@@ -28,7 +28,6 @@ from oslo_context import context
 from oslo_db.sqlalchemy import enginefacade
 from oslo_log import log as logging
 from oslo_utils import timeutils
-import six
 
 from nova import exception
 from nova.i18n import _
@@ -37,9 +36,6 @@ from nova import policy
 from nova import utils
 
 LOG = logging.getLogger(__name__)
-# TODO(melwitt): This cache should be cleared whenever WSGIService receives a
-# SIGHUP and periodically based on an expiration time. Currently, none of the
-# cell caches are purged, so neither is this one, for now.
 CELL_CACHE = {}
 # NOTE(melwitt): Used for the scatter-gather utility to indicate we timed out
 # waiting for a result from a cell.
@@ -110,7 +106,7 @@ class RequestContext(context.RequestContext):
         self.remote_address = remote_address
         if not timestamp:
             timestamp = timeutils.utcnow()
-        if isinstance(timestamp, six.string_types):
+        if isinstance(timestamp, str):
             timestamp = timeutils.parse_strtime(timestamp)
         self.timestamp = timestamp
 
@@ -118,7 +114,8 @@ class RequestContext(context.RequestContext):
             # Only include required parts of service_catalog
             self.service_catalog = [s for s in service_catalog
                 if s.get('type') in ('image', 'block-storage', 'volumev3',
-                                     'key-manager', 'placement', 'network')]
+                                     'key-manager', 'placement', 'network',
+                                     'accelerator')]
         else:
             # if list is empty or none
             self.service_catalog = []

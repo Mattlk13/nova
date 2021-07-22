@@ -17,19 +17,16 @@
     Common functions used by different CLI interfaces.
 """
 
-from __future__ import print_function
-
 import argparse
+import inspect
 import traceback
 
 from oslo_log import log as logging
-import six
 
 import nova.conf
 import nova.db.api
 from nova import exception
 from nova.i18n import _
-from nova import utils
 
 CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
@@ -68,12 +65,12 @@ def validate_args(fn, *args, **kwargs):
     :param arg: the positional arguments supplied
     :param kwargs: the keyword arguments supplied
     """
-    argspec = utils.getargspec(fn)
+    argspec = inspect.getfullargspec(fn)
 
     num_defaults = len(argspec.defaults or [])
     required_args = argspec.args[:len(argspec.args) - num_defaults]
 
-    if six.get_method_self(fn) is not None:
+    if fn.__self__ is not None:
         required_args.pop(0)
 
     missing = [arg for arg in required_args if arg not in kwargs]
@@ -170,7 +167,7 @@ def get_action_fn():
     fn = CONF.category.action_fn
     fn_args = []
     for arg in CONF.category.action_args:
-        if isinstance(arg, six.binary_type):
+        if isinstance(arg, bytes):
             arg = arg.decode('utf-8')
         fn_args.append(arg)
 
@@ -179,7 +176,7 @@ def get_action_fn():
         v = getattr(CONF.category, 'action_kwarg_' + k)
         if v is None:
             continue
-        if isinstance(v, six.binary_type):
+        if isinstance(v, bytes):
             v = v.decode('utf-8')
         fn_kwargs[k] = v
 

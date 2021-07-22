@@ -16,7 +16,6 @@ import mock
 from oslo_messaging import exceptions as messaging_exceptions
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
-import six
 
 from nova.compute import instance_actions
 from nova.compute import power_state
@@ -452,8 +451,7 @@ class CrossCellMigrationTaskTestCase(test.NoDBTestCase):
                 return_value=False):
             ex = self.assertRaises(exception.MigrationPreCheckError,
                                    self.task._perform_external_api_checks)
-            self.assertIn('Required networking service API extension',
-                          six.text_type(ex))
+            self.assertIn('Required networking service API extension', str(ex))
 
     @mock.patch('nova.conductor.tasks.cross_cell_migrate.LOG.exception')
     def test_rollback_idempotent(self, mock_log_exception):
@@ -472,7 +470,7 @@ class CrossCellMigrationTaskTestCase(test.NoDBTestCase):
         with mock.patch.object(self.task, '_execute', side_effect=error):
             # The TestingException from the main task should be raised.
             ex = self.assertRaises(test.TestingException, self.task.execute)
-            self.assertEqual('main task', six.text_type(ex))
+            self.assertEqual('main task', str(ex))
         # And all three sub-task rollbacks should have been called.
         for subtask in self.task._completed_tasks.values():
             subtask.rollback.assert_called_once_with(error)
@@ -740,7 +738,7 @@ class PrepResizeAtDestTaskTestCase(test.NoDBTestCase):
                 exception.MigrationPreCheckError, self.task.execute)
             self.assertIn(
                 'RPC timeout while checking if we can cross-cell migrate to '
-                'host: fake-host', six.text_type(ex))
+                'host: fake-host', str(ex))
 
         _create_port_bindings.assert_called_once_with()
         _create_volume_attachments.assert_called_once_with()
@@ -804,7 +802,10 @@ class PrepResizeAtSourceTaskTestCase(test.NoDBTestCase):
                 vm_state=vm_states.ACTIVE,
                 display_name='fake-server',
                 system_metadata={},
-                host='source.host.com'),
+                host='source.host.com',
+                flavor=objects.Flavor(),
+            ),
+            objects.Flavor(),
             objects.Migration(),
             objects.RequestSpec(),
             compute_rpcapi=mock.Mock(),
@@ -828,6 +829,8 @@ class PrepResizeAtSourceTaskTestCase(test.NoDBTestCase):
         # The instance should have been updated.
         instance_save.assert_called_once_with(
             expected_task_state=task_states.RESIZE_PREP)
+        self.assertIs(self.task.instance.old_flavor, self.task.instance.flavor)
+        self.assertIs(self.task.instance.new_flavor, self.task.flavor)
         self.assertEqual(
             task_states.RESIZE_MIGRATING, self.task.instance.task_state)
         self.assertEqual(self.task.instance.vm_state,
@@ -855,6 +858,8 @@ class PrepResizeAtSourceTaskTestCase(test.NoDBTestCase):
         # The instance should have been updated.
         instance_save.assert_called_once_with(
             expected_task_state=task_states.RESIZE_PREP)
+        self.assertIs(self.task.instance.old_flavor, self.task.instance.flavor)
+        self.assertIs(self.task.instance.new_flavor, self.task.flavor)
         self.assertEqual(
             task_states.RESIZE_MIGRATING, self.task.instance.task_state)
         self.assertEqual(self.task.instance.vm_state,
@@ -1182,7 +1187,6 @@ class ConfirmResizeTaskTestCase(test.NoDBTestCase):
                                     uuid=uuids.instance,
                                     flavor=objects.Flavor())
         self.task._cleanup_source_host(instance)
-        self.assertIs(instance.old_flavor, instance.flavor)
         mock_action_start.assert_called_once_with(
             instance._context, instance.uuid, instance_actions.CONFIRM_RESIZE,
             want_result=False)
@@ -1434,8 +1438,6 @@ class RevertResizeTaskTestCase(test.NoDBTestCase, ObjectComparatorMixin):
         # Fields on the source cell instance should have been updated.
         self.assertEqual(vm_states.ACTIVE,
                          source_cell_instance.system_metadata['old_vm_state'])
-        self.assertIs(source_cell_instance.old_flavor,
-                      source_cell_instance.flavor)
         self.assertEqual(task_states.RESIZE_REVERTING,
                          source_cell_instance.task_state)
         mock_inst_save.assert_called_once_with()
@@ -1596,7 +1598,7 @@ class RevertResizeTaskTestCase(test.NoDBTestCase, ObjectComparatorMixin):
         ex = self.assertRaises(exception.ObjectActionError,
                                self.task._update_source_obj_from_target_cell,
                                source, target)
-        self.assertIn('nested objects are not supported', six.text_type(ex))
+        self.assertIn('nested objects are not supported', str(ex))
 
     @mock.patch('nova.objects.Migration.get_by_uuid')
     def test_update_migration_in_source_cell(self, mock_get_migration):

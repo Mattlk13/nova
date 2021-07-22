@@ -13,16 +13,18 @@
 #    under the License.
 
 import datetime
+from urllib import parse
 
 import mock
 from oslo_utils import timeutils
-from six.moves.urllib import parse
 
 from nova.tests.functional.api_sample_tests import test_servers
 import nova.tests.functional.api_samples_test_base as astb
 
 
 class SimpleTenantUsageSampleJsonTest(test_servers.ServersSampleBase):
+    # The 'os_compute_api:os-simple-tenant-usage:list' policy is admin-only
+    ADMIN_API = True
     sample_dir = "os-simple-tenant-usage"
 
     def setUp(self):
@@ -71,10 +73,13 @@ class SimpleTenantUsageSampleJsonTest(test_servers.ServersSampleBase):
 
 
 class SimpleTenantUsageV240Test(test_servers.ServersSampleBase):
+    # The 'os_compute_api:os-simple-tenant-usage:list' policy is admin-only
+    ADMIN_API = True
+    USE_PROJECT_ID = False
+
     sample_dir = 'os-simple-tenant-usage'
     microversion = '2.40'
     scenarios = [('v2_40', {'api_major_version': 'v2.1'})]
-    _use_project_id = False
 
     def setUp(self):
         super(SimpleTenantUsageV240Test, self).setUp()

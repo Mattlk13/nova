@@ -12,11 +12,13 @@
 
 import mock
 import os_traits as ot
+
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
 
 from nova import context as nova_context
 from nova import exception
+from nova.network import model as network_model
 from nova import objects
 from nova.scheduler import request_filter
 from nova import test
@@ -33,6 +35,8 @@ class TestRequestFilter(test.NoDBTestCase):
         self.flags(query_placement_for_availability_zone=True,
                    group='scheduler')
         self.flags(enable_isolated_aggregate_filtering=True,
+                   group='scheduler')
+        self.flags(query_placement_for_routed_network_aggregates=True,
                    group='scheduler')
 
     def test_process_reqspec(self):
@@ -129,7 +133,7 @@ class TestRequestFilter(test.NoDBTestCase):
         reqspec = objects.RequestSpec(flavor=fake_flavor, image=fake_image)
         result = request_filter.isolate_aggregates(self.context, reqspec)
         self.assertTrue(result)
-        self.assertItemsEqual(
+        self.assertCountEqual(
             set([uuids.agg1, uuids.agg2, uuids.agg4]),
             reqspec.requested_destination.forbidden_aggregates)
         mock_getnotmd.assert_called_once_with(
@@ -320,7 +324,7 @@ class TestRequestFilter(test.NoDBTestCase):
             ','.join(sorted([uuids.agg4])),
             ','.join(sorted(
                 reqspec.requested_destination.aggregates[1].split(','))))
-        self.assertItemsEqual(
+        self.assertCountEqual(
             set([uuids.agg1, uuids.agg2, uuids.agg3]),
             reqspec.requested_destination.forbidden_aggregates)
         mock_getmd.assert_has_calls([
@@ -400,3 +404,179 @@ class TestRequestFilter(test.NoDBTestCase):
         log_lines = [c[0][0] for c in mock_log.debug.call_args_list]
         self.assertIn('added forbidden trait', log_lines[0])
         self.assertIn('took %.1f seconds', log_lines[1])
+
+    @mock.patch.object(request_filter, 'LOG', new=mock.Mock())
+    def test_transform_image_metadata(self):
+        self.flags(image_metadata_prefilter=True, group='scheduler')
+        properties = objects.ImageMetaProps(
+            hw_disk_bus=objects.fields.DiskBus.SATA,
+            hw_cdrom_bus=objects.fields.DiskBus.IDE,
+            hw_video_model=objects.fields.VideoModel.QXL,
+            hw_vif_model=network_model.VIF_MODEL_VIRTIO
+        )
+        reqspec = objects.RequestSpec(
+            image=objects.ImageMeta(properties=properties),
+            flavor=objects.Flavor(extra_specs={}),
+        )
+        self.assertTrue(
+            request_filter.transform_image_metadata(None, reqspec)
+        )
+        expected = {
+            'COMPUTE_GRAPHICS_MODEL_QXL',
+            'COMPUTE_NET_VIF_MODEL_VIRTIO',
+            'COMPUTE_STORAGE_BUS_IDE',
+            'COMPUTE_STORAGE_BUS_SATA',
+        }
+        self.assertEqual(expected, reqspec.root_required)
+
+    def test_transform_image_metadata__disabled(self):
+        self.flags(image_metadata_prefilter=False, group='scheduler')
+        reqspec = objects.RequestSpec(flavor=objects.Flavor(extra_specs={}))
+        # Assert that we completely skip the filter if disabled
+        self.assertFalse(
+            request_filter.transform_image_metadata(self.context, reqspec)
+        )
+        self.assertEqual(set(), reqspec.root_required)
+
+    @mock.patch.object(request_filter, 'LOG')
+    def test_accelerators_filter_with_device_profile(self, mock_log):
+        # First ensure that accelerators_filter is included
+        self.assertIn(request_filter.accelerators_filter,
+                      request_filter.ALL_REQUEST_FILTERS)
+
+        es = {'accel:device_profile': 'mydp'}
+        reqspec = objects.RequestSpec(flavor=objects.Flavor(extra_specs=es))
+        self.assertEqual(set(), reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
+
+        # Request filter puts the trait into the request spec
+        request_filter.accelerators_filter(self.context, reqspec)
+        self.assertEqual({ot.COMPUTE_ACCELERATORS}, reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
+
+        # Assert both the in-method logging and trace decorator.
+        log_lines = [c[0][0] for c in mock_log.debug.call_args_list]
+        self.assertIn('added required trait', log_lines[0])
+        self.assertIn('took %.1f seconds', log_lines[1])
+
+    @mock.patch.object(request_filter, 'LOG')
+    def test_accelerators_filter_no_device_profile(self, mock_log):
+        # First ensure that accelerators_filter is included
+        self.assertIn(request_filter.accelerators_filter,
+                      request_filter.ALL_REQUEST_FILTERS)
+
+        reqspec = objects.RequestSpec(flavor=objects.Flavor(extra_specs={}))
+        self.assertEqual(set(), reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
+
+        # Request filter puts the trait into the request spec
+        request_filter.accelerators_filter(self.context, reqspec)
+        self.assertEqual(set(), reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
+
+        # Assert about logging
+        mock_log.assert_not_called()
+
+    def test_routed_networks_filter_not_enabled(self):
+        self.assertIn(request_filter.routed_networks_filter,
+                      request_filter.ALL_REQUEST_FILTERS)
+        self.flags(query_placement_for_routed_network_aggregates=False,
+                   group='scheduler')
+        reqspec = objects.RequestSpec(
+            requested_destination=objects.Destination())
+        self.assertFalse(request_filter.routed_networks_filter(
+                         self.context, reqspec))
+        # We don't add any aggregates
+        self.assertIsNone(reqspec.requested_destination.aggregates)
+
+    def test_routed_networks_filter_no_requested_nets(self):
+        reqspec = objects.RequestSpec()
+        self.assertTrue(request_filter.routed_networks_filter(
+                         self.context, reqspec))
+
+    @mock.patch('nova.scheduler.utils.get_aggregates_for_routed_subnet')
+    @mock.patch('nova.network.neutron.API.show_port')
+    def test_routed_networks_filter_with_requested_port_immediate(
+        self, mock_show_port, mock_get_aggs_subnet
+    ):
+        req_net = objects.NetworkRequest(port_id=uuids.port1)
+        reqspec = objects.RequestSpec(
+            requested_networks=objects.NetworkRequestList(objects=[req_net]))
+        # Check whether the port was already bound to a segment
+        mock_show_port.return_value = {
+            'port': {
+                'fixed_ips': [
+                    {
+                        'subnet_id': uuids.subnet1
+            }]}}
+        mock_get_aggs_subnet.return_value = [uuids.agg1]
+
+        self.assertTrue(request_filter.routed_networks_filter(
+                        self.context, reqspec))
+        self.assertEqual([uuids.agg1],
+                         reqspec.requested_destination.aggregates)
+        mock_show_port.assert_called_once_with(self.context, uuids.port1)
+        mock_get_aggs_subnet.assert_called_once_with(
+            self.context, mock.ANY, mock.ANY, uuids.subnet1)
+
+    @mock.patch('nova.scheduler.utils.get_aggregates_for_routed_network')
+    @mock.patch('nova.network.neutron.API.show_port')
+    def test_routed_networks_filter_with_requested_port_deferred(
+        self, mock_show_port, mock_get_aggs_network
+    ):
+        req_net = objects.NetworkRequest(port_id=uuids.port1)
+        reqspec = objects.RequestSpec(
+            requested_networks=objects.NetworkRequestList(objects=[req_net]))
+        # The port was created with a deferred allocation so for the moment,
+        # it's not bound to a specific segment.
+        mock_show_port.return_value = {
+            'port': {
+                'fixed_ips': [],
+                'network_id': uuids.net1}}
+        mock_get_aggs_network.return_value = [uuids.agg1]
+
+        self.assertTrue(request_filter.routed_networks_filter(
+                        self.context, reqspec))
+        self.assertEqual([uuids.agg1],
+                         reqspec.requested_destination.aggregates)
+        mock_show_port.assert_called_once_with(self.context, uuids.port1)
+        mock_get_aggs_network.assert_called_once_with(
+            self.context, mock.ANY, mock.ANY, uuids.net1)
+
+    @mock.patch('nova.scheduler.utils.get_aggregates_for_routed_network')
+    def test_routed_networks_filter_with_requested_net(
+        self, mock_get_aggs_network
+    ):
+        req_net = objects.NetworkRequest(network_id=uuids.net1)
+        reqspec = objects.RequestSpec(
+            requested_networks=objects.NetworkRequestList(objects=[req_net]))
+        mock_get_aggs_network.return_value = [uuids.agg1]
+
+        self.assertTrue(request_filter.routed_networks_filter(
+                        self.context, reqspec))
+        self.assertEqual([uuids.agg1],
+                         reqspec.requested_destination.aggregates)
+        mock_get_aggs_network.assert_called_once_with(
+            self.context, mock.ANY, mock.ANY, uuids.net1)
+
+    @mock.patch('nova.scheduler.utils.get_aggregates_for_routed_network')
+    def test_routed_networks_filter_with_two_requested_nets(
+        self, mock_get_aggs_network
+    ):
+        req_net1 = objects.NetworkRequest(network_id=uuids.net1)
+        req_net2 = objects.NetworkRequest(network_id=uuids.net2)
+        reqspec = objects.RequestSpec(
+            requested_networks=objects.NetworkRequestList(
+                objects=[req_net1, req_net2]))
+        mock_get_aggs_network.side_effect = ([uuids.agg1, uuids.agg2],
+                                             [uuids.agg3])
+
+        self.assertTrue(request_filter.routed_networks_filter(
+                        self.context, reqspec))
+        # require_aggregates() has a specific semantics here where multiple
+        # aggregates provided in the same call have their UUIDs being joined.
+        self.assertEqual([','.join([uuids.agg1, uuids.agg2]), uuids.agg3],
+                         reqspec.requested_destination.aggregates)
+        mock_get_aggs_network.assert_has_calls([
+            mock.call(self.context, mock.ANY, mock.ANY, uuids.net1),
+            mock.call(self.context, mock.ANY, mock.ANY, uuids.net2)])

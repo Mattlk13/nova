@@ -308,7 +308,7 @@ class _TestRequestSpecObject(object):
         mock_limits.assert_called_once_with({})
         # Make sure that all fields are set using that helper method
         skip = ['id', 'security_groups', 'network_metadata', 'is_bfv',
-                'request_level_params']
+                'request_level_params', 'requested_networks']
         for field in [f for f in spec.obj_fields if f not in skip]:
             self.assertTrue(spec.obj_attr_is_set(field),
                              'Field: %s is not set' % field)
@@ -339,7 +339,8 @@ class _TestRequestSpecObject(object):
                 filter_properties, instance_group, instance.availability_zone,
                 objects.SecurityGroupList())
         # Make sure that all fields are set using that helper method
-        skip = ['id', 'network_metadata', 'is_bfv', 'request_level_params']
+        skip = ['id', 'network_metadata', 'is_bfv', 'request_level_params',
+                'requested_networks']
         for field in [f for f in spec.obj_fields if f not in skip]:
             self.assertTrue(spec.obj_attr_is_set(field),
                             'Field: %s is not set' % field)
@@ -531,7 +532,7 @@ class _TestRequestSpecObject(object):
         spec = objects.RequestSpec()
         self.assertEqual({}, spec.to_legacy_filter_properties_dict())
 
-    def test_ensure_network_metadata(self):
+    def test_ensure_network_information(self):
         network_a = fake_network_cache_model.new_network({
             'physical_network': 'foo', 'tunneled': False})
         vif_a = fake_network_cache_model.new_vif({'network': network_a})
@@ -552,14 +553,19 @@ class _TestRequestSpecObject(object):
 
         spec = objects.RequestSpec()
         self.assertNotIn('network_metadata', spec)
+        self.assertNotIn('requested_networks', spec)
 
-        spec.ensure_network_metadata(instance)
+        spec.ensure_network_information(instance)
         self.assertIn('network_metadata', spec)
         self.assertIsInstance(spec.network_metadata, objects.NetworkMetadata)
         self.assertEqual(spec.network_metadata.physnets, set(['foo', 'bar']))
         self.assertTrue(spec.network_metadata.tunneled)
+        self.assertEqual(4, len(spec.requested_networks))
+        for idx, reqnet in enumerate(spec.requested_networks):
+            self.assertEqual(nw_info[idx]['network']['id'], reqnet.network_id)
+            self.assertEqual(nw_info[idx]['id'], reqnet.port_id)
 
-    def test_ensure_network_metadata_missing(self):
+    def test_ensure_network_information_missing(self):
         nw_info = network_model.NetworkInfo([])
         info_cache = objects.InstanceInfoCache(network_info=nw_info,
                                                instance_uuid=uuids.instance)
@@ -568,9 +574,11 @@ class _TestRequestSpecObject(object):
 
         spec = objects.RequestSpec()
         self.assertNotIn('network_metadata', spec)
+        self.assertNotIn('requested_networks', spec)
 
-        spec.ensure_network_metadata(instance)
+        spec.ensure_network_information(instance)
         self.assertNotIn('network_metadata', spec)
+        self.assertNotIn('requested_networks', spec)
 
     @mock.patch.object(request_spec.RequestSpec,
             '_get_by_instance_uuid_from_db')
@@ -664,6 +672,11 @@ class _TestRequestSpecObject(object):
                 objects.ComputeNode(host='host2', hypervisor_hostname='node2'),
             ]))
         req_obj.retry = expected_retry
+        nr = objects.NetworkRequest()
+        req_obj.requested_networks = objects.NetworkRequestList(objects=[nr])
+        req_lvl_params = objects.RequestLevelParams(
+            root_required={"CUSTOM_FOO"})
+        req_obj.request_level_params = req_lvl_params
 
         orig_create_in_db = request_spec.RequestSpec._create_in_db
         with mock.patch.object(request_spec.RequestSpec, '_create_in_db') \
@@ -677,11 +690,16 @@ class _TestRequestSpecObject(object):
             # 2. requested_destination
             # 3. requested_resources
             # 4. retry
+            # 5. requested_networks
+            # 6. request_level_params
             data = jsonutils.loads(updates['spec'])['nova_object.data']
             self.assertNotIn('network_metadata', data)
             self.assertIsNone(data['requested_destination'])
             self.assertIsNone(data['requested_resources'])
             self.assertIsNone(data['retry'])
+            self.assertNotIn('requested_networks', data)
+            self.assertNotIn('request_level_params', data)
+
             self.assertIsNotNone(data['instance_uuid'])
 
         # also we expect that the following fields are not reset after create
@@ -689,6 +707,8 @@ class _TestRequestSpecObject(object):
         # 2. requested_destination
         # 3. requested_resources
         # 4. retry
+        # 5. requested_networks
+        # 6. request_level_params
         self.assertIsNotNone(req_obj.network_metadata)
         self.assertJsonEqual(expected_network_metadata.obj_to_primitive(),
                              req_obj.network_metadata.obj_to_primitive())
@@ -701,6 +721,13 @@ class _TestRequestSpecObject(object):
         self.assertIsNotNone(req_obj.retry)
         self.assertJsonEqual(expected_retry.obj_to_primitive(),
                              req_obj.retry.obj_to_primitive())
+        self.assertIsNotNone(req_obj.requested_networks)
+        self.assertJsonEqual(nr.obj_to_primitive(),
+                             req_obj.requested_networks[0].obj_to_primitive())
+        self.assertIsNotNone(req_obj.request_level_params)
+        self.assertJsonEqual(
+            req_lvl_params.obj_to_primitive(),
+            req_obj.request_level_params.obj_to_primitive())
 
     def test_save_does_not_persist_requested_fields(self):
         req_obj = fake_request_spec.fake_spec_obj(remove_id=True)
@@ -722,6 +749,8 @@ class _TestRequestSpecObject(object):
         req_obj.retry = expected_retry
         req_obj.num_instances = 2
         req_obj.ignore_hosts = [uuids.ignored_host]
+        nr = objects.NetworkRequest()
+        req_obj.requested_networks = objects.NetworkRequestList(objects=[nr])
 
         orig_save_in_db = request_spec.RequestSpec._save_in_db
         with mock.patch.object(request_spec.RequestSpec, '_save_in_db') \
@@ -736,6 +765,7 @@ class _TestRequestSpecObject(object):
             # 3. requested_resources
             # 4. retry
             # 5. ignore_hosts
+            # 6. requested_networks
             data = jsonutils.loads(updates['spec'])['nova_object.data']
             self.assertNotIn('network_metadata', data)
             self.assertIsNone(data['requested_destination'])
@@ -743,6 +773,7 @@ class _TestRequestSpecObject(object):
             self.assertIsNone(data['retry'])
             self.assertIsNone(data['ignore_hosts'])
             self.assertIsNotNone(data['instance_uuid'])
+            self.assertNotIn('requested_networks', data)
 
         # also we expect that the following fields are not reset after save
         # 1. network_metadata
@@ -750,6 +781,7 @@ class _TestRequestSpecObject(object):
         # 3. requested_resources
         # 4. retry
         # 5. ignore_hosts
+        # 6. requested_networks
         self.assertIsNotNone(req_obj.network_metadata)
         self.assertJsonEqual(expected_network_metadata.obj_to_primitive(),
                              req_obj.network_metadata.obj_to_primitive())
@@ -764,6 +796,9 @@ class _TestRequestSpecObject(object):
                              req_obj.retry.obj_to_primitive())
         self.assertIsNotNone(req_obj.ignore_hosts)
         self.assertEqual([uuids.ignored_host], req_obj.ignore_hosts)
+        self.assertIsNotNone(req_obj.requested_networks)
+        self.assertJsonEqual(nr.obj_to_primitive(),
+                             req_obj.requested_networks[0].obj_to_primitive())
 
     def test_save(self):
         req_obj = fake_request_spec.fake_spec_obj()
@@ -871,6 +906,17 @@ class _TestRequestSpecObject(object):
         self.assertNotIn('requested_resources', primitive)
         self.assertIn('instance_uuid', primitive)
 
+    def test_compat_requested_networks(self):
+        req_obj = objects.RequestSpec(
+            requested_networks=objects.NetworkRequestList(objects=[]),
+            instance_uuid=uuids.instance)
+        versions = ovo_base.obj_tree_get_versions('RequestSpec')
+        primitive = req_obj.obj_to_primitive(target_version='1.13',
+                                             version_manifest=versions)
+        primitive = primitive['nova_object.data']
+        self.assertNotIn('requested_networks', primitive)
+        self.assertIn('instance_uuid', primitive)
+
     def test_default_requested_destination(self):
         req_obj = objects.RequestSpec()
         self.assertIsNone(req_obj.requested_destination)
@@ -888,6 +934,13 @@ class _TestRequestSpecObject(object):
         self.assertIsInstance(req_obj.network_metadata,
                               objects.NetworkMetadata)
         self.assertIn('network_metadata', req_obj)
+
+    def test_requested_networks_load(self):
+        req_obj = objects.RequestSpec()
+        self.assertNotIn('requested_networks', req_obj)
+        self.assertIsInstance(req_obj.requested_networks,
+                              objects.NetworkRequestList)
+        self.assertIn('requested_networks', req_obj)
 
     def test_create_raises_on_unchanged_object(self):
         ctxt = context.RequestContext(uuids.user_id, uuids.project_id)
@@ -1005,7 +1058,7 @@ class TestRequestGroupObject(test.NoDBTestCase):
         self.assertIn('requester_id', primitive)
         self.assertIn('provider_uuids', primitive)
         self.assertIn('required_traits', primitive)
-        self.assertItemsEqual(
+        self.assertCountEqual(
                 primitive['forbidden_aggregates'], set(['agg3', 'agg4']))
         primitive = req_obj.obj_to_primitive(
             target_version='1.2',
@@ -1078,7 +1131,7 @@ class TestDestinationObject(test.NoDBTestCase):
         obj_primitive = data(obj.obj_to_primitive(target_version='1.4',
                                                   version_manifest=manifest))
         self.assertIn('forbidden_aggregates', obj_primitive)
-        self.assertItemsEqual(obj_primitive['forbidden_aggregates'],
+        self.assertCountEqual(obj_primitive['forbidden_aggregates'],
                               set(['agg3', 'agg4']))
         self.assertIn('aggregates', obj_primitive)
 

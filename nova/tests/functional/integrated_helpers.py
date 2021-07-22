@@ -19,28 +19,27 @@ Provides common functionality for integrated unit tests
 
 import collections
 import random
-import six
 import string
 import time
 
-import os_traits
+from oslo_concurrency import lockutils
 from oslo_log import log as logging
+import oslo_messaging as messaging
 
 from nova.compute import instance_actions
+from nova.compute import rpcapi as compute_rpcapi
 from nova.compute import utils as compute_utils
 import nova.conf
 from nova import context
 from nova.db import api as db
 import nova.image.glance
 from nova import objects
+from nova.objects import base as objects_base
+from nova import rpc
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional.api import client as api_client
 from nova.tests.functional import fixtures as func_fixtures
-from nova.tests.unit import cast_as_call
-from nova.tests.unit import fake_notifier
-import nova.tests.unit.image.fake
-from nova.tests.unit import policy_fixture
 from nova import utils
 
 
@@ -72,7 +71,33 @@ def generate_new_element(items, prefix, numeric=False):
         LOG.debug("Random collision on %s", candidate)
 
 
-class InstanceHelperMixin(object):
+class StubComputeRPCAPI(compute_rpcapi.ComputeAPI):
+    """Stub ComputeAPI that allows us to pin the RPC version of a host. Used to
+    simulate rolling upgrade situations where either source, dest or conductor
+    are pinned.
+    """
+
+    def __init__(self, version):
+        self.version = version
+
+    @property
+    def router(self):
+        with lockutils.lock('compute-rpcapi-router'):
+            target = messaging.Target(topic='compute', version='6.0')
+            version_cap = self.version
+            serializer = objects_base.NovaObjectSerializer()
+            rpc.get_client(target, version_cap, serializer)
+            default_client = self.get_client(target, version_cap, serializer)
+            return rpc.ClientRouter(default_client)
+
+
+# placeholder used as a default parameter value to distinguish between the case
+# when the parameter is specified by the caller with None from the case when it
+# was not specified
+NOT_SPECIFIED = object()
+
+
+class InstanceHelperMixin:
 
     def _wait_for_server_parameter(
             self, server, expected_params, max_retries=10, api=None):
@@ -162,10 +187,12 @@ class InstanceHelperMixin(object):
         :param server: API response dict of the server being resized/migrated
         :param action: Either "resize" or "migrate" instance action.
         :param error_in_tb: Some expected part of the error event traceback.
+        :returns: The instance action event dict from the API response
         """
         event = self._wait_for_action_fail_completion(
             server, action, 'conductor_migrate_server')
         self.assertIn(error_in_tb, event['traceback'])
+        return event
 
     def _wait_for_migration_status(self, server, expected_statuses):
         """Waits for a migration record with the given statuses to be found
@@ -175,15 +202,22 @@ class InstanceHelperMixin(object):
         api = getattr(self, 'admin_api', self.api)
 
         statuses = [status.lower() for status in expected_statuses]
+        actual_status = None
+
         for attempt in range(10):
             migrations = api.api_get('/os-migrations').body['migrations']
             for migration in migrations:
-                if (migration['instance_uuid'] == server['id'] and
-                        migration['status'].lower() in statuses):
-                    return migration
+                if migration['instance_uuid'] == server['id']:
+                    actual_status = migration['status']
+                    if migration['status'].lower() in statuses:
+                        return migration
             time.sleep(0.5)
-        self.fail('Timed out waiting for migration with status "%s" for '
-                  'instance: %s' % (expected_statuses, server['id']))
+
+        self.fail(
+            'Timed out waiting for migration with status for instance %s '
+            '(expected "%s", got "%s")' % (
+                server['id'], expected_statuses, actual_status,
+            ))
 
     def _wait_for_log(self, log_line):
         for i in range(10):
@@ -192,6 +226,21 @@ class InstanceHelperMixin(object):
             time.sleep(0.5)
 
         self.fail('The line "%(log_line)s" did not appear in the log')
+
+    def _wait_for_assert(self, assert_func, max_retries=10, sleep=0.5):
+        """Waits and retries the assert_func either until it does not raise
+        AssertionError any more or until the max_retries run out.
+        """
+        last_error = None
+        for i in range(max_retries):
+            try:
+                return assert_func()
+            except AssertionError as e:
+                last_error = e
+
+            time.sleep(sleep)
+
+        raise last_error
 
     def _create_aggregate(self, name, availability_zone=None):
         """Creates a host aggregate with the given name and optional AZ
@@ -353,258 +402,238 @@ class InstanceHelperMixin(object):
         self.api.delete_server(server['id'])
         self._wait_until_deleted(server)
 
+    def _reboot_server(self, server, hard=False, expected_state='ACTIVE'):
+        """Reboot a server."""
+        self.api.post_server_action(
+            server['id'], {'reboot': {'type': 'HARD' if hard else 'SOFT'}},
+        )
+        self.notifier.wait_for_versioned_notifications('instance.reboot.end')
+        return self._wait_for_state_change(server, expected_state)
 
-class _IntegratedTestBase(test.TestCase, InstanceHelperMixin):
-    REQUIRES_LOCKING = True
-    ADMIN_API = False
-    # This indicates whether to include the project ID in the URL for API
-    # requests through OSAPIFixture. Overridden by subclasses.
-    _use_project_id = False
-
-    def setUp(self):
-        super(_IntegratedTestBase, self).setUp()
-
-        self.fake_image_service =\
-            nova.tests.unit.image.fake.stub_out_image_service(self)
-
-        self.useFixture(cast_as_call.CastAsCall(self))
-        placement = self.useFixture(func_fixtures.PlacementFixture())
-        self.placement_api = placement.api
-        self.neutron = self.useFixture(nova_fixtures.NeutronFixture(self))
-
-        self._setup_services()
-
-        self.addCleanup(nova.tests.unit.image.fake.FakeImageService_reset)
-
-    def _setup_compute_service(self):
-        return self.start_service('compute')
-
-    def _setup_scheduler_service(self):
-        return self.start_service('scheduler')
-
-    def _setup_services(self):
-        # NOTE(danms): Set the global MQ connection to that of our first cell
-        # for any cells-ignorant code. Normally this is defaulted in the tests
-        # which will result in us not doing the right thing.
-        if 'cell1' in self.cell_mappings:
-            self.flags(transport_url=self.cell_mappings['cell1'].transport_url)
-
-        self.conductor = self.start_service('conductor')
-        self.scheduler = self._setup_scheduler_service()
-        self.compute = self._setup_compute_service()
-
-        self.api_fixture = self.useFixture(
-            nova_fixtures.OSAPIFixture(
-                api_version=self.api_major_version,
-                use_project_id_in_urls=self._use_project_id))
-
-        # if the class needs to run as admin, make the api endpoint
-        # the admin, otherwise it's safer to run as non admin user.
-        if self.ADMIN_API:
-            self.api = self.api_fixture.admin_api
-        else:
-            self.api = self.api_fixture.api
-            self.admin_api = self.api_fixture.admin_api
-
-        if hasattr(self, 'microversion'):
-            self.api.microversion = self.microversion
-
-            if not self.ADMIN_API:
-                self.admin_api.microversion = self.microversion
-
-    def _check_api_endpoint(self, endpoint, expected_middleware):
-        app = self.api_fixture.app().get((None, '/v2'))
-
-        while getattr(app, 'application', False):
-            for middleware in expected_middleware:
-                if isinstance(app.application, middleware):
-                    expected_middleware.remove(middleware)
-                    break
-            app = app.application
-
-        self.assertEqual([],
-                         expected_middleware,
-                         ("The expected wsgi middlewares %s are not "
-                          "existed") % expected_middleware)
-
-
-class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
-    """Base test class for functional tests that check provider usage
-    and consumer allocations in Placement during various operations.
-
-    Subclasses must define a **compute_driver** attribute for the virt driver
-    to use.
-
-    This class sets up standard fixtures and controller services but does not
-    start any compute services, that is left to the subclass.
-    """
-
-    microversion = 'latest'
-
-    # These must match the capabilities in
-    # nova.virt.libvirt.driver.LibvirtDriver.capabilities
-    expected_libvirt_driver_capability_traits = set([
-        six.u(trait) for trait in [
-            os_traits.COMPUTE_DEVICE_TAGGING,
-            os_traits.COMPUTE_NET_ATTACH_INTERFACE,
-            os_traits.COMPUTE_NET_ATTACH_INTERFACE_WITH_TAG,
-            os_traits.COMPUTE_VOLUME_ATTACH_WITH_TAG,
-            os_traits.COMPUTE_VOLUME_EXTEND,
-            os_traits.COMPUTE_TRUSTED_CERTS,
-            os_traits.COMPUTE_IMAGE_TYPE_AKI,
-            os_traits.COMPUTE_IMAGE_TYPE_AMI,
-            os_traits.COMPUTE_IMAGE_TYPE_ARI,
-            os_traits.COMPUTE_IMAGE_TYPE_ISO,
-            os_traits.COMPUTE_IMAGE_TYPE_QCOW2,
-            os_traits.COMPUTE_IMAGE_TYPE_RAW,
-        ]
-    ])
-
-    # These must match the capabilities in
-    # nova.virt.fake.FakeDriver.capabilities
-    expected_fake_driver_capability_traits = set([
-        six.u(trait) for trait in [
-            os_traits.COMPUTE_IMAGE_TYPE_RAW,
-            os_traits.COMPUTE_DEVICE_TAGGING,
-            os_traits.COMPUTE_NET_ATTACH_INTERFACE,
-            os_traits.COMPUTE_NET_ATTACH_INTERFACE_WITH_TAG,
-            os_traits.COMPUTE_VOLUME_ATTACH_WITH_TAG,
-            os_traits.COMPUTE_VOLUME_EXTEND,
-            os_traits.COMPUTE_VOLUME_MULTI_ATTACH,
-            os_traits.COMPUTE_TRUSTED_CERTS,
-        ]
-    ])
-
-    def setUp(self):
-        self.flags(compute_driver=self.compute_driver)
-        super(ProviderUsageBaseTestCase, self).setUp()
-
-        self.policy = self.useFixture(policy_fixture.RealPolicyFixture())
-        self.neutron = self.useFixture(nova_fixtures.NeutronFixture(self))
-        self.useFixture(nova_fixtures.AllServicesCurrent())
-
-        fake_notifier.stub_notifier(self)
-        self.addCleanup(fake_notifier.reset)
-
-        placement = self.useFixture(func_fixtures.PlacementFixture())
-        self.placement_api = placement.api
-        self.api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
-            api_version='v2.1'))
-
-        self.admin_api = self.api_fixture.admin_api
-        self.admin_api.microversion = self.microversion
-        self.api = self.admin_api
-
-        # the image fake backend needed for image discovery
-        self.image_service = (
-            nova.tests.unit.image.fake.stub_out_image_service(self))
-
-        self.start_service('conductor')
-        self.scheduler_service = self.start_service('scheduler')
-
-        self.addCleanup(nova.tests.unit.image.fake.FakeImageService_reset)
-
-        self.computes = {}
-
-    def _start_compute(self, host, cell_name=None):
-        """Start a nova compute service on the given host
-
-        :param host: the name of the host that will be associated to the
-                     compute service.
-        :param cell_name: optional name of the cell in which to start the
-                          compute service (defaults to cell1)
-        :return: the nova compute service object
-        """
-        compute = self.start_service('compute', host=host, cell=cell_name)
-        self.computes[host] = compute
-        return compute
-
-    def _get_provider_uuid_by_host(self, host):
-        # NOTE(gibi): the compute node id is the same as the compute node
-        # provider uuid on that compute
-        resp = self.admin_api.api_get(
-            'os-hypervisors?hypervisor_hostname_pattern=%s' % host).body
-        return resp['hypervisors'][0]['id']
-
-    def _get_provider_usages(self, provider_uuid):
-        return self.placement_api.get(
-            '/resource_providers/%s/usages' % provider_uuid).body['usages']
-
-    def _get_allocations_by_server_uuid(self, server_uuid):
-        return self.placement_api.get(
-            '/allocations/%s' % server_uuid).body['allocations']
-
-    def _wait_for_server_allocations(self, consumer_id, max_retries=20):
-        retry_count = 0
-        while True:
-            alloc = self._get_allocations_by_server_uuid(consumer_id)
-            if alloc:
-                break
-            retry_count += 1
-            if retry_count == max_retries:
-                self.fail('Wait for server allocations failed, '
-                          'server=%s' % (consumer_id))
-            time.sleep(0.5)
-        return alloc
-
-    def _get_allocations_by_provider_uuid(self, rp_uuid):
-        return self.placement_api.get(
-            '/resource_providers/%s/allocations' % rp_uuid).body['allocations']
-
-    def _get_all_providers(self):
-        return self.placement_api.get(
-            '/resource_providers', version='1.14').body['resource_providers']
-
-    def _create_trait(self, trait):
-        return self.placement_api.put('/traits/%s' % trait, {}, version='1.6')
-
-    def _delete_trait(self, trait):
-        return self.placement_api.delete('/traits/%s' % trait, version='1.6')
-
-    def _get_provider_traits(self, provider_uuid):
-        return self.placement_api.get(
-            '/resource_providers/%s/traits' % provider_uuid,
-            version='1.6').body['traits']
-
-    def _set_provider_traits(self, rp_uuid, traits):
-        """This will overwrite any existing traits.
-
-        :param rp_uuid: UUID of the resource provider to update
-        :param traits: list of trait strings to set on the provider
-        :returns: APIResponse object with the results
-        """
-        provider = self.placement_api.get(
-            '/resource_providers/%s' % rp_uuid).body
-        put_traits_req = {
-            'resource_provider_generation': provider['generation'],
-            'traits': traits
+    def _attach_interface(self, server, port_uuid):
+        """attach a neutron port to a server."""
+        body = {
+            "interfaceAttachment": {
+                "port_id": port_uuid
+            }
         }
-        return self.placement_api.put(
-            '/resource_providers/%s/traits' % rp_uuid,
-            put_traits_req, version='1.6')
+        attachment = self.api.attach_interface(server['id'], body)
+        self.notifier.wait_for_versioned_notifications(
+            'instance.interface_attach.end')
+        return attachment
+
+    def _detach_interface(self, server, port_uuid):
+        """detach a neutron port form a server."""
+        self.api.detach_interface(server['id'], port_uuid)
+        self.notifier.wait_for_versioned_notifications(
+            'instance.interface_detach.end')
+
+    def _rebuild_server(self, server, image_uuid, expected_state='ACTIVE'):
+        """Rebuild a server."""
+        self.api.post_server_action(
+            server['id'], {'rebuild': {'imageRef': image_uuid}},
+        )
+        self.notifier.wait_for_versioned_notifications('instance.rebuild.end')
+        return self._wait_for_state_change(server, expected_state)
+
+    def _migrate_server(self, server, host=None):
+        """Cold migrate a server."""
+        body = {'host': host} if host else None
+        self.api.post_server_action(server['id'], {'migrate': body})
+        return self._wait_for_state_change(server, 'VERIFY_RESIZE')
+
+    def _resize_server(self, server, flavor_id):
+        self.api.post_server_action(
+            server['id'], {'resize': {'flavorRef': flavor_id}})
+        self.notifier.wait_for_versioned_notifications('instance.resize.end')
+        return self._wait_for_state_change(server, 'VERIFY_RESIZE')
+
+    def _confirm_resize(self, server, *, cross_cell=False):
+        self.api.post_server_action(server['id'], {'confirmResize': None})
+        server = self._wait_for_state_change(server, 'ACTIVE')
+        event = 'compute_confirm_resize'
+        if cross_cell:
+            event = 'conductor_confirm_snapshot_based_resize'
+        self._wait_for_instance_action_event(
+            server, instance_actions.CONFIRM_RESIZE, event, 'success')
+        return server
+
+    def _revert_resize(self, server):
+        # NOTE(sbauza): This method requires the caller to setup a fake
+        # notifier by stubbing it.
+        self.api.post_server_action(server['id'], {'revertResize': None})
+        server = self._wait_for_state_change(server, 'ACTIVE')
+        self._wait_for_migration_status(server, ['reverted'])
+        # Note that the migration status is changed to "reverted" in the
+        # dest host revert_resize method but the allocations are cleaned up
+        # in the source host finish_revert_resize method so we need to wait
+        # for the finish_revert_resize method to complete.
+        self.notifier.wait_for_versioned_notifications(
+            'instance.resize_revert.end')
+        return server
+
+    def _live_migrate(
+        self, server, migration_expected_state='completed',
+        server_expected_state='ACTIVE',
+    ):
+        self.api.post_server_action(
+            server['id'],
+            {'os-migrateLive': {'host': None, 'block_migration': 'auto'}})
+        self._wait_for_state_change(server, server_expected_state)
+        self._wait_for_migration_status(server, [migration_expected_state])
+
+    _live_migrate_server = _live_migrate
+
+    def _suspend_server(self, server, expected_state='SUSPENDED'):
+        """Suspend a server."""
+        self.api.post_server_action(server['id'], {'suspend': {}})
+        self.notifier.wait_for_versioned_notifications('instance.suspend.end')
+        return self._wait_for_state_change(server, expected_state)
+
+    def _resume_server(self, server, expected_state='ACTIVE'):
+        """Resume a server."""
+        self.api.post_server_action(server['id'], {'resume': {}})
+        self.notifier.wait_for_versioned_notifications('instance.resume.end')
+        return self._wait_for_state_change(server, expected_state)
+
+    def _shelve_server(self, server, expected_state='SHELVED_OFFLOADED'):
+        """Shelve a server."""
+        self.api.post_server_action(server['id'], {'shelve': {}})
+        return self._wait_for_state_change(server, expected_state)
+
+    def _shelve_offload_server(self, server):
+        """Shelve offload a server."""
+        self.api.post_server_action(server['id'], {'shelveOffload': {}})
+        self._wait_for_server_parameter(server,
+                                        {'status': 'SHELVED_OFFLOADED',
+                                         'OS-EXT-SRV-ATTR:host': None,
+                                         'OS-EXT-AZ:availability_zone': ''})
+
+    def _unshelve_server(self, server, expected_state='ACTIVE'):
+        """Unshelve a server."""
+        self.api.post_server_action(server['id'], {'unshelve': None})
+        return self._wait_for_state_change(server, expected_state)
+
+    def _evacuate_server(
+            self, server, extra_post_args=None, expected_host=None,
+            expected_state='ACTIVE', expected_task_state=NOT_SPECIFIED,
+            expected_migration_status='done'):
+        """Evacuate a server."""
+        api = getattr(self, 'admin_api', self.api)
+
+        post = {'evacuate': {}}
+        if extra_post_args:
+            post['evacuate'].update(extra_post_args)
+
+        expected_result = {'status': expected_state}
+        if expected_host:
+            expected_result['OS-EXT-SRV-ATTR:host'] = expected_host
+        if expected_task_state is not NOT_SPECIFIED:
+            expected_result['OS-EXT-STS:task_state'] = expected_task_state
+
+        api.post_server_action(server['id'], post)
+
+        # NOTE(gibi): The order of waiting for the migration and returning
+        # a fresh server from _wait_for_server_parameter is important as
+        # the compute manager sets status of the instance before sets the
+        # host and finally sets the migration status. So waiting for the
+        # migration first makes the returned server object more consistent.
+        self._wait_for_migration_status(server, [expected_migration_status])
+        return self._wait_for_server_parameter(server, expected_result)
+
+    def _start_server(self, server):
+        self.api.post_server_action(server['id'], {'os-start': None})
+        return self._wait_for_state_change(server, 'ACTIVE')
+
+    def _stop_server(self, server):
+        self.api.post_server_action(server['id'], {'os-stop': None})
+        return self._wait_for_state_change(server, 'SHUTOFF')
+
+
+class PlacementHelperMixin:
+    """A helper mixin for interacting with placement."""
 
     def _get_all_resource_classes(self):
-        dicts = self.placement_api.get(
-            '/resource_classes', version='1.2').body['resource_classes']
-        return [d['name'] for d in dicts]
+        resp = self.placement.get(
+            '/resource_classes', version='1.2'
+        ).body['resource_classes']
+        return [d['name'] for d in resp]
 
-    def _get_all_traits(self):
-        return self.placement_api.get('/traits', version='1.6').body['traits']
+    def _get_all_providers(self):
+        return self.placement.get(
+            '/resource_providers', version='1.14'
+        ).body['resource_providers']
 
-    def _get_provider_inventory(self, rp_uuid):
-        return self.placement_api.get(
-            '/resource_providers/%s/inventories' % rp_uuid).body['inventories']
-
-    def _get_provider_aggregates(self, rp_uuid):
-        return self.placement_api.get(
-            '/resource_providers/%s/aggregates' % rp_uuid,
-            version='1.1').body['aggregates']
+    def _get_all_rp_uuids_in_a_tree(self, in_tree_rp_uuid):
+        rps = self.placement.get(
+            '/resource_providers?in_tree=%s' % in_tree_rp_uuid,
+            version='1.20',
+        ).body['resource_providers']
+        return [rp['uuid'] for rp in rps]
 
     def _post_resource_provider(self, rp_name):
-        return self.placement_api.post(
-            url='/resource_providers',
-            version='1.20', body={'name': rp_name}).body
+        return self.placement.post(
+            '/resource_providers', version='1.20', body={'name': rp_name}
+        ).body
 
+    def _get_resource_provider_by_uuid(self, rp_uuid):
+        return self.placement.get(
+            '/resource_providers/%s' % rp_uuid, version='1.15',
+        ).body
+
+    def _get_provider_uuid_by_name(self, name):
+        return self.placement.get(
+            '/resource_providers?name=%s' % name,
+        ).body['resource_providers'][0]['uuid']
+
+    def _get_provider_usages(self, provider_uuid):
+        return self.placement.get(
+            '/resource_providers/%s/usages' % provider_uuid
+        ).body['usages']
+
+    # TODO(stephenfin): Rename to '_get_provider_allocations'
+    def _get_allocations_by_provider_uuid(self, rp_uuid):
+        return self.placement.get(
+            '/resource_providers/%s/allocations' % rp_uuid
+        ).body['allocations']
+
+    def _get_provider_traits(self, rp_uuid):
+        """Get traits for the specified provider.
+
+        :param rp_uuid: UUID of the resource provider to update
+        :returns: Dict object with the results.
+        """
+        return self.placement.get(
+            '/resource_providers/%s/traits' % rp_uuid, version='1.6'
+        ).body['traits']
+
+    def _set_provider_traits(self, rp_uuid, traits):
+        """Set traits for the specified provider.
+
+        This will overwrite any existing traits.
+
+        :param rp_uuid: UUID of the resource provider to update.
+        :param traits: List of trait strings to set on the provider.
+        :returns: APIResponse object with the results.
+        """
+        provider = self.placement.get(
+            '/resource_providers/%s' % rp_uuid
+        ).body
+        return self.placement.put(
+            '/resource_providers/%s/traits' % rp_uuid,
+            {
+                'resource_provider_generation': provider['generation'],
+                'traits': traits
+            },
+            version='1.6',
+        )
+
+    def _get_provider_inventory(self, rp_uuid):
+        return self.placement.get(
+            '/resource_providers/%s/inventories' % rp_uuid
+        ).body['inventories']
+
+    # TODO(stephenfin): Rename '_set_provider_inventory'
     def _set_inventory(self, rp_uuid, inv_body):
         """This will set the inventory for a given resource provider.
 
@@ -612,10 +641,12 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
         :param inv_body: inventory to set on the provider
         :returns: APIResponse object with the results
         """
-        return self.placement_api.post(
-            url= ('/resource_providers/%s/inventories' % rp_uuid),
-            version='1.15', body=inv_body).body
+        return self.placement.post(
+            '/resource_providers/%s/inventories' % rp_uuid,
+            version='1.15', body=inv_body
+        ).body
 
+    # TODO(stephenfin): Rename '_update_provider_inventory'
     def _update_inventory(self, rp_uuid, inv_body):
         """This will update the inventory for a given resource provider.
 
@@ -623,28 +654,37 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
         :param inv_body: inventory to set on the provider
         :returns: APIResponse object with the results
         """
-        return self.placement_api.put(
-            url= ('/resource_providers/%s/inventories' % rp_uuid),
-            body=inv_body).body
+        return self.placement.put(
+            '/resource_providers/%s/inventories' % rp_uuid, body=inv_body,
+        ).body
 
-    def _get_resource_provider_by_uuid(self, rp_uuid):
-        return self.placement_api.get(
-            '/resource_providers/%s' % rp_uuid, version='1.15').body
+    def _get_provider_aggregates(self, rp_uuid):
+        return self.placement.get(
+            '/resource_providers/%s/aggregates' % rp_uuid, version='1.1'
+        ).body['aggregates']
 
+    # TODO(stephenfin): Rename '_set_provider_aggregates'
     def _set_aggregate(self, rp_uuid, agg_id):
-        provider = self.placement_api.get(
-            '/resource_providers/%s' % rp_uuid).body
-        post_agg_req = {"aggregates": [agg_id],
-                        "resource_provider_generation": provider['generation']}
-        return self.placement_api.put(
-            '/resource_providers/%s/aggregates' % rp_uuid, version='1.19',
-            body=post_agg_req).body
+        provider = self.placement.get(
+            '/resource_providers/%s' % rp_uuid
+        ).body
+        return self.placement.put(
+            '/resource_providers/%s/aggregates' % rp_uuid,
+            body={
+                'aggregates': [agg_id],
+                'resource_provider_generation': provider['generation'],
+            },
+            version='1.19',
+        ).body
 
-    def _get_all_rp_uuids_in_a_tree(self, in_tree_rp_uuid):
-        rps = self.placement_api.get(
-            '/resource_providers?in_tree=%s' % in_tree_rp_uuid,
-            version='1.20').body['resource_providers']
-        return [rp['uuid'] for rp in rps]
+    def _get_all_traits(self):
+        return self.placement.get('/traits', version='1.6').body['traits']
+
+    def _create_trait(self, trait):
+        return self.placement.put('/traits/%s' % trait, {}, version='1.6')
+
+    def _delete_trait(self, trait):
+        return self.placement.delete('/traits/%s' % trait, version='1.6')
 
     def assertRequestMatchesUsage(self, requested_resources, root_rp_uuid):
         # It matches the usages of the whole tree against the request
@@ -701,8 +741,9 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
                 resources[key.split(':')[1]] += value
         return resources
 
-    def assertFlavorMatchesAllocation(self, flavor, consumer_uuid,
-                                      root_rp_uuid):
+    def assertFlavorMatchesAllocation(
+        self, flavor, consumer_uuid, root_rp_uuid,
+    ):
         # NOTE(gibi): This function does not handle sharing RPs today.
         expected_rps = self._get_all_rp_uuids_in_a_tree(root_rp_uuid)
         allocations = self._get_allocations_by_server_uuid(consumer_uuid)
@@ -711,8 +752,9 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
         # function for nested and non-nested trees in a generic way.
         total_allocation = collections.defaultdict(int)
         for rp, alloc in allocations.items():
-            self.assertIn(rp, expected_rps, 'Unexpected, out of tree RP in the'
-                                            ' allocation')
+            self.assertIn(
+                rp, expected_rps,
+                'Unexpected, out of tree RP in the allocation')
             for rc, value in alloc['resources'].items():
                 total_allocation[rc] += value
 
@@ -730,13 +772,45 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
         ctxt = context.get_admin_context()
         migrations = db.migration_get_all_by_filters(
             ctxt, {'instance_uuid': instance_uuid})
-        self.assertEqual(1, len(migrations),
-                         'Test expected a single migration, '
-                         'but found %i' % len(migrations))
+        self.assertEqual(
+            1, len(migrations),
+            'Test expected a single migration but found %i' % len(migrations))
         return migrations[0].uuid
 
+
+class PlacementInstanceHelperMixin(InstanceHelperMixin, PlacementHelperMixin):
+    """A placement-aware variant of InstanceHelperMixin."""
+
+    # TODO(stephenfin): Rename to '_get_server_allocations'
+    def _get_allocations_by_server_uuid(self, server_uuid):
+        return self.placement.get(
+            '/allocations/%s' % server_uuid
+        ).body['allocations']
+
+    def _wait_for_server_allocations(self, consumer_id, max_retries=20):
+        retry_count = 0
+        while True:
+            alloc = self._get_allocations_by_server_uuid(consumer_id)
+            if alloc:
+                break
+            retry_count += 1
+            if retry_count == max_retries:
+                self.fail('Wait for server allocations failed, '
+                          'server=%s' % (consumer_id))
+            time.sleep(0.5)
+        return alloc
+
+    def _get_provider_uuid_by_host(self, host):
+        # NOTE(gibi): the compute node id is the same as the compute node
+        # provider uuid on that compute
+        return self.admin_api.api_get(
+            'os-hypervisors?hypervisor_hostname_pattern=%s' % host
+        ).body['hypervisors'][0]['id']
+
+    # TODO(stephenfin): Rename to '_create_server_and_check_allocations'
     def _boot_and_check_allocations(
-            self, flavor, source_hostname, networks='none'):
+        self, flavor, source_hostname, networks='none',
+    ):
         """Boot an instance and check that the resource allocation is correct
 
         After booting an instance on the given host with a given flavor it
@@ -755,7 +829,8 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
         server_req = self._build_server(
             image_uuid='155d900f-4e14-4e4c-a73d-069cbf4541e6',
             flavor_id=flavor['id'],
-            networks=networks)
+            networks=networks,
+        )
         server_req['availability_zone'] = 'nova:%s' % source_hostname
         LOG.info('booting on %s', source_hostname)
         created_server = self.api.post_server({'server': server_req})
@@ -774,14 +849,13 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
         for rp_uuid in [self._get_provider_uuid_by_host(hostname)
                         for hostname in self.computes.keys()
                         if hostname != source_hostname]:
-            self.assertRequestMatchesUsage({'VCPU': 0,
-                                            'MEMORY_MB': 0,
-                                            'DISK_GB': 0}, rp_uuid)
+            self.assertRequestMatchesUsage(
+                {'VCPU': 0, 'MEMORY_MB': 0, 'DISK_GB': 0}, rp_uuid)
 
         # Check that the server only allocates resource from the host it is
         # booted on
-        self.assertFlavorMatchesAllocation(flavor, server['id'],
-                                           source_rp_uuid)
+        self.assertFlavorMatchesAllocation(
+            flavor, server['id'], source_rp_uuid)
         self._run_periodics()
 
         # After running the periodics but before we start any other operation,
@@ -793,18 +867,19 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
 
         # Check that the server only allocates resource from the host it is
         # booted on
-        self.assertFlavorMatchesAllocation(flavor, server['id'],
-                                           source_rp_uuid)
+        self.assertFlavorMatchesAllocation(
+            flavor, server['id'], source_rp_uuid)
 
         # Check that the other providers has no usage
         for rp_uuid in [self._get_provider_uuid_by_host(hostname)
                         for hostname in self.computes.keys()
                         if hostname != source_hostname]:
-            self.assertRequestMatchesUsage({'VCPU': 0,
-                                            'MEMORY_MB': 0,
-                                            'DISK_GB': 0}, rp_uuid)
+            self.assertRequestMatchesUsage(
+                {'VCPU': 0, 'MEMORY_MB': 0, 'DISK_GB': 0}, rp_uuid)
+
         return server
 
+    # TODO(stephenfin): Rename to '_delete_server_and_check_allocations'
     def _delete_and_check_allocations(self, server):
         """Delete the instance and asserts that the allocations are cleaned
 
@@ -815,13 +890,13 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
         :returns: The uuid of the migration record associated with the resize
             or cold migrate operation
         """
-
         # First check to see if there is a related migration record so we can
         # assert its allocations (if any) are not leaked.
         with utils.temporary_mutation(self.admin_api, microversion='2.59'):
             migrations = self.admin_api.api_get(
-                '/os-migrations?instance_uuid=%s' %
-                server['id']).body['migrations']
+                '/os-migrations?instance_uuid=%s' % server['id']
+            ).body['migrations']
+
         if migrations:
             # If there is more than one migration, they are sorted by
             # created_at in descending order so we'll get the last one
@@ -838,13 +913,14 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
         # instance.delete.end notification as that is emitted after the
         # resources are freed.
 
-        fake_notifier.wait_for_versioned_notifications('instance.delete.end')
+        self.notifier.wait_for_versioned_notifications('instance.delete.end')
 
-        for rp_uuid in [self._get_provider_uuid_by_host(hostname)
-                        for hostname in self.computes.keys()]:
-            self.assertRequestMatchesUsage({'VCPU': 0,
-                                            'MEMORY_MB': 0,
-                                            'DISK_GB': 0}, rp_uuid)
+        for rp_uuid in [
+            self._get_provider_uuid_by_host(hostname)
+            for hostname in self.computes.keys()
+        ]:
+            self.assertRequestMatchesUsage(
+                {'VCPU': 0, 'MEMORY_MB': 0, 'DISK_GB': 0}, rp_uuid)
 
         # and no allocations for the deleted server
         allocations = self._get_allocations_by_server_uuid(server['id'])
@@ -854,27 +930,18 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
             # and no allocations for the delete migration
             allocations = self._get_allocations_by_server_uuid(migration_uuid)
             self.assertEqual(0, len(allocations))
+
         return migration_uuid
 
-    def _run_periodics(self):
-        """Run the update_available_resource task on every compute manager
+    def _move_and_check_allocations(
+        self, server, request, old_flavor, new_flavor, source_rp_uuid,
+        dest_rp_uuid,
+    ):
+        if 'resize' not in request and 'migrate' not in request:
+            raise Exception(
+                '_move_and_check_allocations only supports resize or migrate '
+                'requests.')
 
-        This runs periodics on the computes in an undefined order; some child
-        class redefined this function to force a specific order.
-        """
-
-        ctx = context.get_admin_context()
-        for host, compute in self.computes.items():
-            LOG.info('Running periodic for compute (%s)', host)
-            # Make sure the context is targeted to the proper cell database
-            # for multi-cell tests.
-            with context.target_cell(
-                    ctx, self.host_mappings[host].cell_mapping) as cctxt:
-                compute.manager.update_available_resource(cctxt)
-        LOG.info('Finished with periodics')
-
-    def _move_and_check_allocations(self, server, request, old_flavor,
-                                    new_flavor, source_rp_uuid, dest_rp_uuid):
         self.api.post_server_action(server['id'], request)
         self._wait_for_state_change(server, 'VERIFY_RESIZE')
 
@@ -906,17 +973,19 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
         reqspec = objects.RequestSpec.get_by_instance_uuid(ctxt, server['id'])
         self.assertEqual(new_flavor['id'], reqspec.flavor.flavorid)
 
-    def _migrate_and_check_allocations(self, server, flavor, source_rp_uuid,
-                                       dest_rp_uuid):
-        request = {
-            'migrate': None
-        }
+    # TODO(stephenfin): Rename to '_migrate_server_and_check_allocations'
+    def _migrate_and_check_allocations(
+        self, server, flavor, source_rp_uuid, dest_rp_uuid,
+    ):
+        request = {'migrate': None}
         self._move_and_check_allocations(
             server, request=request, old_flavor=flavor, new_flavor=flavor,
             source_rp_uuid=source_rp_uuid, dest_rp_uuid=dest_rp_uuid)
 
-    def _resize_and_check_allocations(self, server, old_flavor, new_flavor,
-                                      source_rp_uuid, dest_rp_uuid):
+    # TODO(stephenfin): Rename to '_resize_server_and_check_allocations'
+    def _resize_and_check_allocations(
+        self, server, old_flavor, new_flavor, source_rp_uuid, dest_rp_uuid,
+    ):
         request = {
             'resize': {
                 'flavorRef': new_flavor['id']
@@ -927,18 +996,15 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
             new_flavor=new_flavor, source_rp_uuid=source_rp_uuid,
             dest_rp_uuid=dest_rp_uuid)
 
-    def _resize_to_same_host_and_check_allocations(self, server, old_flavor,
-                                                   new_flavor, rp_uuid):
+    # TODO(stephenfin): Rename to
+    # '_resize_server_to_same_host_and_check_allocations'
+    def _resize_to_same_host_and_check_allocations(
+        self, server, old_flavor, new_flavor, rp_uuid,
+    ):
         # Resize the server to the same host and check usages in VERIFY_RESIZE
         # state
         self.flags(allow_resize_to_same_host=True)
-        resize_req = {
-            'resize': {
-                'flavorRef': new_flavor['id']
-            }
-        }
-        self.api.post_server_action(server['id'], resize_req)
-        self._wait_for_state_change(server, 'VERIFY_RESIZE')
+        self._resize_server(server, new_flavor['id'])
 
         self.assertFlavorMatchesUsage(rp_uuid, old_flavor, new_flavor)
 
@@ -970,15 +1036,16 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
                                            rp_uuid)
 
     def _check_allocation_during_evacuate(
-            self, flavor, server_uuid, source_root_rp_uuid, dest_root_rp_uuid):
-
+        self, flavor, server_uuid, source_root_rp_uuid, dest_root_rp_uuid,
+    ):
         allocations = self._get_allocations_by_server_uuid(server_uuid)
         self.assertEqual(2, len(allocations))
         self.assertFlavorMatchesUsage(source_root_rp_uuid, flavor)
         self.assertFlavorMatchesUsage(dest_root_rp_uuid, flavor)
 
-    def assert_hypervisor_usage(self, compute_node_uuid, flavor,
-                                volume_backed):
+    def assert_hypervisor_usage(
+        self, compute_node_uuid, flavor, volume_backed,
+    ):
         """Asserts the given hypervisor's resource usage matches the
         given flavor (assumes a single instance on the hypervisor).
 
@@ -990,11 +1057,14 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
         # GET /os-hypervisors/{uuid} requires at least 2.53
         with utils.temporary_mutation(self.admin_api, microversion='2.53'):
             hypervisor = self.admin_api.api_get(
-                '/os-hypervisors/%s' % compute_node_uuid).body['hypervisor']
+                '/os-hypervisors/%s' % compute_node_uuid
+            ).body['hypervisor']
+
         if volume_backed:
             expected_disk_usage = 0
         else:
             expected_disk_usage = flavor['disk']
+
         # Account for reserved_host_disk_mb.
         expected_disk_usage += compute_utils.convert_mb_to_ceil_gb(
             CONF.reserved_host_disk_mb)
@@ -1006,22 +1076,124 @@ class ProviderUsageBaseTestCase(test.TestCase, InstanceHelperMixin):
         expected_vcpu_usage = CONF.reserved_host_cpus + flavor['vcpus']
         self.assertEqual(expected_vcpu_usage, hypervisor['vcpus_used'])
 
-    def _confirm_resize(self, server):
-        self.api.post_server_action(server['id'], {'confirmResize': None})
-        server = self._wait_for_state_change(server, 'ACTIVE')
-        self._wait_for_instance_action_event(
-            server, instance_actions.CONFIRM_RESIZE,
-            'compute_confirm_resize', 'success')
-        return server
 
-    def _revert_resize(self, server):
-        self.api.post_server_action(server['id'], {'revertResize': None})
-        server = self._wait_for_state_change(server, 'ACTIVE')
-        self._wait_for_migration_status(server, ['reverted'])
-        # Note that the migration status is changed to "reverted" in the
-        # dest host revert_resize method but the allocations are cleaned up
-        # in the source host finish_revert_resize method so we need to wait
-        # for the finish_revert_resize method to complete.
-        fake_notifier.wait_for_versioned_notifications(
-            'instance.resize_revert.end')
-        return server
+class _IntegratedTestBase(test.TestCase, PlacementInstanceHelperMixin):
+    #: Whether the test requires global external locking being configured for
+    #: them. New tests should set this to False.
+    REQUIRES_LOCKING = True
+
+    #: Whether to use admin credentials for all nova API requests.
+    ADMIN_API = False
+
+    # TODO(stephenfin): Rename to API_MAJOR_VERSION
+    #: The default API major version to use for all nova API requests.
+    api_major_version = 'v2.1'
+
+    # TODO(stephenfin): Rename to API_MICRO_VERSION
+    #: The default microversion to use for all nova API requests; requires API
+    #: major version 2.1
+    microversion = None
+
+    #: Whether to include the project ID in the URL for API requests through
+    #: OSAPIFixture.
+    USE_PROJECT_ID = False
+
+    #: Whether to stub keystonemiddleware and NovaKeystoneContext; override to
+    #: making those middlewares behave as they would in real life, i.e. try to
+    #: do real authentication.
+    STUB_KEYSTONE = True
+
+    def setUp(self):
+        super(_IntegratedTestBase, self).setUp()
+
+        self.useFixture(nova_fixtures.CastAsCallFixture(self))
+
+        self.placement = self.useFixture(func_fixtures.PlacementFixture()).api
+        self.neutron = self.useFixture(nova_fixtures.NeutronFixture(self))
+        self.cinder = self.useFixture(nova_fixtures.CinderFixture(self))
+        self.glance = self.useFixture(nova_fixtures.GlanceFixture(self))
+        self.policy = self.useFixture(nova_fixtures.RealPolicyFixture())
+
+        self.notifier = self.useFixture(
+            nova_fixtures.NotificationFixture(self))
+
+        self._setup_services()
+
+    def _setup_compute_service(self):
+        return self._start_compute('compute')
+
+    def _setup_scheduler_service(self):
+        return self.start_service('scheduler')
+
+    def _setup_conductor_service(self):
+        return self.start_service('conductor')
+
+    def _setup_services(self):
+        # NOTE(danms): Set the global MQ connection to that of our first cell
+        # for any cells-ignorant code. Normally this is defaulted in the tests
+        # which will result in us not doing the right thing.
+        if 'cell1' in self.cell_mappings:
+            self.flags(transport_url=self.cell_mappings['cell1'].transport_url)
+
+        self.conductor = self._setup_conductor_service()
+        self.scheduler = self._setup_scheduler_service()
+        self.compute = self._setup_compute_service()
+
+        self.api_fixture = self.useFixture(
+            nova_fixtures.OSAPIFixture(
+                api_version=self.api_major_version,
+                use_project_id_in_urls=self.USE_PROJECT_ID,
+                stub_keystone=self.STUB_KEYSTONE))
+
+        self.admin_api = self.api_fixture.admin_api
+        # if the class needs to run as admin, make the api endpoint
+        # the admin, otherwise it's safer to run as non admin user.
+        if self.ADMIN_API:
+            self.api = self.api_fixture.admin_api
+        else:
+            self.api = self.api_fixture.api
+
+        if self.microversion:
+            self.api.microversion = self.microversion
+
+            if not self.ADMIN_API:
+                self.admin_api.microversion = self.microversion
+
+
+# TODO(stephenfin): This is almost identical to '_IntegratedTestBase' now and
+# could be removed
+class ProviderUsageBaseTestCase(test.TestCase, PlacementInstanceHelperMixin):
+    """Base test class for functional tests that check provider usage
+    and consumer allocations in Placement during various operations.
+
+    Subclasses must define a **compute_driver** attribute for the virt driver
+    to use.
+
+    This class sets up standard fixtures and controller services but does not
+    start any compute services, that is left to the subclass.
+    """
+
+    microversion = 'latest'
+
+    def setUp(self):
+        self.flags(compute_driver=self.compute_driver)
+        super(ProviderUsageBaseTestCase, self).setUp()
+
+        self.policy = self.useFixture(nova_fixtures.RealPolicyFixture())
+        self.neutron = self.useFixture(nova_fixtures.NeutronFixture(self))
+        self.glance = self.useFixture(nova_fixtures.GlanceFixture(self))
+        self.placement = self.useFixture(func_fixtures.PlacementFixture()).api
+        self.useFixture(nova_fixtures.AllServicesCurrent())
+
+        self.notifier = self.useFixture(
+            nova_fixtures.NotificationFixture(self))
+
+        self.api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
+            api_version='v2.1'))
+
+        self.admin_api = self.api_fixture.admin_api
+        self.admin_api.microversion = self.microversion
+        self.api = self.admin_api
+
+        self.start_service('conductor')
+        self.scheduler_service = self.start_service('scheduler')

@@ -23,12 +23,11 @@ SHOULD include dedicated exception logging.
 """
 
 from oslo_log import log as logging
-import six
 
 import webob.exc
 from webob import util as woutil
 
-from nova.i18n import _, _LE
+from nova.i18n import _
 
 LOG = logging.getLogger(__name__)
 
@@ -49,7 +48,7 @@ class ConvertedException(webob.exc.WSGIHTTPException):
             try:
                 self.title = woutil.status_reasons[self.code]
             except KeyError:
-                msg = _LE("Improper or unknown HTTP status code used: %d")
+                msg = "Improper or unknown HTTP status code used: %d"
                 LOG.error(msg, code)
                 self.title = woutil.status_generic_reasons[self.code // 100]
         self.explanation = explanation
@@ -82,7 +81,7 @@ class NovaException(Exception):
             if not message:
                 message = self.msg_fmt % kwargs
             else:
-                message = six.text_type(message)
+                message = str(message)
         except Exception:
             # NOTE(melwitt): This is done in a separate method so it can be
             # monkey-patched during testing to make it a hard failure.
@@ -95,7 +94,7 @@ class NovaException(Exception):
     def _log_exception(self):
         # kwargs doesn't match a variable in the message
         # log the issue and the kwargs
-        LOG.exception(_LE('Exception in string format operation'))
+        LOG.exception('Exception in string format operation')
         for name, value in self.kwargs.items():
             LOG.error("%s: %s" % (name, value))  # noqa
 
@@ -154,6 +153,10 @@ class CinderAPIVersionNotAvailable(NovaException):
 class Forbidden(NovaException):
     msg_fmt = _("Forbidden")
     code = 403
+
+
+class ForbiddenWithAccelerators(Forbidden):
+    msg_fmt = _("Forbidden with instances that have accelerators.")
 
 
 class AdminRequired(Forbidden):
@@ -244,6 +247,11 @@ class TooManyDiskDevices(InvalidBDM):
     msg_fmt = _('The maximum allowed number of disk devices (%(maximum)d) to '
                 'attach to a single instance has been exceeded.')
     code = 403
+
+
+class InvalidBDMDiskBus(InvalidBDM):
+    msg_fmr = _("Block Device Mapping is invalid: The provided disk bus "
+                "%(disk_bus)s is not valid.")
 
 
 class InvalidAttribute(Invalid):
@@ -501,7 +509,7 @@ class ComputeResourcesUnavailable(ServiceUnavailable):
 
 
 class HypervisorUnavailable(NovaException):
-    msg_fmt = _("Connection to the hypervisor is broken on host: %(host)s")
+    msg_fmt = _("Connection to the hypervisor is broken on host")
 
 
 class ComputeServiceUnavailable(ServiceUnavailable):
@@ -523,6 +531,20 @@ class OperationNotSupportedForSEV(NovaException):
     code = 409
 
 
+class OperationNotSupportedForVTPM(NovaException):
+    msg_fmt = _("Operation '%(operation)s' not supported for vTPM-enabled "
+                "instance (%(instance_uuid)s).")
+    code = 409
+
+
+class OperationNotSupportedForVDPAInterface(NovaException):
+    msg_fmt = _(
+        "Operation '%(operation)s' not supported for instance with "
+        "vDPA ports ((instance_uuid)s)."
+    )
+    code = 409
+
+
 class InvalidHypervisorType(Invalid):
     msg_fmt = _("The supplied hypervisor type of is invalid.")
 
@@ -541,6 +563,14 @@ class ServiceTooOld(Invalid):
     msg_fmt = _("This service is older (v%(thisver)i) than the minimum "
                 "(v%(minver)i) version of the rest of the deployment. "
                 "Unable to continue.")
+
+
+class TooOldComputeService(Invalid):
+    msg_fmt = _("Current Nova version does not support computes older than "
+                "%(oldest_supported_version)s but the minimum compute service "
+                "level in your %(scope)s is %(min_service_level)d and the "
+                "oldest supported service level is "
+                "%(oldest_supported_service)d.")
 
 
 class DestinationDiskExists(Invalid):
@@ -586,6 +616,10 @@ class ImageBadRequest(Invalid):
                 "%(response)s")
 
 
+class ImageImportImpossible(Invalid):
+    msg_fmt = _("Import of image %(image_id)s refused: %(reason)s")
+
+
 class ImageQuotaExceeded(NovaException):
     msg_fmt = _("Quota exceeded or out of space for image %(image_id)s "
                 "in the image service.")
@@ -611,15 +645,6 @@ class ConstraintNotMet(NovaException):
 class NotFound(NovaException):
     msg_fmt = _("Resource could not be found.")
     code = 404
-
-
-class AgentBuildNotFound(NotFound):
-    msg_fmt = _("No agent-build associated with id %(id)s.")
-
-
-class AgentBuildExists(NovaException):
-    msg_fmt = _("Agent-build with hypervisor %(hypervisor)s os %(os)s "
-                "architecture %(architecture)s exists.")
 
 
 class VolumeAttachmentNotFound(NotFound):
@@ -676,6 +701,11 @@ class VolumeDriverNotFound(NotFound):
     msg_fmt = _("Could not find a handler for %(driver_type)s volume.")
 
 
+class VolumeDriverNotSupported(VolumeDriverNotFound):
+    msg_fmt = _("The %(volume_driver)s volume driver is not supported on this "
+                "platform.")
+
+
 class InvalidImageRef(Invalid):
     msg_fmt = _("Invalid image href %(image_href)s.")
 
@@ -693,17 +723,9 @@ class ImageDeleteConflict(NovaException):
     msg_fmt = _("Conflict deleting image. Reason: %(reason)s.")
 
 
-class ImageHandlerUnsupported(NovaException):
-    msg_fmt = _("Error: unsupported image handler %(image_handler)s.")
-
-
 class PreserveEphemeralNotSupported(Invalid):
     msg_fmt = _("The current driver does not support "
                 "preserving ephemeral partitions.")
-
-
-class StorageRepositoryNotFound(NotFound):
-    msg_fmt = _("Cannot find SR to read/write VDI.")
 
 
 class InstanceMappingNotFound(NotFound):
@@ -794,13 +816,13 @@ class PortBindingFailed(Invalid):
 
 
 class PortBindingDeletionFailed(NovaException):
-    msg_fmt = _("Failed to delete binding for port %(port_id)s and host "
-                "%(host)s.")
+    msg_fmt = _("Failed to delete binding for port(s) %(port_id)s on host "
+                "%(host)s; please check neutron logs for more information")
 
 
 class PortBindingActivationFailed(NovaException):
-    msg_fmt = _("Failed to activate binding for port %(port_id)s and host "
-                "%(host)s.")
+    msg_fmt = _("Failed to activate binding for port %(port_id)s on host "
+                "%(host)s; please check neutron logs for more information")
 
 
 class PortUpdateFailed(Invalid):
@@ -1173,16 +1195,17 @@ class BootFromVolumeRequiredForZeroDiskFlavor(Forbidden):
                 "zero disk.")
 
 
-class InsufficientFreeMemory(NovaException):
-    msg_fmt = _("Insufficient free memory on compute node to start %(uuid)s.")
-
-
 class NoValidHost(NovaException):
     msg_fmt = _("No valid host was found. %(reason)s")
 
 
 class RequestFilterFailed(NovaException):
     msg_fmt = _("Scheduling failed: %(reason)s")
+
+
+class InvalidRoutedNetworkConfiguration(NovaException):
+    msg_fmt = _("Neutron routed networks configuration is invalid: "
+                "%(reason)s.")
 
 
 class MaxRetriesExceeded(NoValidHost):
@@ -1233,11 +1256,6 @@ class SecurityGroupLimitExceeded(QuotaError):
 
 class PortLimitExceeded(QuotaError):
     msg_fmt = _("Maximum number of ports exceeded")
-
-
-class AggregateError(NovaException):
-    msg_fmt = _("Aggregate %(aggregate_id)s: action '%(action)s' "
-                "caused an error: %(reason)s.")
 
 
 class AggregateNotFound(NotFound):
@@ -1333,6 +1351,16 @@ class InterfaceAttachFailedNoNetwork(Invalid):
                 "for project '%(project_id)s'.")
 
 
+class InterfaceAttachPciClaimFailed(Invalid):
+    msg_fmt = _("Failed to claim PCI device for %(instance_uuid)s during "
+                "interface attach")
+
+
+class InterfaceAttachResourceAllocationFailed(Invalid):
+    msg_fmt = _("Failed to allocate additional resources to %(instance_uuid)s "
+                "during interface attach")
+
+
 class InterfaceDetachFailed(Invalid):
     msg_fmt = _("Failed to detach network adapter device from "
                 "%(instance_uuid)s")
@@ -1388,6 +1416,19 @@ class UnsupportedHardware(Invalid):
                 "the '%(virt)s' virt driver")
 
 
+class UnsupportedRescueBus(Invalid):
+    msg_fmt = _("Requested rescue bus '%(bus)s' is not supported by "
+                "the '%(virt)s' virt driver")
+
+
+class UnsupportedRescueDevice(Invalid):
+    msg_fmt = _("Requested rescue device '%(device)s' is not supported")
+
+
+class UnsupportedRescueImage(Invalid):
+    msg_fmt = _("Requested rescue image '%(image)s' is not supported")
+
+
 class Base64Exception(NovaException):
     msg_fmt = _("Invalid Base 64 data for file %(path)s")
 
@@ -1399,10 +1440,6 @@ class BuildAbortException(NovaException):
 class RescheduledException(NovaException):
     msg_fmt = _("Build of instance %(instance_uuid)s was re-scheduled: "
                 "%(reason)s")
-
-
-class ShadowTableExists(NovaException):
-    msg_fmt = _("Shadow table with name %(name)s already exists.")
 
 
 class InstanceFaultRollback(NovaException):
@@ -1418,19 +1455,6 @@ class OrphanedObjectError(NovaException):
 
 class ObjectActionError(NovaException):
     msg_fmt = _('Object action %(action)s failed because: %(reason)s')
-
-
-class AgentError(NovaException):
-    msg_fmt = _('Error during following call to agent: %(method)s')
-
-
-class AgentTimeout(AgentError):
-    msg_fmt = _('Unable to contact guest agent. '
-                'The following call timed out: %(method)s')
-
-
-class AgentNotImplemented(AgentError):
-    msg_fmt = _('Agent does not support the call: %(method)s')
 
 
 class InstanceGroupNotFound(NotFound):
@@ -1527,11 +1551,6 @@ class InternalError(NovaException):
     Consider subclassing this to provide more specific exceptions.
     """
     msg_fmt = "%(err)s"
-
-
-class PciDevicePrepareFailed(NovaException):
-    msg_fmt = _("Failed to prepare PCI device %(id)s for instance "
-                "%(instance_uuid)s: %(reason)s")
 
 
 class PciDeviceDetachFailed(NovaException):
@@ -1736,6 +1755,15 @@ class InvalidMachineType(Invalid):
                 "%(image_name)s (%(image_id)s): %(reason)s")
 
 
+class InvalidMachineTypeUpdate(Invalid):
+    msg_fmt = _("Cannot update machine type %(existing_machine_type)s to "
+                "%(machine_type)s.")
+
+
+class UnsupportedMachineType(Invalid):
+    msg_fmt = _("Machine type %(machine_type)s is not supported.")
+
+
 class InvalidVirtualMachineMode(Invalid):
     msg_fmt = _("Virtual machine mode '%(vmmode)s' is not recognised")
 
@@ -1867,6 +1895,10 @@ class UEFINotSupported(Invalid):
     msg_fmt = _("UEFI is not supported")
 
 
+class SecureBootNotSupported(Invalid):
+    msg_fmt = _("Secure Boot is not supported by host")
+
+
 class TriggerCrashDumpNotSupported(Invalid):
     msg_fmt = _("Triggering crash dump is not supported")
 
@@ -1880,9 +1912,8 @@ class LibguestfsCannotReadKernel(Invalid):
 
 
 class RealtimeMaskNotFoundOrInvalid(Invalid):
-    msg_fmt = _("Realtime policy needs vCPU(s) mask configured with at least "
-                "1 RT vCPU and 1 ordinary vCPU. See hw:cpu_realtime_mask "
-                "or hw_cpu_realtime_mask")
+    msg_fmt = _("Use of realtime CPUs requires either one or more "
+                "non-realtime CPU(s) or offloaded emulator threads.")
 
 
 class OsInfoNotFound(NotFound):
@@ -2001,11 +2032,6 @@ class InventoryInUse(InvalidInventory):
 class UsagesRetrievalFailed(NovaException):
     msg_fmt = _("Failed to retrieve usages for project '%(project_id)s' and "
                 "user '%(user_id)s'.")
-
-
-class UnsupportedPointerModelRequested(Invalid):
-    msg_fmt = _("Pointer model '%(model)s' requested is not supported by "
-                "host.")
 
 
 class NotSupportedWithOption(Invalid):
@@ -2268,13 +2294,17 @@ class PMEMNamespaceConfigInvalid(NovaException):
                 "please check your conf file. ")
 
 
+class GetPMEMNamespacesFailed(NovaException):
+    msg_fmt = _("Get PMEM namespaces on host failed: %(reason)s.")
+
+
 class VPMEMCleanupFailed(NovaException):
     msg_fmt = _("Failed to clean up the vpmem backend device %(dev)s: "
                 "%(error)s")
 
 
 class RequestGroupSuffixConflict(NovaException):
-    msg_fmt = _("Duplicate request group suffix %(suffix)s!")
+    msg_fmt = _("Duplicate request group suffix %(suffix)s.")
 
 
 class AmbiguousResourceProviderForPCIRequest(NovaException):
@@ -2289,3 +2319,56 @@ class UnexpectedResourceProviderNameForPCIRequest(NovaException):
                 "formatted name. Expected name format is "
                 "<hostname>:<agentname>:<interfacename>, but got "
                 "%(provider_name)s")
+
+
+class DeviceProfileError(NovaException):
+    msg_fmt = _("Device profile name %(name)s: %(msg)s")
+
+
+class AcceleratorRequestOpFailed(NovaException):
+    msg_fmt = _("Failed to %(op)s accelerator requests: %(msg)s")
+
+
+class AcceleratorRequestBindingFailed(NovaException):
+    msg_fmt = _("Failed to bind accelerator requests: %(msg)s")
+
+    def __init__(self, arqs, **kwargs):
+        super().__init__(message=self.msg_fmt, **kwargs)
+        self.arqs = arqs or []
+
+
+class InvalidLibvirtGPUConfig(NovaException):
+    msg_fmt = _('Invalid configuration for GPU devices: %(reason)s')
+
+
+class RequiredMixedInstancePolicy(Invalid):
+    msg_fmt = _("Cannot specify 'hw:cpu_dedicated_mask' without the "
+                "'mixed' policy.")
+
+
+class RequiredMixedOrRealtimeCPUMask(Invalid):
+    msg_fmt = _("Dedicated CPU set can be specified from either "
+                "'hw:cpu_dedicated_mask' or 'hw:cpu_realtime_mask' when "
+                "using 'mixed' CPU policy. 'hw:cpu_dedicated_mask' and "
+                "'hw:cpu_realtime_mask' can not be specified at the same "
+                "time, or be specified with none of them.")
+
+
+class MixedInstanceNotSupportByComputeService(NovaException):
+    msg_fmt = _("To support 'mixed' policy instance 'nova-compute' service "
+                "must be upgraded to 'Victoria' or later.")
+
+
+class InvalidMixedInstanceDedicatedMask(Invalid):
+    msg_fmt = _("Mixed instance must have at least 1 pinned vCPU and 1 "
+                "unpinned vCPU. See 'hw:cpu_dedicated_mask'.")
+
+
+class ProviderConfigException(NovaException):
+    """Exception indicating an error occurred processing provider config files.
+
+    This class is used to avoid a raised exception inadvertently being caught
+    and mishandled by the resource tracker.
+    """
+    msg_fmt = _("An error occurred while processing "
+                "a provider config file: %(error)s")

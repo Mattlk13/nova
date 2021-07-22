@@ -14,6 +14,7 @@
 #    under the License.
 
 import datetime
+from io import StringIO
 import sys
 import warnings
 
@@ -24,16 +25,15 @@ from oslo_db import exception as db_exc
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel
 from oslo_utils import uuidutils
-from six.moves import StringIO
 
 from nova.cmd import manage
 from nova import conf
 from nova import context
 from nova.db import api as db
-from nova.db import migration
 from nova.db.sqlalchemy import migration as sqla_migration
 from nova import exception
 from nova import objects
+from nova.scheduler.client import report
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.unit import fake_requests
@@ -143,10 +143,14 @@ class DbCommandsTestCase(test.NoDBTestCase):
                                                     purge=purge)
         mock_db_archive.assert_has_calls([
             # Called with max_rows=30 but only 15 were archived.
-            mock.call(test.MatchType(context.RequestContext), 30, before=None),
+            mock.call(
+                test.MatchType(context.RequestContext), 30, before=None,
+                task_log=False),
             # So the total from the last call was 15 and the new max_rows=15
             # for the next call in the second cell.
-            mock.call(test.MatchType(context.RequestContext), 15, before=None)
+            mock.call(
+                test.MatchType(context.RequestContext), 15, before=None,
+                task_log=False)
         ])
         output = self.output.getvalue()
         expected = '''\
@@ -218,18 +222,28 @@ class DbCommandsTestCase(test.NoDBTestCase):
                                                     until_complete=True)
         mock_db_archive.assert_has_calls([
             # Called with max_rows=30 but only 15 were archived.
-            mock.call(test.MatchType(context.RequestContext), 30, before=None),
+            mock.call(
+                test.MatchType(context.RequestContext), 30, before=None,
+                task_log=False),
             # Called with max_rows=30 but 0 were archived (nothing left to
             # archive in this cell)
-            mock.call(test.MatchType(context.RequestContext), 30, before=None),
+            mock.call(
+                test.MatchType(context.RequestContext), 30, before=None,
+                task_log=False),
             # So the total from the last call was 0 and the new max_rows=30
             # because until_complete=True.
-            mock.call(test.MatchType(context.RequestContext), 30, before=None),
+            mock.call(
+                test.MatchType(context.RequestContext), 30, before=None,
+                task_log=False),
             # Called with max_rows=30 but 0 were archived (nothing left to
             # archive in this cell)
-            mock.call(test.MatchType(context.RequestContext), 30, before=None),
+            mock.call(
+                test.MatchType(context.RequestContext), 30, before=None,
+                task_log=False),
             # Called one final time with max_rows=30
-            mock.call(test.MatchType(context.RequestContext), 30, before=None)
+            mock.call(
+                test.MatchType(context.RequestContext), 30, before=None,
+                task_log=False)
         ])
         output = self.output.getvalue()
         expected = '''\
@@ -252,7 +266,8 @@ Archiving.....complete
     def _test_archive_deleted_rows(self, mock_db_archive, verbose=False):
         result = self.commands.archive_deleted_rows(20, verbose=verbose)
         mock_db_archive.assert_called_once_with(
-            test.MatchType(context.RequestContext), 20, before=None)
+            test.MatchType(context.RequestContext), 20, before=None,
+            task_log=False)
         output = self.output.getvalue()
         if verbose:
             expected = '''\
@@ -304,9 +319,15 @@ Archiving.....complete
 
         self.assertEqual(expected, self.output.getvalue())
         mock_db_archive.assert_has_calls([
-            mock.call(test.MatchType(context.RequestContext), 20, before=None),
-            mock.call(test.MatchType(context.RequestContext), 20, before=None),
-            mock.call(test.MatchType(context.RequestContext), 20, before=None),
+            mock.call(
+                test.MatchType(context.RequestContext), 20, before=None,
+                task_log=False),
+            mock.call(
+                test.MatchType(context.RequestContext), 20, before=None,
+                task_log=False),
+            mock.call(
+                test.MatchType(context.RequestContext), 20, before=None,
+                task_log=False),
         ])
 
     def test_archive_deleted_rows_until_complete_quiet(self):
@@ -344,9 +365,15 @@ Rows were archived, running purge...
 
         self.assertEqual(expected, self.output.getvalue())
         mock_db_archive.assert_has_calls([
-            mock.call(test.MatchType(context.RequestContext), 20, before=None),
-            mock.call(test.MatchType(context.RequestContext), 20, before=None),
-            mock.call(test.MatchType(context.RequestContext), 20, before=None),
+            mock.call(
+                test.MatchType(context.RequestContext), 20, before=None,
+                task_log=False),
+            mock.call(
+                test.MatchType(context.RequestContext), 20, before=None,
+                task_log=False),
+            mock.call(
+                test.MatchType(context.RequestContext), 20, before=None,
+                task_log=False),
         ])
         mock_db_purge.assert_called_once_with(mock.ANY, None,
                                               status_fn=mock.ANY)
@@ -405,8 +432,12 @@ Archiving....stopped
 
         self.assertEqual(expected, self.output.getvalue())
         mock_db_archive.assert_has_calls([
-            mock.call(test.MatchType(context.RequestContext), 20, before=None),
-            mock.call(test.MatchType(context.RequestContext), 20, before=None)
+            mock.call(
+                test.MatchType(context.RequestContext), 20, before=None,
+                task_log=False),
+            mock.call(
+                test.MatchType(context.RequestContext), 20, before=None,
+                task_log=False)
         ])
 
     def test_archive_deleted_rows_until_stopped_quiet(self):
@@ -422,7 +453,8 @@ Archiving....stopped
         result = self.commands.archive_deleted_rows(20, before='2017-01-13')
         mock_db_archive.assert_called_once_with(
                 test.MatchType(context.RequestContext), 20,
-                before=datetime.datetime(2017, 1, 13))
+                before=datetime.datetime(2017, 1, 13),
+                task_log=False)
         self.assertEqual(1, result)
 
     @mock.patch.object(db, 'archive_deleted_rows', return_value=({}, [], 0))
@@ -432,7 +464,8 @@ Archiving....stopped
         result = self.commands.archive_deleted_rows(20, verbose=True,
                                                     purge=True)
         mock_db_archive.assert_called_once_with(
-            test.MatchType(context.RequestContext), 20, before=None)
+            test.MatchType(context.RequestContext), 20, before=None,
+            task_log=False)
         output = self.output.getvalue()
         # If nothing was archived, there should be no purge messages
         self.assertIn('Nothing was archived.', output)
@@ -474,7 +507,9 @@ Archiving....stopped
 
         self.assertEqual(1, result)
         mock_db_archive.assert_has_calls([
-            mock.call(test.MatchType(context.RequestContext), 20, before=None)
+            mock.call(
+                test.MatchType(context.RequestContext), 20, before=None,
+                task_log=False)
         ])
         self.assertEqual(1, mock_reqspec_destroy.call_count)
         mock_members_destroy.assert_called_once()
@@ -582,32 +617,6 @@ Cell %s: 456
         ret = self.commands.purge(purge_all=True, all_cells=True)
         self.assertEqual(4, ret)
         self.assertIn('Unable to get cell list', self.output.getvalue())
-
-    @mock.patch.object(migration, 'db_null_instance_uuid_scan',
-                       return_value={'foo': 0})
-    def test_null_instance_uuid_scan_no_records_found(self, mock_scan):
-        self.commands.null_instance_uuid_scan()
-        self.assertIn("There were no records found", self.output.getvalue())
-
-    @mock.patch.object(migration, 'db_null_instance_uuid_scan',
-                       return_value={'foo': 1, 'bar': 0})
-    def _test_null_instance_uuid_scan(self, mock_scan, delete):
-        self.commands.null_instance_uuid_scan(delete)
-        output = self.output.getvalue()
-
-        if delete:
-            self.assertIn("Deleted 1 records from table 'foo'.", output)
-            self.assertNotIn("Deleted 0 records from table 'bar'.", output)
-        else:
-            self.assertIn("1 records in the 'foo' table", output)
-            self.assertNotIn("0 records in the 'bar' table", output)
-        self.assertNotIn("There were no records found", output)
-
-    def test_null_instance_uuid_scan_readonly(self):
-        self._test_null_instance_uuid_scan(delete=False)
-
-    def test_null_instance_uuid_scan_delete(self):
-        self._test_null_instance_uuid_scan(delete=True)
 
     @mock.patch.object(sqla_migration, 'db_version', return_value=2)
     def test_version(self, sqla_migrate):
@@ -2346,6 +2355,24 @@ class TestNovaManagePlacement(test.NoDBTestCase):
         self.cli = manage.PlacementCommands()
         self.useFixture(fixtures.MockPatch('nova.network.neutron.get_client'))
 
+    def test_heal_allocations_with_cell_instance_id(self):
+        """Test heal allocation with both cell id and instance id"""
+        cell_uuid = uuidutils.generate_uuid()
+        instance_uuid = uuidutils.generate_uuid()
+        self.assertEqual(127, self.cli.heal_allocations(
+                        instance_uuid=instance_uuid,
+                        cell_uuid=cell_uuid))
+        self.assertIn('The --cell and --instance options',
+        self.output.getvalue())
+
+    @mock.patch('nova.objects.CellMapping.get_by_uuid',
+                side_effect=exception.CellMappingNotFound(uuid='fake'))
+    def test_heal_allocations_with_cell_id_not_found(self, mock_get):
+        """Test the case where cell_id is not found"""
+        self.assertEqual(127, self.cli.heal_allocations(cell_uuid='fake'))
+        output = self.output.getvalue().strip()
+        self.assertEqual('Cell with uuid fake was not found.', output)
+
     @ddt.data(-1, 0, "one")
     def test_heal_allocations_invalid_max_count(self, max_count):
         self.assertEqual(127, self.cli.heal_allocations(max_count=max_count))
@@ -2860,6 +2887,142 @@ class TestNovaManagePlacement(test.NoDBTestCase):
         neutron.update_port.assert_called_once_with(
             uuidsentinel.port_id, body=expected_update_body)
 
+    def test_audit_with_wrong_provider_uuid(self):
+        with mock.patch.object(
+                self.cli, '_get_resource_provider',
+                side_effect=exception.ResourceProviderNotFound(
+                    name_or_uuid=uuidsentinel.fake_uuid)):
+            ret = self.cli.audit(
+                provider_uuid=uuidsentinel.fake_uuid)
+        self.assertEqual(127, ret)
+        output = self.output.getvalue()
+        self.assertIn(
+            'Resource provider with UUID %s' % uuidsentinel.fake_uuid,
+            output)
+
+    @mock.patch.object(manage.PlacementCommands,
+                       '_check_orphaned_allocations_for_provider')
+    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.get')
+    def _test_audit(self, get_resource_providers, check_orphaned_allocs,
+                     verbose=False, delete=False, errors=False, found=False):
+        rps = [
+              {"generation": 1,
+               "uuid": uuidsentinel.rp1,
+               "links": None,
+               "name": "rp1",
+               "parent_provider_uuid": None,
+               "root_provider_uuid": uuidsentinel.rp1},
+              {"generation": 1,
+               "uuid": uuidsentinel.rp2,
+               "links": None,
+               "name": "rp2",
+               "parent_provider_uuid": None,
+               "root_provider_uuid": uuidsentinel.rp2},
+              ]
+        get_resource_providers.return_value = fake_requests.FakeResponse(
+            200, content=jsonutils.dumps({"resource_providers": rps}))
+
+        if errors:
+            # We found one orphaned allocation per RP but RP1 got a fault
+            check_orphaned_allocs.side_effect = ((1, 1), (1, 0))
+        elif found:
+            # we found one orphaned allocation per RP and we had no faults
+            check_orphaned_allocs.side_effect = ((1, 0), (1, 0))
+        else:
+            # No orphaned allocations are found for all the RPs
+            check_orphaned_allocs.side_effect = ((0, 0), (0, 0))
+
+        ret = self.cli.audit(verbose=verbose, delete=delete)
+        if errors:
+            # Any fault stops the audit and provides a return code equals to 1
+            expected_ret = 1
+        elif found and delete:
+            # We found orphaned allocations and deleted them
+            expected_ret = 4
+        elif found and not delete:
+            # We found orphaned allocations but we left them
+            expected_ret = 3
+        else:
+            # Nothing was found
+            expected_ret = 0
+        self.assertEqual(expected_ret, ret)
+
+        call1 = mock.call(mock.ANY, mock.ANY, mock.ANY, rps[0], delete)
+        call2 = mock.call(mock.ANY, mock.ANY, mock.ANY, rps[1], delete)
+        if errors:
+            # We stop checking other RPs once we got a fault
+            check_orphaned_allocs.assert_has_calls([call1])
+        else:
+            # All the RPs are checked
+            check_orphaned_allocs.assert_has_calls([call1, call2])
+
+        if verbose and found:
+            output = self.output.getvalue()
+            self.assertIn('Processed 2 allocations', output)
+        if errors:
+            output = self.output.getvalue()
+            self.assertIn(
+                'The Resource Provider %s had problems' % rps[0]["uuid"],
+                output)
+
+    def test_audit_not_found_orphaned_allocs(self):
+        self._test_audit(found=False)
+
+    def test_audit_found_orphaned_allocs_not_verbose(self):
+        self._test_audit(found=True)
+
+    def test_audit_found_orphaned_allocs_verbose(self):
+        self._test_audit(found=True, verbose=True)
+
+    def test_audit_found_orphaned_allocs_and_deleted_them(self):
+        self._test_audit(found=True, delete=True)
+
+    def test_audit_found_orphaned_allocs_but_got_errors(self):
+        self._test_audit(errors=True)
+
+    @mock.patch.object(manage.PlacementCommands,
+                       '_delete_allocations_from_consumer')
+    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
+                'get_allocations_for_resource_provider')
+    @mock.patch.object(manage.PlacementCommands,
+                       '_get_instances_and_current_migrations')
+    def test_check_orphaned_allocations_for_provider(self,
+                                                     get_insts_and_migs,
+                                                     get_allocs_for_rp,
+                                                     delete_allocs):
+        provider = {"generation": 1,
+                    "uuid": uuidsentinel.rp1,
+                    "links": None,
+                    "name": "rp1",
+                    "parent_provider_uuid": None,
+                    "root_provider_uuid": uuidsentinel.rp1}
+        compute_resources = {'VCPU': 1, 'MEMORY_MB': 2048, 'DISK_GB': 20}
+        allocations = {
+            # Some orphaned compute allocation
+            uuidsentinel.orphaned_alloc1: {'resources': compute_resources},
+            # Some existing instance allocation
+            uuidsentinel.inst1: {'resources': compute_resources},
+            # Some existing migration allocation
+            uuidsentinel.mig1: {'resources': compute_resources},
+            # Some other allocation not related to Nova
+            uuidsentinel.other_alloc1: {'resources': {'CUSTOM_GOO'}},
+        }
+
+        get_insts_and_migs.return_value = (
+            [uuidsentinel.inst1],
+            [uuidsentinel.mig1])
+        get_allocs_for_rp.return_value = report.ProviderAllocInfo(allocations)
+
+        ctxt = context.RequestContext()
+        placement = report.SchedulerReportClient()
+        ret = self.cli._check_orphaned_allocations_for_provider(
+            ctxt, placement, lambda x: x, provider, True)
+        get_allocs_for_rp.assert_called_once_with(ctxt, uuidsentinel.rp1)
+        delete_allocs.assert_called_once_with(ctxt, placement, provider,
+                                              uuidsentinel.orphaned_alloc1,
+                                              'instance')
+        self.assertEqual((1, 0), ret)
+
 
 class TestNovaManageMain(test.NoDBTestCase):
     """Tests the nova-manage:main() setup code."""
@@ -2891,3 +3054,296 @@ class TestNovaManageMain(test.NoDBTestCase):
             mock_conf.post_mortem = True
             self.assertEqual(255, manage.main())
             self.assertTrue(mock_pm.called)
+
+
+class LibvirtCommandsTestCase(test.NoDBTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.output = StringIO()
+        self.useFixture(fixtures.MonkeyPatch('sys.stdout', self.output))
+        self.commands = manage.LibvirtCommands()
+
+    @mock.patch('nova.virt.libvirt.machine_type_utils.get_machine_type')
+    @mock.patch('nova.context.get_admin_context')
+    def test_get(self, mock_get_context, mock_get_machine_type):
+        mock_get_context.return_value = mock.sentinel.admin_context
+        mock_get_machine_type.return_value = 'pc'
+        ret = self.commands.get_machine_type(
+            instance_uuid=uuidsentinel.instance
+        )
+        mock_get_machine_type.assert_called_once_with(
+            mock.sentinel.admin_context,
+            uuidsentinel.instance
+        )
+        output = self.output.getvalue()
+        self.assertEqual(0, ret)
+        self.assertIn('pc', output)
+
+    @mock.patch('nova.virt.libvirt.machine_type_utils.get_machine_type')
+    @mock.patch('nova.context.get_admin_context')
+    def test_get_unknown_failure(
+        self, mock_get_context, mock_get_machine_type
+    ):
+        mock_get_machine_type.side_effect = Exception()
+        ret = self.commands.get_machine_type(
+            instance_uuid=uuidsentinel.instance
+        )
+        self.assertEqual(1, ret)
+
+    @mock.patch('nova.virt.libvirt.machine_type_utils.get_machine_type')
+    @mock.patch('nova.context.get_admin_context', new=mock.Mock())
+    def test_get_unable_to_find_instance_mapping(self, mock_get_machine_type):
+        mock_get_machine_type.side_effect = exception.InstanceMappingNotFound(
+            uuid=uuidsentinel.instance)
+        ret = self.commands.get_machine_type(
+            instance_uuid=uuidsentinel.instance
+        )
+        output = self.output.getvalue()
+        self.assertEqual(2, ret)
+        self.assertIn(
+            f"Instance {uuidsentinel.instance} has no mapping to a cell.",
+            output)
+
+    @mock.patch('nova.virt.libvirt.machine_type_utils.get_machine_type')
+    @mock.patch('nova.context.get_admin_context', new=mock.Mock())
+    def test_get_machine_type_unable_to_find_instance(
+        self, mock_get_machine_type
+    ):
+        mock_get_machine_type.side_effect = exception.InstanceNotFound(
+            instance_id=uuidsentinel.instance)
+        ret = self.commands.get_machine_type(
+            instance_uuid=uuidsentinel.instance)
+        output = self.output.getvalue()
+        self.assertEqual(2, ret)
+        self.assertIn(
+            f"Instance {uuidsentinel.instance} could not be found.",
+            output)
+
+    @mock.patch('nova.virt.libvirt.machine_type_utils.get_machine_type',
+                new=mock.Mock(return_value=None))
+    @mock.patch('nova.context.get_admin_context', new=mock.Mock())
+    def test_get_none_found(self):
+        ret = self.commands.get_machine_type(
+            instance_uuid=uuidsentinel.instance
+        )
+        output = self.output.getvalue()
+        self.assertEqual(3, ret)
+        self.assertIn("No machine type registered for instance "
+                      f"{uuidsentinel.instance}", output)
+
+    @mock.patch('nova.virt.libvirt.machine_type_utils.update_machine_type')
+    @mock.patch('nova.context.get_admin_context')
+    def test_update(self, mock_get_context, mock_update):
+        mock_update.return_value = ('pc-1.2', 'pc-1.1')
+        ret = self.commands.update_machine_type(
+            instance_uuid=uuidsentinel.instance,
+            machine_type='pc-1.2'
+        )
+        mock_update.assert_called_once_with(
+            mock_get_context.return_value,
+            uuidsentinel.instance,
+            'pc-1.2',
+            force=False
+        )
+        output = self.output.getvalue()
+        self.assertEqual(0, ret)
+        self.assertIn(
+            f"Updated instance {uuidsentinel.instance} machine type to pc-1.2 "
+            "(previously pc-1.1)",
+            output
+        )
+
+    @mock.patch('nova.virt.libvirt.machine_type_utils.update_machine_type')
+    @mock.patch('nova.context.get_admin_context')
+    def test_update_force(self, mock_get_context, mock_update):
+        mock_update.return_value = ('q35', 'pc')
+        ret = self.commands.update_machine_type(
+            instance_uuid=uuidsentinel.instance,
+            machine_type='q35',
+            force=True
+        )
+        mock_update.assert_called_once_with(
+            mock_get_context.return_value,
+            uuidsentinel.instance,
+            'q35',
+            force=True
+        )
+        output = self.output.getvalue()
+        self.assertEqual(0, ret)
+        self.assertIn(
+            f"Updated instance {uuidsentinel.instance} machine type to q35 "
+            "(previously pc)",
+            output
+        )
+
+    @mock.patch('nova.virt.libvirt.machine_type_utils.update_machine_type')
+    @mock.patch('nova.context.get_admin_context', new=mock.Mock())
+    def test_update_unknown_failure(self, mock_update):
+        mock_update.side_effect = Exception()
+        ret = self.commands.update_machine_type(
+            instance_uuid=uuidsentinel.instance,
+            machine_type=mock.sentinel.machine_type
+        )
+        self.assertEqual(1, ret)
+
+    @mock.patch('nova.virt.libvirt.machine_type_utils.update_machine_type')
+    @mock.patch('nova.context.get_admin_context', new=mock.Mock())
+    def test_update_instance_mapping_not_found(self, mock_update):
+        mock_update.side_effect = exception.InstanceMappingNotFound(
+            uuid=uuidsentinel.instance
+        )
+        ret = self.commands.update_machine_type(
+            instance_uuid=uuidsentinel.instance,
+            machine_type=mock.sentinel.machine_type
+        )
+        output = self.output.getvalue()
+        self.assertEqual(2, ret)
+        self.assertIn(
+            f"Instance {uuidsentinel.instance} has no mapping to a cell.",
+            output
+        )
+
+    @mock.patch('nova.virt.libvirt.machine_type_utils.update_machine_type')
+    @mock.patch('nova.context.get_admin_context', new=mock.Mock())
+    def test_update_instance_not_found(self, mock_update):
+        mock_update.side_effect = exception.InstanceNotFound(
+            instance_id=uuidsentinel.instance
+        )
+        ret = self.commands.update_machine_type(
+            instance_uuid=uuidsentinel.instance,
+            machine_type=mock.sentinel.machine_type
+        )
+        output = self.output.getvalue()
+        self.assertEqual(2, ret)
+        self.assertIn(
+            f"Instance {uuidsentinel.instance} could not be found.",
+            output
+        )
+
+    @mock.patch('nova.virt.libvirt.machine_type_utils.update_machine_type')
+    @mock.patch('nova.context.get_admin_context', new=mock.Mock())
+    def test_update_instance_invalid_state(self, mock_update):
+        mock_update.side_effect = exception.InstanceInvalidState(
+            instance_uuid=uuidsentinel.instance,
+            attr='vm_state',
+            state='ACTIVE',
+            method='update machine type'
+        )
+        ret = self.commands.update_machine_type(
+            instance_uuid=uuidsentinel.instance,
+            machine_type=mock.sentinel.machine_type
+        )
+        output = self.output.getvalue()
+        self.assertEqual(3, ret)
+        self.assertIn(
+            f"Instance {uuidsentinel.instance} in vm_state ACTIVE. Cannot "
+            "update machine type while the instance is in this state.",
+            output
+        )
+
+    @mock.patch('nova.virt.libvirt.machine_type_utils.update_machine_type')
+    @mock.patch('nova.context.get_admin_context', new=mock.Mock())
+    def test_update_invalid_machine_type_update(self, mock_update):
+        mock_update.side_effect = exception.InvalidMachineTypeUpdate(
+            existing_machine_type='q35',
+            machine_type='pc',
+        )
+        ret = self.commands.update_machine_type(
+            instance_uuid=uuidsentinel.instance,
+            machine_type=mock.sentinel.machine_type
+        )
+        output = self.output.getvalue()
+        self.assertEqual(4, ret)
+        self.assertIn(
+            "Cannot update machine type q35 to pc.",
+            output
+        )
+
+    @mock.patch('nova.virt.libvirt.machine_type_utils.update_machine_type')
+    @mock.patch('nova.context.get_admin_context', new=mock.Mock())
+    def test_update_unsupported_machine_type(self, mock_update):
+        mock_update.side_effect = exception.UnsupportedMachineType(
+            machine_type='foo'
+        )
+        ret = self.commands.update_machine_type(
+            instance_uuid=uuidsentinel.instance,
+            machine_type=mock.sentinel.machine_type
+        )
+        output = self.output.getvalue()
+        self.assertEqual(5, ret)
+        self.assertIn(
+            "Machine type foo is not supported.",
+            output
+        )
+
+    @mock.patch(
+        'nova.virt.libvirt.machine_type_utils.get_instances_without_type')
+    @mock.patch('nova.context.get_admin_context')
+    def test_list_unset_machine_type_none_found(
+        self, mock_get_context, mock_get_instances
+    ):
+        mock_get_context.return_value = mock.sentinel.admin_context
+        mock_get_instances.return_value = []
+        ret = self.commands.list_unset_machine_type(
+            cell_uuid=uuidsentinel.cell_uuid)
+        mock_get_instances.assert_called_once_with(
+            mock.sentinel.admin_context,
+            uuidsentinel.cell_uuid
+        )
+        output = self.output.getvalue()
+        self.assertEqual(0, ret)
+        self.assertIn(
+            "No instances found without hw_machine_type set.",
+            output
+        )
+
+    @mock.patch(
+        'nova.virt.libvirt.machine_type_utils.get_instances_without_type')
+    @mock.patch('nova.context.get_admin_context')
+    def test_list_unset_machine_type_unknown_failure(
+        self, mock_get_context, mock_get_instances
+    ):
+        mock_get_instances.side_effect = Exception()
+        ret = self.commands.list_unset_machine_type(
+            cell_uuid=uuidsentinel.cell_uuid)
+        self.assertEqual(1, ret)
+
+    @mock.patch(
+        'nova.virt.libvirt.machine_type_utils.get_instances_without_type')
+    @mock.patch('nova.context.get_admin_context')
+    def test_list_unset_machine_type_cell_mapping_not_found(
+        self, mock_get_context, mock_get_instances
+    ):
+        mock_get_context.return_value = mock.sentinel.admin_context
+        mock_get_instances.side_effect = exception.CellMappingNotFound(
+            uuid=uuidsentinel.cell_uuid
+        )
+        ret = self.commands.list_unset_machine_type(
+            cell_uuid=uuidsentinel.cell_uuid)
+        output = self.output.getvalue()
+        self.assertEqual(2, ret)
+        self.assertIn(
+            f"Cell {uuidsentinel.cell_uuid} has no mapping",
+            output
+        )
+
+    @mock.patch(
+        'nova.virt.libvirt.machine_type_utils.get_instances_without_type')
+    @mock.patch('nova.context.get_admin_context')
+    def test_list_unset_machine_type(
+        self, mock_get_context, mock_get_instances
+    ):
+        mock_get_context.return_value = mock.sentinel.admin_context
+        mock_get_instances.return_value = [
+            mock.Mock(spec=objects.Instance, uuid=uuidsentinel.instance)
+        ]
+        ret = self.commands.list_unset_machine_type(
+            cell_uuid=uuidsentinel.cell_uuid)
+        mock_get_instances.assert_called_once_with(
+            mock.sentinel.admin_context,
+            uuidsentinel.cell_uuid
+        )
+        output = self.output.getvalue()
+        self.assertEqual(3, ret)
+        self.assertIn(uuidsentinel.instance, output)

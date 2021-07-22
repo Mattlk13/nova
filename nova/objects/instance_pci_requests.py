@@ -23,10 +23,11 @@ from nova.objects import fields
 class InstancePCIRequest(base.NovaObject,
                          base.NovaObjectDictCompat):
     # Version 1.0: Initial version
-    # Version 1.1: Add request_id
-    # Version 1.2: Add PCI NUMA affinity policy
-    # Version 1.3: Add requester_id
-    VERSION = '1.3'
+    # Version 1.1: Added request_id field
+    # Version 1.2: Added numa_policy field
+    # Version 1.3: Added requester_id field
+    # Version 1.4: Added 'socket' to numa_policy field
+    VERSION = '1.4'
 
     # Possible sources for a PCI request:
     # FLAVOR_ALIAS : Request originated from a flavor alias.
@@ -81,14 +82,6 @@ class InstancePCIRequests(base.NovaObject,
         'instance_uuid': fields.UUIDField(),
         'requests': fields.ListOfObjectsField('InstancePCIRequest'),
     }
-
-    def obj_make_compatible(self, primitive, target_version):
-        target_version = versionutils.convert_version_to_tuple(target_version)
-        if target_version < (1, 1) and 'requests' in primitive:
-            for index, request in enumerate(self.requests):
-                request.obj_make_compatible(
-                    primitive['requests'][index]['nova_object.data'], '1.0')
-                primitive['requests'][index]['nova_object.version'] = '1.0'
 
     @classmethod
     def obj_from_db(cls, context, instance_uuid, db_requests):

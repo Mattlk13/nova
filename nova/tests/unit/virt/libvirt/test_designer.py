@@ -16,11 +16,10 @@ import mock
 
 from nova.pci import utils as pci_utils
 from nova import test
+from nova.tests.fixtures import libvirt_data as fake_libvirt_data
 from nova.tests.unit import matchers
-from nova.tests.unit.virt.libvirt import fake_libvirt_data
 from nova.virt.libvirt import config
 from nova.virt.libvirt import designer
-from nova.virt.libvirt import host
 
 
 class DesignerTestCase(test.NoDBTestCase):
@@ -61,23 +60,10 @@ class DesignerTestCase(test.NoDBTestCase):
 
     def test_set_vif_host_backend_ethernet_config_libvirt_1_3_3(self):
         conf = config.LibvirtConfigGuestInterface()
-        mock_host = mock.Mock(autospec=host.Host)
-        mock_host.has_min_version.return_value = True
-        designer.set_vif_host_backend_ethernet_config(
-            conf, 'fake-tap', mock_host)
+        designer.set_vif_host_backend_ethernet_config(conf, 'fake-tap')
         self.assertEqual('ethernet', conf.net_type)
         self.assertEqual('fake-tap', conf.target_dev)
         self.assertIsNone(conf.script)
-
-    def test_set_vif_host_backend_ethernet_config_libvirt_pre_1_3_3(self):
-        conf = config.LibvirtConfigGuestInterface()
-        mock_host = mock.Mock(autospec=host.Host)
-        mock_host.has_min_version.return_value = False
-        designer.set_vif_host_backend_ethernet_config(
-            conf, 'fake-tap', mock_host)
-        self.assertEqual('ethernet', conf.net_type)
-        self.assertEqual('fake-tap', conf.target_dev)
-        self.assertEqual('', conf.script)
 
     def test_set_vif_host_backend_802qbg_config(self):
         conf = config.LibvirtConfigGuestInterface()
@@ -188,6 +174,25 @@ class DesignerTestCase(test.NoDBTestCase):
         self.assertIsNone(conf.vhost_rx_queue_size)
         self.assertIsNone(conf.vhost_tx_queue_size)
 
+    def test_set_vif_host_backend_vdpa_config(self):
+        conf = config.LibvirtConfigGuestInterface()
+        designer.set_vif_host_backend_vdpa_config(
+            conf, '/dev/vdpa_vdpa0')
+        self.assertEqual('vdpa', conf.net_type)
+        self.assertEqual('/dev/vdpa_vdpa0', conf.source_dev)
+        self.assertIsNone(conf.vhost_rx_queue_size)
+        self.assertIsNone(conf.vhost_tx_queue_size)
+
+    def test_set_vif_host_backend_vdpa_config_queue_size(self):
+        conf = config.LibvirtConfigGuestInterface()
+        designer.set_vif_host_backend_vdpa_config(
+            conf, '/dev/vdpa_vdpa0', rx_queue_size=512,
+            tx_queue_size=1024)
+        self.assertEqual('vdpa', conf.net_type)
+        self.assertEqual('/dev/vdpa_vdpa0', conf.source_dev)
+        self.assertEqual(512, conf.vhost_rx_queue_size)
+        self.assertEqual(1024, conf.vhost_tx_queue_size)
+
     def test_set_vif_host_backend_vhostuser_config_queue_size(self):
         conf = config.LibvirtConfigGuestInterface()
         designer.set_vif_host_backend_vhostuser_config(conf, 'fake-mode',
@@ -221,12 +226,25 @@ class DesignerTestCase(test.NoDBTestCase):
         self.assertEqual(512, conf.vhost_rx_queue_size)
         self.assertIsNone(conf.vhost_tx_queue_size)
 
+    def test_set_vif_host_backend_vhostuser_config_tapname(self):
+        conf = config.LibvirtConfigGuestInterface()
+        designer.set_vif_host_backend_vhostuser_config(conf, 'fake-mode',
+                                                       'fake-path', None, None,
+                                                       'fake-tap')
+        self.assertEqual('vhostuser', conf.net_type)
+        self.assertEqual('unix', conf.vhostuser_type)
+        self.assertEqual('fake-mode', conf.vhostuser_mode)
+        self.assertEqual('fake-path', conf.vhostuser_path)
+        self.assertIsNone(conf.vhost_rx_queue_size)
+        self.assertIsNone(conf.vhost_tx_queue_size)
+        self.assertEqual('fake-tap', conf.target_dev)
+
     def test_set_vif_mtu_config(self):
         conf = config.LibvirtConfigGuestInterface()
         designer.set_vif_mtu_config(conf, 9000)
         self.assertEqual(9000, conf.mtu)
 
-    def test_set_driver_iommu_for_sev(self):
+    def test_set_driver_iommu(self):
         conf = fake_libvirt_data.fake_kvm_guest()
 
         # obj.devices[11]
@@ -235,7 +253,7 @@ class DesignerTestCase(test.NoDBTestCase):
         controller.index = 0
         conf.add_device(controller)
 
-        designer.set_driver_iommu_for_sev(conf)
+        designer.set_driver_iommu_for_all_devices(conf)
 
         # All disks/interfaces/memballoon are expected to be virtio,
         # thus driver_iommu should be on

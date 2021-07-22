@@ -97,7 +97,16 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
 
     def setUp(self):
         super(PciDeviceStatsTestCase, self).setUp()
-        self.pci_stats = stats.PciDeviceStats()
+        self._setup_pci_stats()
+
+    def _setup_pci_stats(self, numa_topology=None):
+        """Exists for tests that need to setup pci_stats with a specific NUMA
+        topology, while still allowing tests that don't care to get the default
+        "empty" one.
+        """
+        if not numa_topology:
+            numa_topology = objects.NUMATopology()
+        self.pci_stats = stats.PciDeviceStats(numa_topology)
         # The following two calls need to be made before adding the devices.
         patcher = fakes.fake_pci_whitelist()
         self.addCleanup(patcher.stop)
@@ -123,7 +132,7 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
                           self.fake_dev_2)
 
     def test_pci_stats_equivalent(self):
-        pci_stats2 = stats.PciDeviceStats()
+        pci_stats2 = stats.PciDeviceStats(objects.NUMATopology())
         for dev in [self.fake_dev_1,
                     self.fake_dev_2,
                     self.fake_dev_3,
@@ -132,7 +141,7 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
         self.assertEqual(self.pci_stats, pci_stats2)
 
     def test_pci_stats_not_equivalent(self):
-        pci_stats2 = stats.PciDeviceStats()
+        pci_stats2 = stats.PciDeviceStats(objects.NUMATopology())
         for dev in [self.fake_dev_1,
                     self.fake_dev_2,
                     self.fake_dev_3]:
@@ -141,7 +150,7 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
 
     def test_object_create(self):
         m = self.pci_stats.to_device_pools_obj()
-        new_stats = stats.PciDeviceStats(m)
+        new_stats = stats.PciDeviceStats(objects.NUMATopology(), m)
 
         self.assertEqual(len(new_stats.pools), 3)
         self.assertEqual(set([d['count'] for d in new_stats]),
@@ -150,6 +159,7 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
                          set(['v1', 'v2', 'v3']))
 
     def test_apply_requests(self):
+        self.assertEqual(len(self.pci_stats.pools), 3)
         self.pci_stats.apply_requests(pci_requests)
         self.assertEqual(len(self.pci_stats.pools), 2)
         self.assertEqual(self.pci_stats.pools[0]['vendor_id'], 'v1')
@@ -174,16 +184,26 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
                          set([1, 2]))
 
     def test_support_requests_numa(self):
-        cells = [objects.InstanceNUMACell(id=0, cpuset=set(), memory=0),
-                 objects.InstanceNUMACell(id=1, cpuset=set(), memory=0)]
+        cells = [
+            objects.InstanceNUMACell(
+                id=0, cpuset=set(), pcpuset=set(), memory=0),
+            objects.InstanceNUMACell(
+                id=1, cpuset=set(), pcpuset=set(), memory=0),
+        ]
         self.assertTrue(self.pci_stats.support_requests(pci_requests, cells))
 
     def test_support_requests_numa_failed(self):
-        cells = [objects.InstanceNUMACell(id=0, cpuset=set(), memory=0)]
+        cells = [
+            objects.InstanceNUMACell(
+                id=0, cpuset=set(), pcpuset=set(), memory=0),
+        ]
         self.assertFalse(self.pci_stats.support_requests(pci_requests, cells))
 
     def test_support_requests_no_numa_info(self):
-        cells = [objects.InstanceNUMACell(id=0, cpuset=set(), memory=0)]
+        cells = [
+            objects.InstanceNUMACell(
+                id=0, cpuset=set(), pcpuset=set(), memory=0),
+        ]
         pci_requests = self._get_fake_requests(vendor_ids=['v3'])
         self.assertTrue(self.pci_stats.support_requests(pci_requests, cells))
 
@@ -197,7 +217,10 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
         # numa node 1 has 1 device with vendor_id 'v2'
         # we request two devices with vendor_id 'v1' and 'v2'.
         # pci_numa_policy is 'preferred' so we can ignore numa affinity
-        cells = [objects.InstanceNUMACell(id=0, cpuset=set(), memory=0)]
+        cells = [
+            objects.InstanceNUMACell(
+                id=0, cpuset=set(), pcpuset=set(), memory=0),
+        ]
         pci_requests = self._get_fake_requests(
             numa_policy=fields.PCINUMAAffinityPolicy.PREFERRED)
 
@@ -206,11 +229,33 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
     def test_support_requests_no_numa_info_pci_numa_policy_required(self):
         # pci device with vendor_id 'v3' has numa_node=None.
         # pci_numa_policy is 'required' so we can't use this device
-        cells = [objects.InstanceNUMACell(id=0, cpuset=set(), memory=0)]
+        cells = [
+            objects.InstanceNUMACell(
+                id=0, cpuset=set(), pcpuset=set(), memory=0),
+        ]
         pci_requests = self._get_fake_requests(vendor_ids=['v3'],
             numa_policy=fields.PCINUMAAffinityPolicy.REQUIRED)
 
         self.assertFalse(self.pci_stats.support_requests(pci_requests, cells))
+
+    def test_filter_pools_for_socket_affinity_no_socket(self):
+        self._setup_pci_stats(
+            objects.NUMATopology(
+                cells=[objects.NUMACell(socket=None)]))
+        self.assertEqual(
+            [],
+            self.pci_stats._filter_pools_for_socket_affinity(
+                self.pci_stats.pools, [objects.InstanceNUMACell()]))
+
+    def test_filter_pools_for_socket_affinity(self):
+        self._setup_pci_stats(
+            objects.NUMATopology(
+                cells=[objects.NUMACell(id=1, socket=1)]))
+        pools = self.pci_stats._filter_pools_for_socket_affinity(
+            self.pci_stats.pools, [objects.InstanceNUMACell(id=1)])
+        self.assertEqual(1, len(pools))
+        self.assertEqual('p2', pools[0]['product_id'])
+        self.assertEqual('v2', pools[0]['vendor_id'])
 
     def test_consume_requests(self):
         devs = self.pci_stats.consume_requests(pci_requests)
@@ -227,21 +272,31 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
                           pci_requests_multiple))
 
     def test_consume_requests_numa(self):
-        cells = [objects.InstanceNUMACell(id=0, cpuset=set(), memory=0),
-                 objects.InstanceNUMACell(id=1, cpuset=set(), memory=0)]
+        cells = [
+            objects.InstanceNUMACell(
+                id=0, cpuset=set(), pcpuset=set(), memory=0),
+            objects.InstanceNUMACell(
+                id=1, cpuset=set(), pcpuset=set(), memory=0),
+        ]
         devs = self.pci_stats.consume_requests(pci_requests, cells)
         self.assertEqual(2, len(devs))
         self.assertEqual(set(['v1', 'v2']),
                          set([dev.vendor_id for dev in devs]))
 
     def test_consume_requests_numa_failed(self):
-        cells = [objects.InstanceNUMACell(id=0, cpuset=set(), memory=0)]
+        cells = [
+            objects.InstanceNUMACell(
+                id=0, cpuset=set(), pcpuset=set(), memory=0),
+        ]
         self.assertIsNone(self.pci_stats.consume_requests(pci_requests, cells))
 
     def test_consume_requests_no_numa_info(self):
-        cells = [objects.InstanceNUMACell(id=0, cpuset=set(), memory=0)]
+        cells = [
+            objects.InstanceNUMACell(
+                id=0, cpuset=set(), pcpuset=set(), memory=0),
+        ]
         pci_request = [objects.InstancePCIRequest(count=1,
-                    spec=[{'vendor_id': 'v3'}])]
+                                                  spec=[{'vendor_id': 'v3'}])]
         devs = self.pci_stats.consume_requests(pci_request, cells)
         self.assertEqual(1, len(devs))
         self.assertEqual(set(['v3']),
@@ -258,8 +313,10 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
         ``expected``.
         """
         self._add_fake_devs_with_numa()
-        cells = [objects.InstanceNUMACell(id=id, cpuset=set(), memory=0)
-                 for id in cell_ids]
+        cells = [
+            objects.InstanceNUMACell(
+                id=id, cpuset=set(), pcpuset=set(), memory=0)
+            for id in cell_ids]
 
         pci_requests = self._get_fake_requests(vendor_ids=[vendor_id],
             numa_policy=policy, count=count)
@@ -397,7 +454,7 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
     def test_white_list_parsing(self, mock_whitelist_parse):
         white_list = '{"product_id":"0001", "vendor_id":"8086"}'
         CONF.set_override('passthrough_whitelist', white_list, 'pci')
-        pci_stats = stats.PciDeviceStats()
+        pci_stats = stats.PciDeviceStats(objects.NUMATopology())
         pci_stats.add_device(self.fake_dev_2)
         pci_stats.remove_device(self.fake_dev_2)
         self.assertEqual(1, mock_whitelist_parse.call_count)
@@ -412,7 +469,9 @@ class PciDeviceStatsWithTagsTestCase(test.NoDBTestCase):
                        '{"vendor_id":"1137","product_id":"0072"}']
         self.flags(passthrough_whitelist=white_list, group='pci')
         dev_filter = whitelist.Whitelist(white_list)
-        self.pci_stats = stats.PciDeviceStats(dev_filter=dev_filter)
+        self.pci_stats = stats.PciDeviceStats(
+            objects.NUMATopology(),
+            dev_filter=dev_filter)
 
     def _create_pci_devices(self):
         self.pci_tagged_devices = []
@@ -533,6 +592,30 @@ class PciDeviceStatsWithTagsTestCase(test.NoDBTestCase):
         self.pci_stats.remove_device(dev2)
         self._assertPools()
 
+    def test_update_device(self):
+        # Update device type of one of the device from type-PCI to
+        # type-PF. Verify if the existing pool is updated and a new
+        # pool is created with dev_type type-PF.
+        self._create_pci_devices()
+        dev1 = self.pci_tagged_devices.pop()
+        dev1.dev_type = 'type-PF'
+        self.pci_stats.update_device(dev1)
+        self.assertEqual(3, len(self.pci_stats.pools))
+        self._assertPoolContent(self.pci_stats.pools[0], '1137', '0072',
+                                len(self.pci_untagged_devices))
+        self.assertEqual(self.pci_untagged_devices,
+                         self.pci_stats.pools[0]['devices'])
+        self._assertPoolContent(self.pci_stats.pools[1], '1137', '0071',
+                                len(self.pci_tagged_devices),
+                                physical_network='physnet1')
+        self.assertEqual(self.pci_tagged_devices,
+                         self.pci_stats.pools[1]['devices'])
+        self._assertPoolContent(self.pci_stats.pools[2], '1137', '0071',
+                                1,
+                                physical_network='physnet1')
+        self.assertEqual(dev1,
+                         self.pci_stats.pools[2]['devices'][0])
+
 
 class PciDeviceVFPFStatsTestCase(test.NoDBTestCase):
 
@@ -541,42 +624,80 @@ class PciDeviceVFPFStatsTestCase(test.NoDBTestCase):
         white_list = ['{"vendor_id":"8086","product_id":"1528"}',
                       '{"vendor_id":"8086","product_id":"1515"}']
         self.flags(passthrough_whitelist=white_list, group='pci')
-        self.pci_stats = stats.PciDeviceStats()
+        self.pci_stats = stats.PciDeviceStats(objects.NUMATopology())
 
     def _create_pci_devices(self, vf_product_id=1515, pf_product_id=1528):
         self.sriov_pf_devices = []
         for dev in range(2):
-            pci_dev = {'compute_node_id': 1,
-                       'address': '0000:81:00.%d' % dev,
-                       'vendor_id': '8086',
-                       'product_id': '%d' % pf_product_id,
-                       'status': 'available',
-                       'request_id': None,
-                       'dev_type': fields.PciDeviceType.SRIOV_PF,
-                       'parent_addr': None,
-                       'numa_node': 0}
+            pci_dev = {
+                'compute_node_id': 1,
+                'address': '0000:81:00.%d' % dev,
+                'vendor_id': '8086',
+                'product_id': '%d' % pf_product_id,
+                'status': 'available',
+                'request_id': None,
+                'dev_type': fields.PciDeviceType.SRIOV_PF,
+                'parent_addr': None,
+                'numa_node': 0
+            }
             dev_obj = objects.PciDevice.create(None, pci_dev)
             dev_obj.child_devices = []
             self.sriov_pf_devices.append(dev_obj)
 
         self.sriov_vf_devices = []
         for dev in range(8):
-            pci_dev = {'compute_node_id': 1,
-                       'address': '0000:81:10.%d' % dev,
-                       'vendor_id': '8086',
-                       'product_id': '%d' % vf_product_id,
-                       'status': 'available',
-                       'request_id': None,
-                       'dev_type': fields.PciDeviceType.SRIOV_VF,
-                       'parent_addr': '0000:81:00.%d' % int(dev / 4),
-                       'numa_node': 0}
+            pci_dev = {
+                'compute_node_id': 1,
+                'address': '0000:81:10.%d' % dev,
+                'vendor_id': '8086',
+                'product_id': '%d' % vf_product_id,
+                'status': 'available',
+                'request_id': None,
+                'dev_type': fields.PciDeviceType.SRIOV_VF,
+                'parent_addr': '0000:81:00.%d' % int(dev / 4),
+                'numa_node': 0
+            }
             dev_obj = objects.PciDevice.create(None, pci_dev)
             dev_obj.parent_device = self.sriov_pf_devices[int(dev / 4)]
             dev_obj.parent_device.child_devices.append(dev_obj)
             self.sriov_vf_devices.append(dev_obj)
 
+        self.vdpa_devices = []
+        for dev in range(8):
+            pci_dev = {
+                'compute_node_id': 1,
+                'address': '0000:82:10.%d' % dev,
+                'vendor_id': '8086',
+                'product_id': '%d' % vf_product_id,
+                'status': 'available',
+                'request_id': None,
+                'dev_type': fields.PciDeviceType.VDPA,
+                'parent_addr': '0000:81:00.%d' % int(dev / 4),
+                'numa_node': 0
+            }
+            dev_obj = objects.PciDevice.create(None, pci_dev)
+            dev_obj.parent_device = self.sriov_pf_devices[int(dev / 4)]
+            dev_obj.parent_device.child_devices.append(dev_obj)
+            self.vdpa_devices.append(dev_obj)
+
         list(map(self.pci_stats.add_device, self.sriov_pf_devices))
         list(map(self.pci_stats.add_device, self.sriov_vf_devices))
+        list(map(self.pci_stats.add_device, self.vdpa_devices))
+
+    def test_consume_VDPA_requests(self):
+        self._create_pci_devices()
+        pci_requests = [
+            objects.InstancePCIRequest(
+                count=8, spec=[{'dev_type': 'vdpa'}])]
+        devs = self.pci_stats.consume_requests(pci_requests)
+        self.assertEqual(8, len(devs))
+        self.assertEqual('vdpa', devs[0].dev_type)
+        free_devs = self.pci_stats.get_free_devs()
+        # Validate that the parents of these devs has been removed
+        # from pools.
+        for dev in devs:
+            self.assertNotIn(dev.parent_addr,
+                             [free_dev.address for free_dev in free_devs])
 
     def test_consume_VF_requests(self):
         self._create_pci_devices()

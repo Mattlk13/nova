@@ -184,30 +184,38 @@ class ViewBuilder(common.ViewBuilder):
         return ret
 
     @staticmethod
-    def _get_host_status_unknown_only(context):
-        # We will use the unknown_only variable to tell us what host status we
-        # can show, if any:
-        #   * unknown_only = False means we can show any host status.
-        #   * unknown_only = True means that we can only show host
-        #     status: UNKNOWN. If the host status is anything other than
-        #     UNKNOWN, we will not include the host_status field in the
-        #     response.
-        #   * unknown_only = None means we cannot show host status at all and
-        #     we will not include the host_status field in the response.
+    def _get_host_status_unknown_only(context, instance=None):
+        """We will use the unknown_only variable to tell us what host status we
+        can show, if any:
+          * unknown_only = False means we can show any host status.
+          * unknown_only = True means that we can only show host
+            status: UNKNOWN. If the host status is anything other than
+            UNKNOWN, we will not include the host_status field in the
+            response.
+          * unknown_only = None means we cannot show host status at all and
+            we will not include the host_status field in the response.
+        """
         unknown_only = None
         # Check show:host_status policy first because if it passes, we know we
         # can show any host status and need not check the more restrictive
         # show:host_status:unknown-only policy.
+        # Keeping target as None (which means policy will default these target
+        # to context.project_id) for now which is case of 'detail' API which
+        # policy is default to system and project reader.
+        target = None
+        if instance is not None:
+            target = {'project_id': instance.project_id}
         if context.can(
                 servers_policies.SERVERS % 'show:host_status',
-                fatal=False):
+                fatal=False, target=target):
             unknown_only = False
         # If we are not allowed to show any/all host status, check if we can at
         # least show only the host status: UNKNOWN.
         elif context.can(
                 servers_policies.SERVERS %
                 'show:host_status:unknown-only',
-                fatal=False):
+                fatal=False,
+                target=target):
             unknown_only = True
         return unknown_only
 
@@ -303,7 +311,8 @@ class ViewBuilder(common.ViewBuilder):
 
         if show_extended_attr is None:
             show_extended_attr = context.can(
-                esa_policies.BASE_POLICY_NAME, fatal=False)
+                esa_policies.BASE_POLICY_NAME, fatal=False,
+                target={'project_id': instance.project_id})
         if show_extended_attr:
             properties = ['host', 'name', 'node']
             if api_version_request.is_supported(request, min_version='2.3'):
@@ -357,7 +366,8 @@ class ViewBuilder(common.ViewBuilder):
                                           add_delete_on_termination)
         if (api_version_request.is_supported(request, min_version='2.16')):
             if show_host_status is None:
-                unknown_only = self._get_host_status_unknown_only(context)
+                unknown_only = self._get_host_status_unknown_only(
+                    context, instance)
                 # If we're not allowed by policy to show host status at all,
                 # don't bother requesting instance host status from the compute
                 # API.
@@ -537,34 +547,32 @@ class ViewBuilder(common.ViewBuilder):
         else:
             return ""
 
-    def _get_flavor_dict(self, request, instance_type, show_extra_specs):
+    def _get_flavor_dict(self, request, flavor, show_extra_specs):
         flavordict = {
-            "vcpus": instance_type.vcpus,
-            "ram": instance_type.memory_mb,
-            "disk": instance_type.root_gb,
-            "ephemeral": instance_type.ephemeral_gb,
-            "swap": instance_type.swap,
-            "original_name": instance_type.name
+            "vcpus": flavor.vcpus,
+            "ram": flavor.memory_mb,
+            "disk": flavor.root_gb,
+            "ephemeral": flavor.ephemeral_gb,
+            "swap": flavor.swap,
+            "original_name": flavor.name
         }
         if show_extra_specs:
-            flavordict['extra_specs'] = instance_type.extra_specs
+            flavordict['extra_specs'] = flavor.extra_specs
         return flavordict
 
     def _get_flavor(self, request, instance, show_extra_specs):
-        instance_type = instance.get_flavor()
-        if not instance_type:
-            LOG.warning("Instance has had its instance_type removed "
+        flavor = instance.get_flavor()
+        if not flavor:
+            LOG.warning("Instance has had its flavor removed "
                         "from the DB", instance=instance)
             return {}
 
         if api_version_request.is_supported(request, min_version="2.47"):
-            return self._get_flavor_dict(request, instance_type,
-                                         show_extra_specs)
+            return self._get_flavor_dict(request, flavor, show_extra_specs)
 
-        flavor_id = instance_type["flavorid"]
-        flavor_bookmark = self._flavor_builder._get_bookmark_link(request,
-                                                                  flavor_id,
-                                                                  "flavors")
+        flavor_id = flavor["flavorid"]
+        flavor_bookmark = self._flavor_builder._get_bookmark_link(
+            request, flavor_id, "flavors")
         return {
             "id": str(flavor_id),
             "links": [{

@@ -17,7 +17,6 @@
 import mock
 from oslo_concurrency import processutils
 from oslo_config import cfg
-import six
 
 from nova.compute import api as compute_api
 from nova import context
@@ -26,7 +25,6 @@ from nova.objects import keypair as keypair_obj
 from nova import quota
 from nova.tests.unit.compute import test_compute
 from nova.tests.unit import fake_crypto
-from nova.tests.unit import fake_notifier
 from nova.tests.unit.objects import test_keypair
 from nova.tests.unit import utils as test_utils
 
@@ -83,9 +81,9 @@ class KeypairAPITestCase(test_compute.BaseTestCase):
         self.stub_out("nova.db.api.key_pair_get", db_key_pair_get)
 
     def _check_notifications(self, action='create', key_name='foo'):
-        self.assertEqual(2, len(fake_notifier.NOTIFICATIONS))
+        self.assertEqual(2, len(self.notifier.notifications))
 
-        n1 = fake_notifier.NOTIFICATIONS[0]
+        n1 = self.notifier.notifications[0]
         self.assertEqual('INFO', n1.priority)
         self.assertEqual('keypair.%s.start' % action, n1.event_type)
         self.assertEqual('api.%s' % CONF.host, n1.publisher_id)
@@ -93,7 +91,7 @@ class KeypairAPITestCase(test_compute.BaseTestCase):
         self.assertEqual('fake', n1.payload['tenant_id'])
         self.assertEqual(key_name, n1.payload['key_name'])
 
-        n2 = fake_notifier.NOTIFICATIONS[1]
+        n2 = self.notifier.notifications[1]
         self.assertEqual('INFO', n2.priority)
         self.assertEqual('keypair.%s.end' % action, n2.event_type)
         self.assertEqual('api.%s' % CONF.host, n2.publisher_id)
@@ -119,7 +117,7 @@ class CreateImportSharedTestMixIn(object):
 
         exc = self.assertRaises(exc_class, func, self.ctxt, self.ctxt.user_id,
                                 name, *args)
-        self.assertEqual(expected_message, six.text_type(exc))
+        self.assertEqual(expected_message, str(exc))
 
     def assertInvalidKeypair(self, expected_message, name):
         msg = 'Keypair data is invalid: %s' % expected_message
@@ -219,6 +217,12 @@ class ImportKeypairTestCase(KeypairAPITestCase, CreateImportSharedTestMixIn):
     def test_success_ssh(self):
         self._check_success()
 
+    def test_success_ssh_ed25519(self):
+        self.pub_key = ('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFl6u75BTi8xGtSPm'
+                        '1yVJuLE/oMtCOuEMJJnBSuZEdXz')
+        self.fingerprint = '1a:1d:a7:2c:4c:ff:15:c4:70:13:38:b6:ac:4c:dc:12'
+        self._check_success()
+
     def test_success_x509(self):
         self.keypair_type = keypair_obj.KEYPAIR_TYPE_X509
         certif, fingerprint = fake_crypto.get_x509_cert_and_fingerprint()
@@ -232,7 +236,7 @@ class ImportKeypairTestCase(KeypairAPITestCase, CreateImportSharedTestMixIn):
                                 self.ctxt, self.ctxt.user_id, 'foo',
                                 'bad key data')
         msg = u'Keypair data is invalid: failed to generate fingerprint'
-        self.assertEqual(msg, six.text_type(exc))
+        self.assertEqual(msg, str(exc))
 
 
 class GetKeypairTestCase(KeypairAPITestCase):

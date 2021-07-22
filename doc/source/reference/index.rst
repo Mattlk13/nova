@@ -37,6 +37,11 @@ The following is a dive into some of the internals in nova.
 
 * :doc:`/reference/isolate-aggregates`: Describes how the placement filter
   works in nova to isolate groups of hosts.
+* :doc:`/reference/attach-volume`: Describes the attach volume flow, using the
+  libvirt virt driver as an example.
+* :doc:`/reference/block-device-structs`: Block Device Data Structures
+* :doc:`/reference/libvirt-distro-support-matrix`: Libvirt virt driver OS
+  distribution support matrix
 
 .. # NOTE(amotoki): toctree needs to be placed at the end of the secion to
    # keep the document structure in the PDF doc.
@@ -56,6 +61,9 @@ The following is a dive into some of the internals in nova.
    conductor
    isolate-aggregates
    api-microversion-history
+   attach-volume
+   block-device-structs
+   libvirt-distro-support-matrix
 
 Debugging
 =========

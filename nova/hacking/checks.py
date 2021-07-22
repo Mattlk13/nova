@@ -32,7 +32,6 @@ import os
 import re
 
 from hacking import core
-import six
 
 
 UNDERSCORE_IMPORT_FILES = []
@@ -76,9 +75,7 @@ asse_true_false_with_in_or_not_in_spaces = re.compile(r"assert(True|False)"
                     r"[\[|'|\"](, .*)?\)")
 asse_raises_regexp = re.compile(r"assertRaisesRegexp\(")
 conf_attribute_set_re = re.compile(r"CONF\.[a-z0-9_.]+\s*=\s*\w")
-translated_log = re.compile(
-    r"(.)*LOG\.(audit|error|info|critical|exception)"
-    r"\(\s*_\(\s*('|\")")
+translated_log = re.compile(r"(.)*LOG\.\w+\(\s*_\(\s*('|\")")
 mutable_default_args = re.compile(r"^\s*def .+\((.+=\{\}|.+=\[\])")
 string_translation = re.compile(r"[^_]*_\(\s*('|\")")
 underscore_import_check = re.compile(r"(.)*import _(.)*")
@@ -130,6 +127,8 @@ mock_attribute_re = re.compile(r"[\.\(](retrun_value)[,=\s]")
 # Regex for useless assertions
 useless_assertion_re = re.compile(
     r"\.((assertIsNone)\(None|(assertTrue)\((True|\d+|'.+'|\".+\")),")
+# Regex for misuse of assert_has_calls
+mock_assert_has_calls_re = re.compile(r"\.assert_has_calls\s?=")
 
 
 class BaseASTChecker(ast.NodeVisitor):
@@ -295,28 +294,16 @@ def assert_equal_type(logical_line):
 
 
 @core.flake8ext
-def check_python3_xrange(logical_line):
-    if re.search(r"\bxrange\s*\(", logical_line):
-        yield (0, "N327: Do not use xrange(). 'xrange()' is not compatible "
-                  "with Python 3. Use range() or six.moves.range() instead.")
+def no_translate_logs(logical_line, filename):
+    """Check for 'LOG.foo(_('
 
-
-@core.flake8ext
-def no_translate_debug_logs(logical_line, filename):
-    """Check for 'LOG.debug(_('
-
-    As per our translation policy,
-    https://wiki.openstack.org/wiki/LoggingStandards#Log_Translation
-    we shouldn't translate debug level logs.
-
-    * This check assumes that 'LOG' is a logger.
-    * Use filename so we can start enforcing this in specific folders instead
-      of needing to do so all at once.
+    As per our translation policy, we shouldn't translate logs.
+    This check assumes that 'LOG' is a logger.
 
     N319
     """
-    if logical_line.startswith("LOG.debug(_("):
-        yield (0, "N319 Don't translate debug level logs")
+    if translated_log.match(logical_line):
+        yield (0, "N319 Don't translate logs")
 
 
 @core.flake8ext
@@ -371,19 +358,12 @@ def check_explicit_underscore_import(logical_line, filename):
     elif (underscore_import_check.match(logical_line) or
           custom_underscore_check.match(logical_line)):
         UNDERSCORE_IMPORT_FILES.append(filename)
-    elif (translated_log.match(logical_line) or
-         string_translation.match(logical_line)):
+    elif string_translation.match(logical_line):
         yield (0, "N323: Found use of _() without explicit import of _ !")
 
 
 @core.flake8ext
 def use_jsonutils(logical_line, filename):
-    # the code below that path is not meant to be executed from neutron
-    # tree where jsonutils module is present, so don't enforce its usage
-    # for this subdirectory
-    if "plugins/xenserver" in filename:
-        return
-
     # tools are OK to use the standard json module
     if "/tools/" in filename:
         return
@@ -408,58 +388,6 @@ def check_api_version_decorator(logical_line, previous_logical, blank_before,
         yield (0, msg)
 
 
-class CheckForStrUnicodeExc(BaseASTChecker):
-    """Checks for the use of str() or unicode() on an exception.
-
-    This currently only handles the case where str() or unicode()
-    is used in the scope of an exception handler.  If the exception
-    is passed into a function, returned from an assertRaises, or
-    used on an exception created in the same scope, this does not
-    catch it.
-    """
-
-    name = 'check_for_string_unicode_exc'
-    version = '1.0'
-
-    CHECK_DESC = ('N325 str() and unicode() cannot be used on an '
-                  'exception.  Remove or use six.text_type()')
-
-    def __init__(self, tree, filename):
-        super(CheckForStrUnicodeExc, self).__init__(tree, filename)
-        self.name = []
-        self.already_checked = []
-
-    # Python 2 produces ast.TryExcept and ast.TryFinally nodes, but Python 3
-    # only produces ast.Try nodes.
-    if six.PY2:
-        def visit_TryExcept(self, node):
-            for handler in node.handlers:
-                if handler.name:
-                    self.name.append(handler.name.id)
-                    super(CheckForStrUnicodeExc, self).generic_visit(node)
-                    self.name = self.name[:-1]
-                else:
-                    super(CheckForStrUnicodeExc, self).generic_visit(node)
-    else:
-        def visit_Try(self, node):
-            for handler in node.handlers:
-                if handler.name:
-                    self.name.append(handler.name)
-                    super(CheckForStrUnicodeExc, self).generic_visit(node)
-                    self.name = self.name[:-1]
-                else:
-                    super(CheckForStrUnicodeExc, self).generic_visit(node)
-
-    def visit_Call(self, node):
-        if self._check_call_names(node, ['str', 'unicode']):
-            if node not in self.already_checked:
-                self.already_checked.append(node)
-                if isinstance(node.args[0], ast.Name):
-                    if node.args[0].id in self.name:
-                        self.add_error(node.args[0])
-        super(CheckForStrUnicodeExc, self).generic_visit(node)
-
-
 class CheckForTransAdd(BaseASTChecker):
     """Checks for the use of concatenation on a translated string.
 
@@ -474,14 +402,15 @@ class CheckForTransAdd(BaseASTChecker):
     CHECK_DESC = ('N326 Translated messages cannot be concatenated.  '
                   'String should be included in translated message.')
 
-    TRANS_FUNC = ['_', '_LI', '_LW', '_LE', '_LC']
+    TRANS_FUNC = ['_']
 
     def visit_BinOp(self, node):
         if isinstance(node.op, ast.Add):
-            if self._check_call_names(node.left, self.TRANS_FUNC):
-                self.add_error(node.left)
-            elif self._check_call_names(node.right, self.TRANS_FUNC):
-                self.add_error(node.right)
+            for node_x in (node.left, node.right):
+                if isinstance(node_x, ast.Call):
+                    if isinstance(node_x.func, ast.Name):
+                        if node_x.func.id == '_':
+                            self.add_error(node_x)
         super(CheckForTransAdd, self).generic_visit(node)
 
 
@@ -731,30 +660,6 @@ def check_doubled_words(physical_line, filename):
 
 
 @core.flake8ext
-def check_python3_no_iteritems(logical_line):
-    msg = ("N344: Use items() instead of dict.iteritems().")
-
-    if re.search(r".*\.iteritems\(\)", logical_line):
-        yield (0, msg)
-
-
-@core.flake8ext
-def check_python3_no_iterkeys(logical_line):
-    msg = ("N345: Use six.iterkeys() instead of dict.iterkeys().")
-
-    if re.search(r".*\.iterkeys\(\)", logical_line):
-        yield (0, msg)
-
-
-@core.flake8ext
-def check_python3_no_itervalues(logical_line):
-    msg = ("N346: Use six.itervalues() instead of dict.itervalues().")
-
-    if re.search(r".*\.itervalues\(\)", logical_line):
-        yield (0, msg)
-
-
-@core.flake8ext
 def no_os_popen(logical_line):
     """Disallow 'os.popen('
 
@@ -788,8 +693,8 @@ def no_log_warn(logical_line):
 def check_context_log(logical_line, filename, noqa):
     """check whether context is being passed to the logs
 
-    Not correct: LOG.info(_LI("Rebooting instance"), context=context)
-    Correct:  LOG.info(_LI("Rebooting instance"))
+    Not correct: LOG.info("Rebooting instance", context=context)
+    Correct:  LOG.info("Rebooting instance")
     https://bugs.launchpad.net/nova/+bug/1500896
 
     N353
@@ -1019,3 +924,18 @@ def useless_assertion(logical_line, filename):
         match = useless_assertion_re.search(logical_line)
         if match:
             yield (0, msg % (match.group(2) or match.group(3)))
+
+
+@core.flake8ext
+def check_assert_has_calls(logical_line, filename):
+    """Check misuse of assert_has_calls.
+
+    Not correct: mock_method.assert_has_calls = [mock.call(0)]
+    Correct:     mock_method.assert_has_calls([mock.call(0)])
+
+    N366
+    """
+    msg = "N366: The assert_has_calls is a method rather than a variable."
+    if ('nova/tests/' in filename and
+            mock_assert_has_calls_re.search(logical_line)):
+        yield (0, msg)

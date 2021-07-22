@@ -20,10 +20,10 @@ from nova.compute import vm_states
 from nova import exception
 from nova.policies import attach_interfaces as ai_policies
 from nova.policies import base as base_policy
+from nova.tests import fixtures as nova_fixtures
 from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit import fake_instance
 from nova.tests.unit.policies import base
-from nova.tests.unit import policy_fixture
 
 
 class AttachInterfacesPolicyTest(base.BasePolicyTest):
@@ -56,7 +56,8 @@ class AttachInterfacesPolicyTest(base.BasePolicyTest):
         self.admin_unauthorized_contexts = [
             self.system_member_context, self.system_reader_context,
             self.system_foo_context,
-            self.other_project_member_context
+            self.other_project_member_context,
+            self.other_project_reader_context,
         ]
 
         self.reader_authorized_contexts = [
@@ -68,7 +69,8 @@ class AttachInterfacesPolicyTest(base.BasePolicyTest):
 
         self.reader_unauthorized_contexts = [
             self.system_foo_context,
-            self.other_project_member_context
+            self.other_project_member_context,
+            self.other_project_reader_context,
         ]
 
     @mock.patch('nova.compute.api.API.get')
@@ -141,7 +143,7 @@ class AttachInterfacesScopeTypePolicyTest(AttachInterfacesPolicyTest):
 class AttachInterfacesDeprecatedPolicyTest(base.BasePolicyTest):
     """Test Attach Interfaces APIs Deprecated policies.
     This class checks if deprecated policy rules are
-    overridden by user on policy.json file then they
+    overridden by user on policy.yaml file then they
     still work because oslo.policy add deprecated rules
     in logical OR condition and enforce them for policy
     checks if overridden.
@@ -164,7 +166,7 @@ class AttachInterfacesDeprecatedPolicyTest(base.BasePolicyTest):
         # Oslo.policy will consider the overridden rules if:
         #  1. overridden deprecated rule's checks are different than defaults
         #  2. new rules are not present in policy file
-        self.policy = self.useFixture(policy_fixture.OverridePolicyFixture(
+        self.policy = self.useFixture(nova_fixtures.OverridePolicyFixture(
                                       rules_in_file=override_rules))
 
     @mock.patch('nova.compute.api.API.get')
@@ -174,7 +176,7 @@ class AttachInterfacesDeprecatedPolicyTest(base.BasePolicyTest):
         # Test to verify if deprecatd overridden policy is working.
 
         # check for success as admin role. Deprecated rule
-        # has been overridden with admin checks in policy.json
+        # has been overridden with admin checks in policy.yaml
         # If admin role pass it means overridden rule is enforced by
         # olso.policy because new default is system or project reader and the
         # old default is admin.
@@ -222,7 +224,9 @@ class AttachInterfacesNoLegacyPolicyTest(AttachInterfacesPolicyTest):
             self.project_foo_context,
             self.system_member_context, self.system_reader_context,
             self.system_foo_context,
-            self.other_project_member_context]
+            self.other_project_member_context,
+            self.other_project_reader_context,
+        ]
 
         # Check that system reader or projct is able to
         # create or delete interfaces.
@@ -230,12 +234,13 @@ class AttachInterfacesNoLegacyPolicyTest(AttachInterfacesPolicyTest):
             self.system_admin_context,
             self.project_admin_context, self.system_member_context,
             self.system_reader_context, self.project_reader_context,
-            self.project_member_context,
+            self.project_member_context
         ]
 
         # Check that non-system reader nd non-admin/owner is not able to
         # create or delete interfaces.
         self.reader_unauthorized_contexts = [
             self.legacy_admin_context, self.project_foo_context,
-            self.system_foo_context, self.other_project_member_context
+            self.system_foo_context, self.other_project_member_context,
+            self.other_project_reader_context,
         ]

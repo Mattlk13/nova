@@ -18,13 +18,14 @@ Tests For Scheduler Utils
 
 import mock
 from oslo_utils.fixture import uuidsentinel as uuids
-import six
 
 from nova.compute import flavors
 from nova.compute import utils as compute_utils
 from nova import context as nova_context
 from nova import exception
+from nova.network import neutron
 from nova import objects
+from nova.scheduler.client import report
 from nova.scheduler import utils as scheduler_utils
 from nova import test
 from nova.tests.unit import fake_instance
@@ -39,21 +40,21 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
 
     def test_build_request_spec_without_image(self):
         instance = {'uuid': uuids.instance}
-        instance_type = objects.Flavor(**test_flavor.fake_flavor)
+        flavor = objects.Flavor(**test_flavor.fake_flavor)
 
         with mock.patch.object(flavors, 'extract_flavor') as mock_extract:
-            mock_extract.return_value = instance_type
+            mock_extract.return_value = flavor
             request_spec = scheduler_utils.build_request_spec(None,
                                                               [instance])
             mock_extract.assert_called_once_with({'uuid': uuids.instance})
         self.assertEqual({}, request_spec['image'])
 
     def test_build_request_spec_with_object(self):
-        instance_type = objects.Flavor()
+        flavor = objects.Flavor()
         instance = fake_instance.fake_instance_obj(self.context)
 
         with mock.patch.object(instance, 'get_flavor') as mock_get:
-            mock_get.return_value = instance_type
+            mock_get.return_value = flavor
             request_spec = scheduler_utils.build_request_spec(None,
                                                               [instance])
             mock_get.assert_called_once_with()
@@ -99,7 +100,7 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
         mock_notify_task.assert_called_once_with(
             self.context, method, expected_uuid,
             payload_request_spec, updates['vm_state'],
-            exc_info, test.MatchType(str))
+            exc_info)
 
     def test_set_vm_state_and_notify_request_spec_dict(self):
         """Tests passing a legacy dict format request spec to
@@ -133,23 +134,23 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
         sched_hints = {'hint': ['over-there']}
         forced_host = 'forced-host1'
         forced_node = 'forced-node1'
-        instance_type = objects.Flavor()
+        flavor = objects.Flavor()
         filt_props = scheduler_utils.build_filter_properties(sched_hints,
-                forced_host, forced_node, instance_type)
+                forced_host, forced_node, flavor)
         self.assertEqual(sched_hints, filt_props['scheduler_hints'])
         self.assertEqual([forced_host], filt_props['force_hosts'])
         self.assertEqual([forced_node], filt_props['force_nodes'])
-        self.assertEqual(instance_type, filt_props['instance_type'])
+        self.assertEqual(flavor, filt_props['instance_type'])
 
     def test_build_filter_properties_no_forced_host_no_force_node(self):
         sched_hints = {'hint': ['over-there']}
         forced_host = None
         forced_node = None
-        instance_type = objects.Flavor()
+        flavor = objects.Flavor()
         filt_props = scheduler_utils.build_filter_properties(sched_hints,
-                forced_host, forced_node, instance_type)
+                forced_host, forced_node, flavor)
         self.assertEqual(sched_hints, filt_props['scheduler_hints'])
-        self.assertEqual(instance_type, filt_props['instance_type'])
+        self.assertEqual(flavor, filt_props['instance_type'])
         self.assertNotIn('forced_host', filt_props)
         self.assertNotIn('forced_node', filt_props)
 
@@ -245,7 +246,7 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
                                 scheduler_utils.populate_retry,
                                 filter_properties, uuids.instance)
         # make sure 'msg' is a substring of the complete exception text
-        self.assertIn(msg, six.text_type(nvh))
+        self.assertIn(msg, str(nvh))
 
     def _check_parse_options(self, opts, sep, converter, expected):
         good = scheduler_utils.parse_options(opts,
@@ -408,3 +409,111 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
         self.assertRaises(exception.NoValidHost,
                           scheduler_utils.setup_instance_group,
                           self.context, spec)
+
+    @mock.patch('nova.network.neutron.API.get_segment_ids_for_network')
+    def test_get_aggregates_for_routed_network(self, mock_get_segment_ids):
+        mock_get_segment_ids.return_value = [uuids.segment1, uuids.segment2]
+        report_client = report.SchedulerReportClient()
+        network_api = neutron.API()
+
+        def fake_get_provider_aggregates(context, segment_id):
+            agg = uuids.agg1 if segment_id == uuids.segment1 else uuids.agg2
+            agg_info = report.AggInfo(aggregates=[agg], generation=1)
+            return agg_info
+
+        with mock.patch.object(report_client, '_get_provider_aggregates',
+                side_effect=fake_get_provider_aggregates) as mock_get_aggs:
+            res = scheduler_utils.get_aggregates_for_routed_network(
+                self.context, network_api, report_client, uuids.network1)
+        self.assertEqual([uuids.agg1, uuids.agg2], res)
+        mock_get_segment_ids.assert_called_once_with(
+            self.context, uuids.network1)
+        mock_get_aggs.assert_has_calls(
+            [mock.call(self.context, uuids.segment1),
+             mock.call(self.context, uuids.segment2)])
+
+    @mock.patch('nova.network.neutron.API.get_segment_ids_for_network')
+    def test_get_aggregates_for_routed_network_none(self,
+                                                    mock_get_segment_ids):
+        mock_get_segment_ids.return_value = []
+        report_client = report.SchedulerReportClient()
+        network_api = neutron.API()
+        self.assertEqual(
+            [],
+            scheduler_utils.get_aggregates_for_routed_network(
+                self.context, network_api, report_client, uuids.network1))
+
+    @mock.patch('nova.network.neutron.API.get_segment_ids_for_network')
+    def test_get_aggregates_for_routed_network_fails(self,
+                                                     mock_get_segment_ids):
+        mock_get_segment_ids.return_value = [uuids.segment1]
+        report_client = report.SchedulerReportClient()
+        network_api = neutron.API()
+
+        # We could fail on some placement issue...
+        with mock.patch.object(report_client, '_get_provider_aggregates',
+                return_value=None):
+            self.assertRaises(
+                exception.InvalidRoutedNetworkConfiguration,
+                scheduler_utils.get_aggregates_for_routed_network,
+                self.context, network_api, report_client, uuids.network1)
+
+        # ... but we also want to fail if we can't find the related aggregate
+        agg_info = report.AggInfo(aggregates=set(), generation=1)
+        with mock.patch.object(report_client, '_get_provider_aggregates',
+                return_value=agg_info):
+            self.assertRaises(
+                exception.InvalidRoutedNetworkConfiguration,
+                scheduler_utils.get_aggregates_for_routed_network,
+                self.context, network_api, report_client, uuids.network1)
+
+    @mock.patch('nova.network.neutron.API.get_segment_id_for_subnet')
+    def test_get_aggregates_for_routed_subnet(self, mock_get_segment_ids):
+        mock_get_segment_ids.return_value = uuids.segment1
+        report_client = report.SchedulerReportClient()
+        network_api = neutron.API()
+        agg_info = report.AggInfo(aggregates=[uuids.agg1], generation=1)
+
+        with mock.patch.object(report_client, '_get_provider_aggregates',
+                return_value=agg_info) as mock_get_aggs:
+            res = scheduler_utils.get_aggregates_for_routed_subnet(
+                self.context, network_api, report_client,
+                uuids.subnet1)
+        self.assertEqual([uuids.agg1], res)
+        mock_get_segment_ids.assert_called_once_with(
+            self.context, uuids.subnet1)
+        mock_get_aggs.assert_called_once_with(self.context, uuids.segment1)
+
+    @mock.patch('nova.network.neutron.API.get_segment_id_for_subnet')
+    def test_get_aggregates_for_routed_subnet_none(self, mock_get_segment_ids):
+        mock_get_segment_ids.return_value = None
+        report_client = report.SchedulerReportClient()
+        network_api = neutron.API()
+        self.assertEqual(
+            [],
+            scheduler_utils.get_aggregates_for_routed_subnet(
+                self.context, network_api, report_client, uuids.subnet1))
+
+    @mock.patch('nova.network.neutron.API.get_segment_id_for_subnet')
+    def test_get_aggregates_for_routed_subnet_fails(self,
+                                                    mock_get_segment_ids):
+        mock_get_segment_ids.return_value = uuids.segment1
+        report_client = report.SchedulerReportClient()
+        network_api = neutron.API()
+
+        # We could fail on some placement issue...
+        with mock.patch.object(report_client, '_get_provider_aggregates',
+                return_value=None):
+            self.assertRaises(
+                exception.InvalidRoutedNetworkConfiguration,
+                scheduler_utils.get_aggregates_for_routed_subnet,
+                self.context, network_api, report_client, uuids.subnet1)
+
+        # ... but we also want to fail if we can't find the related aggregate
+        agg_info = report.AggInfo(aggregates=set(), generation=1)
+        with mock.patch.object(report_client, '_get_provider_aggregates',
+                return_value=agg_info):
+            self.assertRaises(
+                exception.InvalidRoutedNetworkConfiguration,
+                scheduler_utils.get_aggregates_for_routed_subnet,
+                self.context, network_api, report_client, uuids.subnet1)

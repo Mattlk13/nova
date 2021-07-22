@@ -16,11 +16,10 @@
 import collections
 import itertools
 import re
+from urllib import parse as urlparse
 
 from oslo_log import log as logging
 from oslo_utils import strutils
-import six
-import six.moves.urllib.parse as urlparse
 import webob
 from webob import exc
 
@@ -28,10 +27,8 @@ from nova.api.openstack import api_version_request
 from nova.compute import task_states
 from nova.compute import vm_states
 import nova.conf
-from nova import context as nova_context
 from nova import exception
 from nova.i18n import _
-from nova.network import constants
 from nova import objects
 from nova import quota
 from nova import utils
@@ -510,7 +507,7 @@ def is_all_tenants(search_opts):
         try:
             all_tenants = strutils.bool_from_string(all_tenants, True)
         except ValueError as err:
-            raise exception.InvalidInput(six.text_type(err))
+            raise exception.InvalidInput(str(err))
     else:
         # The empty string is considered enabling all_tenants
         all_tenants = 'all_tenants' in search_opts
@@ -528,7 +525,7 @@ def is_locked(search_opts):
     try:
         locked = strutils.bool_from_string(locked, strict=True)
     except ValueError as err:
-        raise exception.InvalidInput(six.text_type(err))
+        raise exception.InvalidInput(str(err))
     return locked
 
 
@@ -556,40 +553,3 @@ def supports_port_resource_request(req):
         port resource request support, False otherwise.
     """
     return api_version_request.is_supported(req, '2.72')
-
-
-def supports_port_resource_request_during_move(req):
-    """Check to see if the requested API version is high enough for support
-    port resource request during move operation.
-
-    NOTE: At the moment there is no such microversion that supports port
-    resource request during move. This function is added as a preparation for
-    that microversion (assuming there will be a new microversion, which is
-    yet to be decided).
-
-    :param req: The incoming API request
-    :returns: True if the requested API microversion is high enough for
-        port resource request move support, False otherwise.
-    """
-    return False
-
-
-def instance_has_port_with_resource_request(instance_uuid, network_api):
-
-    # TODO(gibi): Use instance.info_cache to see if there is VIFs with
-    # allocation key in the profile. If there is no such VIF for an instance
-    # and the instance is not shelve offloaded then we can be sure that the
-    # instance has no port with resource request. If the instance is shelve
-    # offloaded then we still have to hit neutron.
-    search_opts = {'device_id': instance_uuid,
-                   'fields': [constants.RESOURCE_REQUEST]}
-    # NOTE(gibi): We need to use an admin context to query neutron ports as
-    # neutron does not fill the resource_request field in the port response if
-    # we query with a non admin context.
-    admin_context = nova_context.get_admin_context()
-    ports = network_api.list_ports(
-        admin_context, **search_opts).get('ports', [])
-    for port in ports:
-        if port.get(constants.RESOURCE_REQUEST):
-            return True
-    return False

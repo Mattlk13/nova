@@ -748,7 +748,7 @@ The embedded flavor description will not be included in server representations.
 ----
 
 Updates the POST request body for the ``migrate`` action to include the
-the optional ``host`` string field defaulted to ``null``. If ``host`` is
+optional ``host`` string field defaulted to ``null``. If ``host`` is
 set the migrate action verifies the provided host with the nova scheduler
 and uses it as the destination for the migration.
 
@@ -1087,3 +1087,93 @@ Adds support for image cache management by aggregate by adding
 Adds ``accelerator-request-bound`` event to ``os-server-external-events``
 API. This event is sent by Cyborg to indicate completion of the binding
 event for one accelerator request (ARQ) associated with an instance.
+
+2.83
+----
+
+Allow the following filter parameters for ``GET /servers/detail``
+and ``GET /servers`` for non-admin :
+
+* ``availability_zone``
+* ``config_drive``
+* ``key_name``
+* ``created_at``
+* ``launched_at``
+* ``terminated_at``
+* ``power_state``
+* ``task_state``
+* ``vm_state``
+* ``progress``
+* ``user_id``
+
+2.84
+----
+
+The ``GET /servers/{server_id}/os-instance-actions/{request_id}`` API returns
+a ``details`` parameter for each failed event with a fault message, similar to
+the server ``fault.message`` parameter in ``GET /servers/{server_id}`` for a
+server with status ``ERROR``.
+
+2.85
+----
+
+Adds the ability to specify ``delete_on_termination`` in the
+``PUT /servers/{server_id}/os-volume_attachments/{volume_id}`` API, which
+allows changing the behavior of volume deletion on instance deletion.
+
+2.86
+----
+
+Add support for validation of known extra specs. This is enabled by default
+for the following APIs:
+
+* ``POST /flavors/{flavor_id}/os-extra_specs``
+* ``PUT /flavors/{flavor_id}/os-extra_specs/{id}``
+
+Validation is only used for recognized extra spec namespaces, currently:
+``accel``, ``aggregate_instance_extra_specs``, ``capabilities``, ``hw``,
+``hw_rng``, ``hw_video``, ``os``, ``pci_passthrough``, ``powervm``, ``quota``,
+``resources``, ``trait``, and ``vmware``.
+
+.. _microversion 2.87:
+
+2.87 (Maximum in Ussuri and Victoria)
+-------------------------------------
+
+Adds support for rescuing boot from volume instances when the compute host
+reports the ``COMPUTE_BFV_RESCUE`` capability trait.
+
+.. _microversion 2.88:
+
+2.88 (Maximum in Wallaby)
+-------------------------
+
+The following fields are no longer included in responses for the
+``GET /os-hypervisors/detail`` and ``GET /os-hypervisors/{hypervisor_id}``
+APIs:
+
+- ``current_workload``
+- ``cpu_info``
+- ``vcpus``
+- ``vcpus_used``
+- ``free_disk_gb``
+- ``local_gb``
+- ``local_gb_used``
+- ``disk_available_least``
+- ``free_ram_mb``
+- ``memory_mb``
+- ``memory_mb_used``
+- ``running_vms``
+
+These fields were removed as the information they provided were frequently
+misleading or outright wrong, and many can be better queried from placement.
+
+In addition, the ``GET /os-hypervisors/statistics`` API, which provided a
+summary view with just the fields listed above, has been removed entirely and
+will now raise a HTTP 404 with microversion 2.88 or greater.
+
+Finally, the ``GET /os-hypervisors/{hypervisor}/uptime`` API, which provided a
+similar response to the ``GET /os-hypervisors/detail`` and ``GET
+/os-hypervisors/{hypervisor_id}`` APIs but with an additional ``uptime`` field,
+has been removed in favour of including this field in the primary ``GET
+/os-hypervisors/detail`` and ``GET /os-hypervisors/{hypervisor_id}`` APIs.

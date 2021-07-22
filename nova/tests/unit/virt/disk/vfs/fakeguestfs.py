@@ -61,7 +61,7 @@ class GuestFS(object):
 
     def add_drive_opts(self, file, *args, **kwargs):
         if file == "/some/fail/file":
-            raise RuntimeError("%s: No such file or directory", file)
+            raise RuntimeError("%s: No such file or directory" % file)
 
         self.drives.append((file, kwargs))
 
@@ -109,7 +109,7 @@ class GuestFS(object):
                 "mode": 0o700
                 }
 
-        return self.files[path]["content"]
+        return bytes(self.files[path]["content"].encode())
 
     def write(self, path, content):
         if path not in self.files:
@@ -169,7 +169,7 @@ class GuestFS(object):
         if ((cfgpath.startswith("/files/etc/passwd") or
                 cfgpath.startswith("/files/etc/group")) and not
                 self.CAN_SET_OWNERSHIP):
-            raise RuntimeError("Node not found %s", cfgpath)
+            raise RuntimeError("Node not found %s" % cfgpath)
 
         if cfgpath == "/files/etc/passwd/root/uid":
             return 0
@@ -183,7 +183,7 @@ class GuestFS(object):
             return 500
         elif cfgpath == "/files/etc/group/admins/gid":
             return 600
-        raise RuntimeError("Unknown path %s", cfgpath)
+        raise RuntimeError("Unknown path %s" % cfgpath)
 
     def set_trace(self, enabled):
         self.trace_enabled = enabled

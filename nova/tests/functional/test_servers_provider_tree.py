@@ -32,6 +32,22 @@ LOG = logging.getLogger(__name__)
 class ProviderTreeTests(integrated_helpers.ProviderUsageBaseTestCase):
     compute_driver = 'fake.MediumFakeDriver'
 
+    # These must match the capabilities in
+    # nova.virt.fake.FakeDriver.capabilities
+    expected_fake_driver_capability_traits = set([
+        trait for trait in [
+            os_traits.COMPUTE_ACCELERATORS,
+            os_traits.COMPUTE_IMAGE_TYPE_RAW,
+            os_traits.COMPUTE_DEVICE_TAGGING,
+            os_traits.COMPUTE_NET_ATTACH_INTERFACE,
+            os_traits.COMPUTE_NET_ATTACH_INTERFACE_WITH_TAG,
+            os_traits.COMPUTE_VOLUME_ATTACH_WITH_TAG,
+            os_traits.COMPUTE_VOLUME_EXTEND,
+            os_traits.COMPUTE_VOLUME_MULTI_ATTACH,
+            os_traits.COMPUTE_TRUSTED_CERTS,
+        ]
+    ])
+
     def setUp(self):
         super(ProviderTreeTests, self).setUp()
         # Before starting compute, placement has no providers registered
@@ -85,7 +101,7 @@ class ProviderTreeTests(integrated_helpers.ProviderUsageBaseTestCase):
             self.expected_fake_driver_capability_traits.union(
                 # The COMPUTE_NODE trait is always added
                 [os_traits.COMPUTE_NODE]))
-        self.assertItemsEqual(self.expected_compute_node_traits,
+        self.assertCountEqual(self.expected_compute_node_traits,
                               self._get_provider_traits(self.host_uuid))
 
     def _run_update_available_resource(self, startup):
@@ -151,7 +167,7 @@ class ProviderTreeTests(integrated_helpers.ProviderUsageBaseTestCase):
         self.assertIn('CUSTOM_BANDWIDTH', self._get_all_resource_classes())
         self.assertIn('CUSTOM_GOLD', self._get_all_traits())
         self.assertEqual(inv, self._get_provider_inventory(self.host_uuid))
-        self.assertItemsEqual(
+        self.assertCountEqual(
             traits.union(self.expected_compute_node_traits),
             self._get_provider_traits(self.host_uuid)
         )
@@ -373,7 +389,7 @@ class ProviderTreeTests(integrated_helpers.ProviderUsageBaseTestCase):
             self._get_provider_inventory(uuids.pf2_2)['SRIOV_NET_VF']['total'])
 
         # Compute don't have any extra traits
-        self.assertItemsEqual(self.expected_compute_node_traits,
+        self.assertCountEqual(self.expected_compute_node_traits,
                               self._get_provider_traits(self.host_uuid))
 
         # NUMAs don't have any traits
@@ -605,7 +621,7 @@ class TraitsTrackingTests(integrated_helpers.ProviderUsageBaseTestCase):
             ptree_traits +
             [os_traits.COMPUTE_NET_ATTACH_INTERFACE, os_traits.COMPUTE_NODE]
         )
-        self.assertItemsEqual(expected_traits,
+        self.assertCountEqual(expected_traits,
                               self._get_provider_traits(rp_uuid))
         global_traits = self._get_all_traits()
         # CUSTOM_FOO is now a registered trait because the virt driver
@@ -617,7 +633,7 @@ class TraitsTrackingTests(integrated_helpers.ProviderUsageBaseTestCase):
         expected_traits.remove(custom_trait)
         expected_traits.remove(os_traits.COMPUTE_NET_ATTACH_INTERFACE)
         self._set_provider_traits(rp_uuid, list(expected_traits))
-        self.assertItemsEqual(expected_traits,
+        self.assertCountEqual(expected_traits,
                               self._get_provider_traits(rp_uuid))
 
         # The above trait deletions are simulations of an out-of-band
@@ -637,7 +653,7 @@ class TraitsTrackingTests(integrated_helpers.ProviderUsageBaseTestCase):
         # placement.
         self._run_periodics()
 
-        self.assertItemsEqual(expected_traits,
+        self.assertCountEqual(expected_traits,
                               self._get_provider_traits(rp_uuid))
         global_traits = self._get_all_traits()
         self.assertIn(custom_trait, global_traits)

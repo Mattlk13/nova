@@ -16,11 +16,12 @@
 import io
 
 import mock
-import six
+import os_traits
 
 from nova import test
 from nova.virt.disk import api as disk_api
 from nova.virt import driver
+from nova.virt import fake
 
 PROC_MOUNTS_CONTENTS = """rootfs / rootfs rw 0 0
 sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
@@ -89,6 +90,18 @@ class TestVirtDriver(test.NoDBTestCase):
         self.assertTrue(driver.swap_is_usable({'device_name': '/dev/sdb',
                                                 'swap_size': 1}))
 
+    def test_image_type_exclude_list(self):
+        fake_driver = fake.FakeDriver(None)
+
+        traits = fake_driver.capabilities_as_traits()
+        self.assertTrue(traits[os_traits.COMPUTE_IMAGE_TYPE_RAW])
+        self.assertFalse(traits[os_traits.COMPUTE_IMAGE_TYPE_VHD])
+
+        self.flags(image_type_exclude_list='raw', group='compute')
+        traits = fake_driver.capabilities_as_traits()
+        self.assertFalse(traits[os_traits.COMPUTE_IMAGE_TYPE_RAW])
+        self.assertFalse(traits[os_traits.COMPUTE_IMAGE_TYPE_VHD])
+
 
 class FakeMount(object):
     def __init__(self, image, mount_dir, partition=None, device=None):
@@ -119,10 +132,10 @@ class FakeMount(object):
 
 class TestDiskImage(test.NoDBTestCase):
     def mock_proc_mounts(self, mock_open):
-        response = io.StringIO(six.text_type(PROC_MOUNTS_CONTENTS))
+        response = io.StringIO(str(PROC_MOUNTS_CONTENTS))
         mock_open.return_value = response
 
-    @mock.patch.object(six.moves.builtins, 'open')
+    @mock.patch('builtins.open')
     def test_mount(self, mock_open):
         self.mock_proc_mounts(mock_open)
         image = '/tmp/fake-image'
@@ -139,7 +152,7 @@ class TestDiskImage(test.NoDBTestCase):
         self.assertEqual(diskimage._mounter, fakemount)
         self.assertEqual(dev, '/dev/fake')
 
-    @mock.patch.object(six.moves.builtins, 'open')
+    @mock.patch('builtins.open')
     def test_umount(self, mock_open):
         self.mock_proc_mounts(mock_open)
 
@@ -159,7 +172,7 @@ class TestDiskImage(test.NoDBTestCase):
         diskimage.umount()
         self.assertIsNone(diskimage._mounter)
 
-    @mock.patch.object(six.moves.builtins, 'open')
+    @mock.patch('builtins.open')
     def test_teardown(self, mock_open):
         self.mock_proc_mounts(mock_open)
 

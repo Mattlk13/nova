@@ -28,8 +28,8 @@ from nova.db import api as db
 from nova import exception
 from nova import objects
 from nova import test
+from nova.tests import fixtures
 from nova.tests.unit.api.openstack import fakes
-from nova.tests.unit.image import fake
 from nova.tests.unit import matchers
 from nova.tests.unit.objects import test_service
 
@@ -203,14 +203,14 @@ class ServersControllerCreateTestV21(test.TestCase):
         fakes.stub_out_nw_api(self)
         self._set_up_controller()
 
-        def create_db_entry_for_new_instance(*args, **kwargs):
-            instance = args[4]
+        def _populate_instance_for_create(*args, **kwargs):
+            instance = args[2]
             instance.uuid = FAKE_UUID
             return instance
 
-        fake.stub_out_image_service(self)
-        self.stub_out('nova.compute.api.API.create_db_entry_for_new_instance',
-                      create_db_entry_for_new_instance)
+        self.useFixture(fixtures.GlanceFixture(self))
+        self.stub_out('nova.compute.api.API._populate_instance_for_create',
+                      _populate_instance_for_create)
 
     def _set_up_controller(self):
         self.controller = servers_v21.ServersController()

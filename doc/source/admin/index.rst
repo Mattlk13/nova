@@ -107,11 +107,19 @@ instance for these kind of workloads.
 
    pci-passthrough
    cpu-topologies
+   real-time
    huge-pages
    virtual-gpu
    file-backed-memory
    ports-with-resource-requests
    virtual-persistent-memory
+   emulated-tpm
+   uefi
+   secure-boot
+   sev
+   managing-resource-providers
+   resource-limits
+   cpu-models
 
 
 Additional guides
@@ -145,3 +153,4 @@ Additional guides
    secure-live-migration-with-qemu-native-tls
    mitigation-for-Intel-MDS-security-flaws
    vendordata
+   hw-machine-type

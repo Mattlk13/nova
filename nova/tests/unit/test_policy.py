@@ -27,8 +27,8 @@ from nova import exception
 from nova.policies import servers as servers_policy
 from nova import policy
 from nova import test
+from nova.tests import fixtures as nova_fixtures
 from nova.tests.unit import fake_policy
-from nova.tests.unit import policy_fixture
 from nova import utils
 
 
@@ -48,7 +48,9 @@ class PolicyFileTestCase(test.NoDBTestCase):
             # is_admin or not. As a side-effect, policy reset is needed here
             # to flush existing policy cache.
             policy.reset()
-            policy.init()
+            # NOTE(gmann): We do not need to log policy warnings for unit
+            # tests.
+            policy.init(suppress_deprecation_warnings=True)
             rule = oslo_policy.RuleDefault('example:test', "")
             policy._ENFORCER.register_defaults([rule])
 
@@ -86,7 +88,9 @@ class PolicyTestCase(test.NoDBTestCase):
                                     "role:ADMIN or role:sysadmin"),
         ]
         policy.reset()
-        policy.init()
+        # NOTE(gmann): We do not need to log policy warnings for unit
+        # tests.
+        policy.init(suppress_deprecation_warnings=True)
         # before a policy rule can be used, its default has to be registered.
         policy._ENFORCER.register_defaults(rules)
         self.context = context.RequestContext('fake', 'fake', roles=['member'])
@@ -232,7 +236,9 @@ class PolicyTestCase(test.NoDBTestCase):
 class IsAdminCheckTestCase(test.NoDBTestCase):
     def setUp(self):
         super(IsAdminCheckTestCase, self).setUp()
-        policy.init()
+        # NOTE(gmann): We do not need to log policy warnings for unit
+        # tests.
+        policy.init(suppress_deprecation_warnings=True)
 
     def test_init_true(self):
         check = policy.IsAdminCheck('is_admin', 'True')
@@ -279,7 +285,7 @@ class IsAdminCheckTestCase(test.NoDBTestCase):
 class AdminRolePolicyTestCase(test.NoDBTestCase):
     def setUp(self):
         super(AdminRolePolicyTestCase, self).setUp()
-        self.policy = self.useFixture(policy_fixture.RoleBasedPolicyFixture())
+        self.policy = self.useFixture(nova_fixtures.RoleBasedPolicyFixture())
         self.context = context.RequestContext('fake', 'fake', roles=['member'])
         self.actions = policy.get_rules().keys()
         self.target = {}
@@ -296,7 +302,7 @@ class AdminRolePolicyTestCase(test.NoDBTestCase):
 class RealRolePolicyTestCase(test.NoDBTestCase):
     def setUp(self):
         super(RealRolePolicyTestCase, self).setUp()
-        self.policy = self.useFixture(policy_fixture.RealPolicyFixture())
+        self.policy = self.useFixture(nova_fixtures.RealPolicyFixture())
         self.non_admin_context = context.RequestContext('fake', 'fake',
                                                         roles=['member'])
         self.admin_context = context.RequestContext('fake', 'fake', True,
@@ -317,7 +323,6 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:servers:show:host_status:unknown-only",
 "os_compute_api:servers:migrations:force_complete",
 "os_compute_api:servers:migrations:delete",
-"os_compute_api:os-admin-actions:reset_network",
 "os_compute_api:os-admin-actions:inject_network_info",
 "os_compute_api:os-admin-actions:reset_state",
 "os_compute_api:os-aggregates:index",
@@ -328,8 +333,6 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:os-aggregates:add_host",
 "os_compute_api:os-aggregates:remove_host",
 "os_compute_api:os-aggregates:set_metadata",
-"os_compute_api:os-agents",
-"os_compute_api:os-baremetal-nodes",
 "os_compute_api:os-evacuate",
 "os_compute_api:os-extended-server-attributes",
 "os_compute_api:os-flavor-access:remove_tenant_access",
@@ -340,32 +343,29 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:os-flavor-manage:create",
 "os_compute_api:os-flavor-manage:update",
 "os_compute_api:os-flavor-manage:delete",
-"os_compute_api:os-hosts",
-"os_compute_api:os-hypervisors",
+"os_compute_api:os-hosts:update",
+"os_compute_api:os-hosts:reboot",
+"os_compute_api:os-hosts:shutdown",
+"os_compute_api:os-hosts:start",
 "os_compute_api:os-instance-actions:events",
-"os_compute_api:os-instance-usage-audit-log",
 "os_compute_api:os-lock-server:unlock:unlock_override",
 "os_compute_api:os-migrate-server:migrate",
 "os_compute_api:os-migrate-server:migrate_live",
 "os_compute_api:os-quota-sets:update",
 "os_compute_api:os-quota-sets:delete",
 "os_compute_api:os-server-diagnostics",
+"os_compute_api:os-server-groups:index:all_projects",
 "os_compute_api:os-services:update",
 "os_compute_api:os-services:delete",
 "os_compute_api:os-shelve:shelve_offload",
-"os_compute_api:os-simple-tenant-usage:list",
 "os_compute_api:os-availability-zone:detail",
-"os_compute_api:os-used-limits",
-"os_compute_api:os-migrations:index",
 "os_compute_api:os-assisted-volume-snapshots:create",
 "os_compute_api:os-assisted-volume-snapshots:delete",
 "os_compute_api:os-console-auth-tokens",
 "os_compute_api:os-quota-class-sets:update",
 "os_compute_api:os-server-external-events:create",
-"os_compute_api:os-volumes-attachments:update",
+"os_compute_api:os-volumes-attachments:swap",
 "os_compute_api:servers:create:zero_disk_flavor",
-"os_compute_api:servers:migrations:index",
-"os_compute_api:servers:migrations:show",
 )
 
         self.admin_or_owner_rules = (
@@ -392,11 +392,8 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:server-metadata:create",
 "os_compute_api:server-metadata:update",
 "os_compute_api:server-metadata:update_all",
-"os_compute_api:os-simple-tenant-usage:show",
 "os_compute_api:os-suspend-server:suspend",
 "os_compute_api:os-suspend-server:resume",
-"os_compute_api:os-tenant-networks",
-"os_compute_api:extensions",
 "os_compute_api:servers:confirm_resize",
 "os_compute_api:servers:create",
 "os_compute_api:servers:create:attach_network",
@@ -424,19 +421,24 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:os-flavor-access",
 "os_compute_api:os-flavor-extra-specs:index",
 "os_compute_api:os-flavor-extra-specs:show",
-"os_compute_api:os-floating-ip-pools",
-"os_compute_api:os-floating-ips",
-"os_compute_api:os-instance-actions",
-"os_compute_api:limits",
-"os_compute_api:os-multinic",
-"os_compute_api:os-networks:view",
+"os_compute_api:os-floating-ips:add",
+"os_compute_api:os-floating-ips:remove",
+"os_compute_api:os-floating-ips:create",
+"os_compute_api:os-floating-ips:delete",
+"os_compute_api:os-multinic:add",
+"os_compute_api:os-multinic:remove",
 "os_compute_api:os-rescue",
-"os_compute_api:os-security-groups",
-"os_compute_api:os-server-password",
+"os_compute_api:os-unrescue",
+"os_compute_api:os-security-groups:create",
+"os_compute_api:os-security-groups:update",
+"os_compute_api:os-security-groups:delete",
+"os_compute_api:os-security-groups:rule:create",
+"os_compute_api:os-security-groups:rule:delete",
+"os_compute_api:os-security-groups:add",
+"os_compute_api:os-security-groups:remove",
+"os_compute_api:os-server-password:clear",
 "os_compute_api:os-server-tags:delete",
 "os_compute_api:os-server-tags:delete_all",
-"os_compute_api:os-server-tags:index",
-"os_compute_api:os-server-tags:show",
 "os_compute_api:os-server-tags:update",
 "os_compute_api:os-server-tags:update_all",
 "os_compute_api:os-server-groups:index",
@@ -445,25 +447,72 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:os-server-groups:delete",
 "os_compute_api:os-shelve:shelve",
 "os_compute_api:os-shelve:unshelve",
-"os_compute_api:os-volumes",
-"os_compute_api:os-volumes-attachments:index",
-"os_compute_api:os-volumes-attachments:show",
+"os_compute_api:os-volumes:create",
+"os_compute_api:os-volumes:delete",
+"os_compute_api:os-volumes:snapshots:create",
+"os_compute_api:os-volumes:snapshots:delete",
 "os_compute_api:os-volumes-attachments:create",
 "os_compute_api:os-volumes-attachments:delete",
+"os_compute_api:os-volumes-attachments:update",
 )
 
         self.allow_all_rules = (
 "os_compute_api:os-quota-sets:defaults",
 "os_compute_api:os-availability-zone:list",
+"os_compute_api:limits",
+"os_compute_api:extensions",
+"os_compute_api:os-floating-ip-pools",
 )
 
         self.system_reader_rules = (
+"os_compute_api:os-tenant-networks:list",
+"os_compute_api:os-tenant-networks:show",
+"os_compute_api:os-baremetal-nodes:list",
+"os_compute_api:os-baremetal-nodes:show",
+"os_compute_api:servers:migrations:index",
+"os_compute_api:servers:migrations:show",
+"os_compute_api:os-simple-tenant-usage:list",
+"os_compute_api:os-migrations:index",
 "os_compute_api:os-services:list",
+"os_compute_api:os-instance-actions:events:details",
+"os_compute_api:os-instance-usage-audit-log:list",
+"os_compute_api:os-instance-usage-audit-log:show",
+"os_compute_api:os-hosts:list",
+"os_compute_api:os-hosts:show",
+"os_compute_api:os-hypervisors:list",
+"os_compute_api:os-hypervisors:list-detail",
+"os_compute_api:os-hypervisors:show",
+"os_compute_api:os-hypervisors:statistics",
+"os_compute_api:os-hypervisors:uptime",
+"os_compute_api:os-hypervisors:search",
+"os_compute_api:os-hypervisors:servers",
+"os_compute_api:limits:other_project",
+"os_compute_api:os-networks:list",
+"os_compute_api:os-networks:show",
 )
 
         self.system_reader_or_owner_rules = (
+"os_compute_api:os-simple-tenant-usage:show",
+"os_compute_api:os-security-groups:get",
+"os_compute_api:os-security-groups:show",
+"os_compute_api:os-security-groups:list",
+"os_compute_api:os-volumes-attachments:index",
+"os_compute_api:os-volumes-attachments:show",
 "os_compute_api:os-attach-interfaces:list",
 "os_compute_api:os-attach-interfaces:show",
+"os_compute_api:os-instance-actions:list",
+"os_compute_api:os-instance-actions:show",
+"os_compute_api:os-server-password:show",
+"os_compute_api:os-server-tags:index",
+"os_compute_api:os-server-tags:show",
+"os_compute_api:os-floating-ips:list",
+"os_compute_api:os-floating-ips:show",
+"os_compute_api:os-volumes:list",
+"os_compute_api:os-volumes:detail",
+"os_compute_api:os-volumes:show",
+"os_compute_api:os-volumes:snapshots:show",
+"os_compute_api:os-volumes:snapshots:list",
+"os_compute_api:os-volumes:snapshots:detail",
 )
 
         self.allow_nobody_rules = (
@@ -509,8 +558,9 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
         special_rules = ('admin_api', 'admin_or_owner', 'context_is_admin',
                          'os_compute_api:os-quota-class-sets:show',
                          'system_admin_api', 'system_reader_api',
-                         'project_member_api', 'project_reader_api',
-                         'system_admin_or_owner', 'system_or_project_reader')
+                         'project_admin_api', 'project_member_api',
+                         'project_reader_api', 'system_admin_or_owner',
+                         'system_or_project_reader')
         result = set(rules.keys()) - set(self.admin_only_rules +
             self.admin_or_owner_rules +
             self.allow_all_rules + self.system_reader_rules +

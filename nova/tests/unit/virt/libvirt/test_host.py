@@ -20,30 +20,30 @@ import eventlet
 from eventlet import greenthread
 from eventlet import tpool
 import mock
+from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import uuidutils
-import six
-from six.moves import builtins
 import testtools
-
 
 from nova.compute import vm_states
 from nova import exception
 from nova import objects
 from nova.objects import fields as obj_fields
+from nova.pci import utils as pci_utils
 from nova import test
-from nova.tests.unit.virt.libvirt import fake_libvirt_data
-from nova.tests.unit.virt.libvirt import fakelibvirt
+from nova.tests import fixtures as nova_fixtures
+from nova.tests.fixtures import libvirt as fakelibvirt
+from nova.tests.fixtures import libvirt_data as fake_libvirt_data
 from nova.virt import event
 from nova.virt.libvirt import config as vconfig
-from nova.virt.libvirt import driver as libvirt_driver
+from nova.virt.libvirt import event as libvirtevent
 from nova.virt.libvirt import guest as libvirt_guest
 from nova.virt.libvirt import host
 
 
 class StringMatcher(object):
     def __eq__(self, other):
-        return isinstance(other, six.string_types)
+        return isinstance(other, str)
 
 
 class FakeVirtDomain(object):
@@ -68,7 +68,7 @@ class HostTestCase(test.NoDBTestCase):
     def setUp(self):
         super(HostTestCase, self).setUp()
 
-        self.useFixture(fakelibvirt.FakeLibvirtFixture())
+        self.useFixture(nova_fixtures.LibvirtFixture())
         self.host = host.Host("qemu:///system")
 
     @mock.patch("nova.virt.libvirt.host.Host._init_events")
@@ -273,20 +273,18 @@ class HostTestCase(test.NoDBTestCase):
         ev = event.LifecycleEvent(
             "cef19ce0-0ca2-11df-855d-b19fbce37686",
             event.EVENT_LIFECYCLE_STOPPED)
-        for uri in ("qemu:///system", "xen:///"):
-            spawn_after_mock = mock.Mock()
-            greenthread.spawn_after = spawn_after_mock
-            hostimpl = host.Host(uri,
-                                 lifecycle_event_handler=lambda e: None)
-            hostimpl._event_emit_delayed(ev)
-            spawn_after_mock.assert_called_once_with(
-                15, hostimpl._event_emit, ev)
+        spawn_after_mock = mock.Mock()
+        greenthread.spawn_after = spawn_after_mock
+        hostimpl = host.Host(
+            'qemu:///system', lifecycle_event_handler=lambda e: None)
+        hostimpl._event_emit_delayed(ev)
+        spawn_after_mock.assert_called_once_with(
+            15, hostimpl._event_emit, ev)
 
     @mock.patch.object(greenthread, 'spawn_after')
     def test_event_emit_delayed_call_delayed_pending(self, spawn_after_mock):
-        hostimpl = host.Host("xen:///",
-                             lifecycle_event_handler=lambda e: None)
-
+        hostimpl = host.Host(
+            'qemu:///system', lifecycle_event_handler=lambda e: None)
         uuid = "cef19ce0-0ca2-11df-855d-b19fbce37686"
         gt_mock = mock.Mock()
         hostimpl._events_delayed[uuid] = gt_mock
@@ -297,8 +295,8 @@ class HostTestCase(test.NoDBTestCase):
         self.assertTrue(spawn_after_mock.called)
 
     def test_event_delayed_cleanup(self):
-        hostimpl = host.Host("xen:///",
-                             lifecycle_event_handler=lambda e: None)
+        hostimpl = host.Host(
+            'qemu:///system', lifecycle_event_handler=lambda e: None)
         uuid = "cef19ce0-0ca2-11df-855d-b19fbce37686"
         ev = event.LifecycleEvent(
             uuid, event.EVENT_LIFECYCLE_STARTED)
@@ -307,6 +305,42 @@ class HostTestCase(test.NoDBTestCase):
         hostimpl._event_emit_delayed(ev)
         gt_mock.cancel.assert_called_once_with()
         self.assertNotIn(uuid, hostimpl._events_delayed.keys())
+
+    def test_device_removed_event(self):
+        hostimpl = mock.MagicMock()
+        conn = mock.MagicMock()
+        fake_dom_xml = """
+                <domain type='kvm'>
+                  <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+                </domain>
+            """
+        dom = fakelibvirt.Domain(conn, fake_dom_xml, running=True)
+        host.Host._event_device_removed_callback(
+            conn, dom, dev='virtio-1', opaque=hostimpl)
+        expected_event = hostimpl._queue_event.call_args[0][0]
+        self.assertEqual(
+            libvirtevent.DeviceRemovedEvent, type(expected_event))
+        self.assertEqual(
+            'cef19ce0-0ca2-11df-855d-b19fbce37686', expected_event.uuid)
+        self.assertEqual('virtio-1', expected_event.dev)
+
+    def test_device_removal_failed(self):
+        hostimpl = mock.MagicMock()
+        conn = mock.MagicMock()
+        fake_dom_xml = """
+                <domain type='kvm'>
+                  <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+                </domain>
+            """
+        dom = fakelibvirt.Domain(conn, fake_dom_xml, running=True)
+        host.Host._event_device_removal_failed_callback(
+            conn, dom, dev='virtio-1', opaque=hostimpl)
+        expected_event = hostimpl._queue_event.call_args[0][0]
+        self.assertEqual(
+            libvirtevent.DeviceRemovalFailedEvent, type(expected_event))
+        self.assertEqual(
+            'cef19ce0-0ca2-11df-855d-b19fbce37686', expected_event.uuid)
+        self.assertEqual('virtio-1', expected_event.dev)
 
     @mock.patch.object(fakelibvirt.virConnect, "domainEventRegisterAny")
     @mock.patch.object(host.Host, "_connect")
@@ -334,7 +368,7 @@ class HostTestCase(test.NoDBTestCase):
         get_conn_currency(self.host)
         get_conn_currency(self.host)
         self.assertEqual(self.connect_calls, 1)
-        self.assertEqual(self.register_calls, 1)
+        self.assertEqual(self.register_calls, 3)
 
     @mock.patch.object(fakelibvirt.virConnect, "domainEventRegisterAny")
     @mock.patch.object(host.Host, "_connect")
@@ -368,7 +402,7 @@ class HostTestCase(test.NoDBTestCase):
         thr1.wait()
         thr2.wait()
         self.assertEqual(self.connect_calls, 1)
-        self.assertEqual(self.register_calls, 1)
+        self.assertEqual(self.register_calls, 3)
 
     @mock.patch.object(host.Host, "_connect")
     def test_conn_event(self, mock_conn):
@@ -520,14 +554,13 @@ class HostTestCase(test.NoDBTestCase):
 
     @mock.patch.object(fakelibvirt.Connection, "listAllDomains")
     def test_list_instance_domains(self, mock_list_all):
-        vm0 = FakeVirtDomain(id=0, name="Domain-0")  # Xen dom-0
         vm1 = FakeVirtDomain(id=3, name="instance00000001")
         vm2 = FakeVirtDomain(id=17, name="instance00000002")
         vm3 = FakeVirtDomain(name="instance00000003")
         vm4 = FakeVirtDomain(name="instance00000004")
 
         def fake_list_all(flags):
-            vms = [vm0]
+            vms = []
             if flags & fakelibvirt.VIR_CONNECT_LIST_DOMAINS_ACTIVE:
                 vms.extend([vm1, vm2])
             if flags & fakelibvirt.VIR_CONNECT_LIST_DOMAINS_INACTIVE:
@@ -559,26 +592,13 @@ class HostTestCase(test.NoDBTestCase):
         self.assertEqual(doms[2].name(), vm3.name())
         self.assertEqual(doms[3].name(), vm4.name())
 
-        doms = self.host.list_instance_domains(only_guests=False)
-
-        mock_list_all.assert_called_once_with(
-            fakelibvirt.VIR_CONNECT_LIST_DOMAINS_ACTIVE)
-        mock_list_all.reset_mock()
-
-        self.assertEqual(len(doms), 3)
-        self.assertEqual(doms[0].name(), vm0.name())
-        self.assertEqual(doms[1].name(), vm1.name())
-        self.assertEqual(doms[2].name(), vm2.name())
-
     @mock.patch.object(host.Host, "list_instance_domains")
     def test_list_guests(self, mock_list_domains):
         dom0 = mock.Mock(spec=fakelibvirt.virDomain)
         dom1 = mock.Mock(spec=fakelibvirt.virDomain)
-        mock_list_domains.return_value = [
-            dom0, dom1]
-        result = self.host.list_guests(True, False)
-        mock_list_domains.assert_called_once_with(
-            only_running=True, only_guests=False)
+        mock_list_domains.return_value = [dom0, dom1]
+        result = self.host.list_guests(True)
+        mock_list_domains.assert_called_once_with(only_running=True)
         self.assertEqual(dom0, result[0]._domain)
         self.assertEqual(dom1, result[1]._domain)
 
@@ -917,6 +937,7 @@ class HostTestCase(test.NoDBTestCase):
         self.host.create_secret('ceph', 'cephvol')
         self.host.create_secret('iscsi', 'iscsivol')
         self.host.create_secret('volume', 'vol')
+        self.host.create_secret('vtpm', 'vtpmdev')
         self.assertRaises(exception.NovaException,
                           self.host.create_secret, "foo", "foovol")
 
@@ -958,71 +979,13 @@ SwapCached:            0 kB
 Active:          8381604 kB
 """)
         with test.nested(
-                mock.patch.object(six.moves.builtins, "open", m, create=True),
-                mock.patch.object(host.Host,
-                                  "get_connection"),
-                mock.patch('sys.platform', 'linux2'),
-                ) as (mock_file, mock_conn, mock_platform):
+            mock.patch('builtins.open', m, create=True),
+            mock.patch.object(host.Host, "get_connection"),
+        ) as (mock_file, mock_conn):
             mock_conn().getInfo.return_value = [
                 obj_fields.Architecture.X86_64, 15814, 8, 1208, 1, 1, 4, 2]
 
             self.assertEqual(6866, self.host.get_memory_mb_used())
-
-    def test_sum_domain_memory_mb_xen(self):
-        class DiagFakeDomain(object):
-            def __init__(self, id, memmb):
-                self.id = id
-                self.memmb = memmb
-
-            def info(self):
-                return [0, 0, self.memmb * 1024]
-
-            def ID(self):
-                return self.id
-
-            def name(self):
-                return "instance000001"
-
-            def UUIDString(self):
-                return uuids.fake
-
-        m = mock.mock_open(read_data="""
-MemTotal:       16194180 kB
-MemFree:          233092 kB
-MemAvailable:    8892356 kB
-Buffers:          567708 kB
-Cached:          8362404 kB
-SwapCached:            0 kB
-Active:          8381604 kB
-""")
-
-        with test.nested(
-                mock.patch.object(six.moves.builtins, "open", m, create=True),
-                mock.patch.object(host.Host,
-                                  "list_guests"),
-                mock.patch.object(libvirt_driver.LibvirtDriver,
-                                  "_conn"),
-                mock.patch('sys.platform', 'linux2'),
-                ) as (mock_file, mock_list, mock_conn, mock_platform):
-            mock_list.return_value = [
-                libvirt_guest.Guest(DiagFakeDomain(0, 15814)),
-                libvirt_guest.Guest(DiagFakeDomain(1, 750)),
-                libvirt_guest.Guest(DiagFakeDomain(2, 1042))]
-            mock_conn.getInfo.return_value = [
-                obj_fields.Architecture.X86_64, 15814, 8, 1208, 1, 1, 4, 2]
-
-            self.assertEqual(8657, self.host._sum_domain_memory_mb())
-            mock_list.assert_called_with(only_guests=False)
-
-    def test_get_memory_used_xen(self):
-        self.flags(virt_type='xen', group='libvirt')
-        with test.nested(
-                mock.patch.object(self.host, "_sum_domain_memory_mb"),
-                mock.patch('sys.platform', 'linux2')
-                ) as (mock_sumDomainMemory, mock_platform):
-            mock_sumDomainMemory.return_value = 8192
-            self.assertEqual(8192, self.host.get_memory_mb_used())
-            mock_sumDomainMemory.assert_called_once_with(include_host=True)
 
     def test_sum_domain_memory_mb_file_backed(self):
         class DiagFakeDomain(object):
@@ -1042,31 +1005,25 @@ Active:          8381604 kB
             def UUIDString(self):
                 return uuids.fake
 
-        with test.nested(
-                mock.patch.object(host.Host,
-                                  "list_guests"),
-                mock.patch('sys.platform', 'linux2'),
-        ) as (mock_list, mock_platform):
+        with mock.patch.object(host.Host, 'list_guests') as mock_list:
             mock_list.return_value = [
                 libvirt_guest.Guest(DiagFakeDomain(0, 4096)),
                 libvirt_guest.Guest(DiagFakeDomain(1, 2048)),
                 libvirt_guest.Guest(DiagFakeDomain(2, 1024)),
                 libvirt_guest.Guest(DiagFakeDomain(3, 1024))]
 
-            self.assertEqual(8192,
-                    self.host._sum_domain_memory_mb(include_host=False))
+            self.assertEqual(8192, self.host._sum_domain_memory_mb())
 
     def test_get_memory_used_file_backed(self):
         self.flags(file_backed_memory=1048576,
                    group='libvirt')
 
-        with test.nested(
-                mock.patch.object(self.host, "_sum_domain_memory_mb"),
-                mock.patch('sys.platform', 'linux2')
-                ) as (mock_sumDomainMemory, mock_platform):
+        with mock.patch.object(
+            self.host, "_sum_domain_memory_mb"
+        ) as mock_sumDomainMemory:
             mock_sumDomainMemory.return_value = 8192
             self.assertEqual(8192, self.host.get_memory_mb_used())
-            mock_sumDomainMemory.assert_called_once_with(include_host=False)
+            mock_sumDomainMemory.assert_called_once_with()
 
     def test_get_cpu_stats(self):
         stats = self.host.get_cpu_stats()
@@ -1113,9 +1070,6 @@ Active:          8381604 kB
 
         def emulate_defineXML(xml):
             conn = self.host.get_connection()
-            # Emulate the decoding behavior of defineXML in Python2
-            if six.PY2:
-                xml = xml.decode("utf-8")
             dom = fakelibvirt.Domain(conn, xml, False)
             return dom
         with mock.patch.object(fakelibvirt.virConnect, "defineXML"
@@ -1128,6 +1082,151 @@ Active:          8381604 kB
     def test_device_lookup_by_name(self, mock_nodeDeviceLookupByName):
         self.host.device_lookup_by_name("foo")
         mock_nodeDeviceLookupByName.assert_called_once_with("foo")
+
+    def test_get_pcinet_info(self):
+        dev_name = "net_enp2s2_02_9a_a1_37_be_54"
+        parent_address = "pci_0000_04_11_7"
+        net_dev = fakelibvirt.NodeDevice(
+            self.host._get_connection(),
+            xml=fake_libvirt_data._fake_NodeDevXml[dev_name])
+        pci_dev = fakelibvirt.NodeDevice(
+            self.host._get_connection(),
+            xml=fake_libvirt_data._fake_NodeDevXml[parent_address])
+        actualvf = self.host._get_pcinet_info(pci_dev, [net_dev])
+        expect_vf = ["rx", "tx", "sg", "tso", "gso", "gro", "rxvlan", "txvlan"]
+        self.assertEqual(expect_vf, actualvf)
+
+    @mock.patch.object(pci_utils, 'get_ifname_by_pci_address')
+    def test_get_pcidev_info_non_nic(self, mock_get_ifname):
+        dev_name = "pci_0000_04_11_7"
+        pci_dev = fakelibvirt.NodeDevice(
+            self.host._get_connection(),
+            xml=fake_libvirt_data._fake_NodeDevXml[dev_name])
+        actual_vf = self.host._get_pcidev_info(dev_name, pci_dev, [], [])
+        expect_vf = {
+            "dev_id": dev_name, "address": "0000:04:11.7",
+            "product_id": '1520', "numa_node": 0,
+            "vendor_id": '8086', "label": 'label_8086_1520',
+            "dev_type": obj_fields.PciDeviceType.SRIOV_VF,
+            'parent_addr': '0000:04:00.3',
+        }
+        self.assertEqual(expect_vf, actual_vf)
+        mock_get_ifname.assert_not_called()
+
+    @mock.patch.object(pci_utils, 'get_ifname_by_pci_address',
+                return_value='ens1')
+    def test_get_pcidev_info(self, mock_get_ifname):
+        devs = {
+            "pci_0000_04_00_3", "pci_0000_04_10_7", "pci_0000_04_11_7",
+            "pci_0000_04_00_1", "pci_0000_03_00_0", "pci_0000_03_00_1"
+        }
+        node_devs = {}
+        for dev_name in devs:
+            node_devs[dev_name] = (
+                fakelibvirt.NodeDevice(
+                    self.host._get_connection(),
+                    xml=fake_libvirt_data._fake_NodeDevXml[dev_name]))
+            for child in fake_libvirt_data._fake_NodeDevXml_children[dev_name]:
+                node_devs[child] = (
+                    fakelibvirt.NodeDevice(
+                        self.host._get_connection(),
+                        xml=fake_libvirt_data._fake_NodeDevXml[child]))
+        net_devs = [
+            dev for dev in node_devs.values() if dev.name() not in devs]
+
+        name = "pci_0000_04_00_3"
+        actual_vf = self.host._get_pcidev_info(
+            name, node_devs[name], net_devs, [])
+        expect_vf = {
+            "dev_id": "pci_0000_04_00_3",
+            "address": "0000:04:00.3",
+            "product_id": '1521',
+            "numa_node": None,
+            "vendor_id": '8086',
+            "label": 'label_8086_1521',
+            "dev_type": obj_fields.PciDeviceType.SRIOV_PF,
+            }
+        self.assertEqual(expect_vf, actual_vf)
+
+        name = "pci_0000_04_10_7"
+        actual_vf = self.host._get_pcidev_info(
+            name, node_devs[name], net_devs, [])
+        expect_vf = {
+            "dev_id": "pci_0000_04_10_7",
+            "address": "0000:04:10.7",
+            "product_id": '1520',
+            "numa_node": None,
+            "vendor_id": '8086',
+            "label": 'label_8086_1520',
+            "dev_type": obj_fields.PciDeviceType.SRIOV_VF,
+            "parent_addr": '0000:04:00.3',
+            "parent_ifname": "ens1",
+            "capabilities": {
+                "network": ["rx", "tx", "sg", "tso", "gso", "gro",
+                            "rxvlan", "txvlan"]},
+            }
+        self.assertEqual(expect_vf, actual_vf)
+
+        name = "pci_0000_04_11_7"
+        actual_vf = self.host._get_pcidev_info(
+            name, node_devs[name], net_devs, [])
+        expect_vf = {
+            "dev_id": "pci_0000_04_11_7",
+            "address": "0000:04:11.7",
+            "product_id": '1520',
+            "vendor_id": '8086',
+            "numa_node": 0,
+            "label": 'label_8086_1520',
+            "dev_type": obj_fields.PciDeviceType.SRIOV_VF,
+            "parent_addr": '0000:04:00.3',
+            "capabilities": {
+                "network": ["rx", "tx", "sg", "tso", "gso", "gro",
+                            "rxvlan", "txvlan"]},
+            "parent_ifname": "ens1",
+        }
+        self.assertEqual(expect_vf, actual_vf)
+
+        name = "pci_0000_04_00_1"
+        actual_vf = self.host._get_pcidev_info(
+            name, node_devs[name], net_devs, [])
+        expect_vf = {
+            "dev_id": "pci_0000_04_00_1",
+            "address": "0000:04:00.1",
+            "product_id": '1013',
+            "numa_node": 0,
+            "vendor_id": '15b3',
+            "label": 'label_15b3_1013',
+            "dev_type": obj_fields.PciDeviceType.STANDARD,
+            }
+        self.assertEqual(expect_vf, actual_vf)
+
+        name = "pci_0000_03_00_0"
+        actual_vf = self.host._get_pcidev_info(
+            name, node_devs[name], net_devs, [])
+        expect_vf = {
+            "dev_id": "pci_0000_03_00_0",
+            "address": "0000:03:00.0",
+            "product_id": '1013',
+            "numa_node": 0,
+            "vendor_id": '15b3',
+            "label": 'label_15b3_1013',
+            "dev_type": obj_fields.PciDeviceType.SRIOV_PF,
+            }
+        self.assertEqual(expect_vf, actual_vf)
+
+        name = "pci_0000_03_00_1"
+        actual_vf = self.host._get_pcidev_info(
+            name, node_devs[name], net_devs, [])
+        expect_vf = {
+            "dev_id": "pci_0000_03_00_1",
+            "address": "0000:03:00.1",
+            "product_id": '1013',
+            "numa_node": 0,
+            "vendor_id": '15b3',
+            "label": 'label_15b3_1013',
+            "dev_type": obj_fields.PciDeviceType.SRIOV_PF,
+            }
+        self.assertEqual(expect_vf, actual_vf)
 
     def test_list_pci_devices(self):
         with mock.patch.object(self.host, "_list_devices") as mock_listDevices:
@@ -1143,6 +1242,189 @@ Active:          8381604 kB
         with mock.patch.object(self.host, "_list_devices") as mock_listDevices:
             self.host.list_mediated_devices(8)
         mock_listDevices.assert_called_once_with('mdev', flags=8)
+
+    def test_list_all_devices(self):
+        with mock.patch.object(
+                self.host.get_connection(),
+                "listAllDevices") as mock_list_all_devices:
+            xml_str = """
+        <device>
+        <name>pci_0000_04_00_3</name>
+        <parent>pci_0000_00_01_1</parent>
+        <driver>
+            <name>igb</name>
+        </driver>
+        <capability type='pci'>
+            <domain>0</domain>
+            <bus>4</bus>
+            <slot>0</slot>
+            <function>3</function>
+            <product id='0x1521'>I350 Gigabit Network Connection</product>
+            <vendor id='0x8086'>Intel Corporation</vendor>
+            <capability type='virt_functions'>
+              <address domain='0x0000' bus='0x04' slot='0x10' function='0x3'/>
+              <address domain='0x0000' bus='0x04' slot='0x10' function='0x7'/>
+              <address domain='0x0000' bus='0x04' slot='0x11' function='0x3'/>
+              <address domain='0x0000' bus='0x04' slot='0x11' function='0x7'/>
+            </capability>
+        </capability>
+      </device>"""
+            pci_dev = fakelibvirt.NodeDevice(None, xml=xml_str)
+            node_devs = [pci_dev]
+            mock_list_all_devices.return_value = node_devs
+            ret = self.host.list_all_devices(flags=42)
+            self.assertEqual(node_devs, ret)
+        mock_list_all_devices.assert_called_once_with(42)
+
+    def test_list_all_devices_raises(self):
+        with mock.patch.object(
+                self.host.get_connection(),
+                "listAllDevices") as mock_list_all_devices:
+            xml_str = """
+        <device>
+        <name>pci_0000_04_00_3</name>
+        <parent>pci_0000_00_01_1</parent>
+        <driver>
+            <name>igb</name>
+        </driver>
+        <capability type='pci'>
+            <domain>0</domain>
+            <bus>4</bus>
+            <slot>0</slot>
+            <function>3</function>
+            <product id='0x1521'>I350 Gigabit Network Connection</product>
+            <vendor id='0x8086'>Intel Corporation</vendor>
+            <capability type='virt_functions'>
+              <address domain='0x0000' bus='0x04' slot='0x10' function='0x3'/>
+              <address domain='0x0000' bus='0x04' slot='0x10' function='0x7'/>
+              <address domain='0x0000' bus='0x04' slot='0x11' function='0x3'/>
+              <address domain='0x0000' bus='0x04' slot='0x11' function='0x7'/>
+            </capability>
+        </capability>
+      </device>"""
+            pci_dev = fakelibvirt.NodeDevice(None, xml=xml_str)
+            node_devs = [pci_dev]
+            mock_list_all_devices.return_value = node_devs
+            mock_list_all_devices.side_effect = fakelibvirt.libvirtError(
+                "message")
+            ret = self.host.list_all_devices(flags=42)
+            self.assertEqual([], ret)
+        mock_list_all_devices.assert_called_once_with(42)
+
+    def test_get_vdpa_nodedev_by_address(self):
+        with test.nested(
+            mock.patch.object(
+                self.host.get_connection(), "listAllDevices"),
+            mock.patch.object(self.host, "_get_pcinet_info"),
+        ) as (mock_list_all_devices, mock_get_pci_info):
+            vdpa_str = """
+                <device>
+                  <name>vdpa_vdpa0</name>
+                  <path>/sys/devices/pci0000:00/0000:00:02.2/0000:06:00.2/vdpa0</path>
+                  <parent>pci_0000_06_00_2</parent>
+                  <driver>
+                    <name>vhost_vdpa</name>
+                  </driver>
+                  <capability type='vdpa'>
+                    <chardev>/dev/vhost-vdpa-0</chardev>
+                  </capability>
+                </device>"""  # noqa: E501
+            vdpa_dev = fakelibvirt.NodeDevice(None, xml=vdpa_str)
+            vf_str = """
+                <device>
+                  <name>pci_0000_06_00_2</name>
+                  <path>/sys/devices/pci0000:00/0000:00:02.2/0000:06:00.2</path>
+                  <parent>pci_0000_00_02_2</parent>
+                  <driver>
+                    <name>mlx5_core</name>
+                  </driver>
+                  <capability type='pci'>
+                  <class>0x020000</class>
+                  <domain>0</domain>
+                  <bus>6</bus>
+                  <slot>0</slot>
+                  <function>2</function>
+                  <product id='0x101e'>ConnectX Family mlx5Gen Virtual Function</product>
+                  <vendor id='0x15b3'>Mellanox Technologies</vendor>
+                  <capability type='phys_function'>
+                     <address domain='0x0000' bus='0x06' slot='0x00' function='0x0'/>
+                  </capability>
+                  <iommuGroup number='99'>
+                    <address domain='0x0000' bus='0x06' slot='0x00' function='0x2'/>
+                  </iommuGroup>
+                  <numa node='0'/>
+                  <pci-express>
+                    <link validity='cap' port='0' speed='16' width='8'/>
+                    <link validity='sta' width='0'/>
+                  </pci-express>
+                  </capability>
+                </device>"""  # noqa: E501
+            vf_dev = fakelibvirt.NodeDevice(None, xml=vf_str)
+            node_devs = [vdpa_dev, vf_dev]
+            mock_list_all_devices.return_value = node_devs
+            mock_get_pci_info.return_value = [
+                {
+                    "dev_id": "pci_0000_06_00_2",
+                    "address": "0000:06:00.2",
+                    "product_id": '101e',
+                    "vendor_id": '15b3',
+                    "numa_node": 0,
+                    "label": 'label_101e_15b3',
+                    "dev_type": 'type-VF',
+                    "parent_addr": "0000:00:02.2",
+                    "parent_ifname": "enp6s0f0",
+                    "capabilities": {
+                        "network": [
+                            "rx", "tx", "sg", "tso", "gso", "gro", "rxvlan",
+                            "txvlan",
+                        ],
+                    },
+                },
+                {
+                    "dev_id": "vdpa_vdpa0",
+                    "address": "0000:06:00.2",
+                    "product_id": '101e',
+                    "vendor_id": '15b3',
+                    "numa_node": 0,
+                    "label": 'label_101e_15b3',
+                    "dev_type": 'vdpa',
+                    'parent_addr': '0000:06:00.2',
+                    "parent_ifname": "enp6s0f0v0",
+                    "capabilities": {
+                        "network": [
+                            "rx", "tx", "sg", "tso", "gso", "gro",
+                            "rxvlan", "txvlan"],
+                    },
+                },
+            ]
+            ret = self.host.get_vdpa_nodedev_by_address("0000:06:00.2")
+            cfgdev = vconfig.LibvirtConfigNodeDevice()
+            cfgdev.parse_str(vdpa_str)
+            self.assertEqual(cfgdev.name, ret.name)
+            self.assertEqual(
+                "/dev/vhost-vdpa-0", ret.vdpa_capability.dev_path)
+
+    def test_get_vdpa_device_path(self):
+        with mock.patch.object(
+            self.host, "get_vdpa_nodedev_by_address",
+        ) as mock_vdpa:
+            xml_str = """
+            <device>
+              <name>vdpa_vdpa0</name>
+              <path>/sys/devices/pci0000:00/0000:00:02.2/0000:06:00.2/vdpa0</path>
+              <parent>pci_0000_06_00_2</parent>
+              <driver>
+                <name>vhost_vdpa</name>
+              </driver>
+              <capability type='vdpa'>
+                <chardev>/dev/vhost-vdpa-0</chardev>
+              </capability>
+            </device>"""
+            cfgdev = vconfig.LibvirtConfigNodeDevice()
+            cfgdev.parse_str(xml_str)
+            mock_vdpa.return_value = cfgdev
+            ret = self.host.get_vdpa_device_path("0000:06:00.2")
+            self.assertEqual("/dev/vhost-vdpa-0", ret)
 
     @mock.patch.object(fakelibvirt.virConnect, "listDevices")
     def test_list_devices(self, mock_listDevices):
@@ -1175,8 +1457,7 @@ Active:          8381604 kB
             read_data="""cg /cgroup/cpu,cpuacct cg opt1,cpu,opt3 0 0
 cg /cgroup/memory cg opt1,opt2 0 0
 """)
-        with mock.patch(
-                "six.moves.builtins.open", m, create=True):
+        with mock.patch('builtins.open', m, create=True):
             self.assertTrue(self.host.is_cpu_control_policy_capable())
 
     def test_is_cpu_control_policy_capable_ko(self):
@@ -1184,13 +1465,27 @@ cg /cgroup/memory cg opt1,opt2 0 0
             read_data="""cg /cgroup/cpu,cpuacct cg opt1,opt2,opt3 0 0
 cg /cgroup/memory cg opt1,opt2 0 0
 """)
-        with mock.patch(
-                "six.moves.builtins.open", m, create=True):
+        with mock.patch('builtins.open', m, create=True):
             self.assertFalse(self.host.is_cpu_control_policy_capable())
 
-    @mock.patch('six.moves.builtins.open', side_effect=IOError)
+    @mock.patch('builtins.open', side_effect=IOError)
     def test_is_cpu_control_policy_capable_ioerror(self, mock_open):
         self.assertFalse(self.host.is_cpu_control_policy_capable())
+
+    def test_get_canonical_machine_type(self):
+        # this test relies on configuration from the FakeLibvirtFixture
+
+        machine_type = self.host.get_canonical_machine_type('x86_64', 'pc')
+        self.assertEqual('pc-i440fx-2.11', machine_type)
+
+        machine_type = self.host.get_canonical_machine_type(
+            'x86_64', 'pc-i440fx-2.11')
+        self.assertEqual('pc-i440fx-2.11', machine_type)
+
+        self.assertRaises(
+            exception.InternalError,
+            self.host.get_canonical_machine_type,
+            'x86_64', 'pc-foo-1.2')
 
     @mock.patch('nova.virt.libvirt.host.libvirt.Connection.getCapabilities')
     def test_has_hyperthreading__true(self, mock_cap):
@@ -1242,6 +1537,269 @@ cg /cgroup/memory cg opt1,opt2 0 0
         """
         self.assertFalse(self.host.has_hyperthreading)
 
+    @mock.patch(
+        'nova.virt.libvirt.host.libvirt.Connection.getDomainCapabilities')
+    @mock.patch('nova.virt.libvirt.host.libvirt.Connection.getCapabilities')
+    def test_supports_uefi__false(self, mock_caps, mock_domcaps):
+        mock_caps.return_value = """
+        <capabilities>
+          <host>
+            <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+            <cpu>
+              <arch>x86_64</arch>
+              <vendor>Intel</vendor>
+            </cpu>
+          </host>
+          <guest>
+            <os_type>hvm</os_type>
+            <arch name='x86_64'/>
+          </guest>
+        </capabilities>
+        """
+        mock_domcaps.return_value = """
+        <domainCapabilities>
+          <machine>pc-q35-5.1</machine>
+          <arch>x86_64</arch>
+          <os supported='yes'>
+            <enum name='firmware'>
+              <value>bios</value>
+            </enum>
+            <loader supported='yes'>
+              <enum name='type'>
+                <value>rom</value>
+              </enum>
+              <enum name='readonly'>
+                <value>yes</value>
+              </enum>
+              <enum name='secure'>
+                <value>no</value>
+              </enum>
+            </loader>
+          </os>
+        </domainCapabilities>
+        """
+        self.assertFalse(self.host.supports_uefi)
+
+    @mock.patch(
+        'nova.virt.libvirt.host.libvirt.Connection.getDomainCapabilities')
+    @mock.patch('nova.virt.libvirt.host.libvirt.Connection.getCapabilities')
+    def test_supports_uefi__true(self, mock_caps, mock_domcaps):
+        mock_caps.return_value = """
+        <capabilities>
+          <host>
+            <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+            <cpu>
+              <arch>x86_64</arch>
+              <vendor>Intel</vendor>
+            </cpu>
+          </host>
+          <guest>
+            <os_type>hvm</os_type>
+            <arch name='x86_64'/>
+          </guest>
+        </capabilities>
+        """
+        mock_domcaps.return_value = """
+        <domainCapabilities>
+          <machine>pc-q35-5.1</machine>
+          <arch>x86_64</arch>
+          <os supported='yes'>
+            <enum name='firmware'>
+              <value>efi</value>
+            </enum>
+            <loader supported='yes'>
+              <value>/usr/share/edk2/ovmf/OVMF_CODE.fd</value>
+              <enum name='type'>
+                <value>rom</value>
+                <value>pflash</value>
+              </enum>
+              <enum name='readonly'>
+                <value>yes</value>
+                <value>no</value>
+              </enum>
+              <enum name='secure'>
+                <value>no</value>
+              </enum>
+            </loader>
+          </os>
+        </domainCapabilities>
+        """
+        self.assertTrue(self.host.supports_uefi)
+
+    @mock.patch(
+        'nova.virt.libvirt.host.libvirt.Connection.getDomainCapabilities')
+    @mock.patch('nova.virt.libvirt.host.libvirt.Connection.getCapabilities')
+    def test_supports_secure_boot__false(self, mock_caps, mock_domcaps):
+        mock_caps.return_value = """
+        <capabilities>
+          <host>
+            <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+            <cpu>
+              <arch>x86_64</arch>
+              <vendor>Intel</vendor>
+            </cpu>
+          </host>
+          <guest>
+            <os_type>hvm</os_type>
+            <arch name='x86_64'/>
+          </guest>
+        </capabilities>
+        """
+        mock_domcaps.return_value = """
+        <domainCapabilities>
+          <machine>pc-q35-5.1</machine>
+          <arch>x86_64</arch>
+          <os supported='yes'>
+            <enum name='firmware'>
+              <value>efi</value>
+            </enum>
+            <loader supported='yes'>
+              <value>/usr/share/edk2/ovmf/OVMF_CODE.fd</value>
+              <enum name='type'>
+                <value>rom</value>
+                <value>pflash</value>
+              </enum>
+              <enum name='readonly'>
+                <value>yes</value>
+                <value>no</value>
+              </enum>
+              <enum name='secure'>
+                <value>no</value>
+              </enum>
+            </loader>
+          </os>
+        </domainCapabilities>
+        """
+        self.assertFalse(self.host.supports_secure_boot)
+
+    @mock.patch(
+        'nova.virt.libvirt.host.libvirt.Connection.getDomainCapabilities')
+    @mock.patch('nova.virt.libvirt.host.libvirt.Connection.getCapabilities')
+    def test_supports_secure_boot__true(self, mock_caps, mock_domcaps):
+        mock_caps.return_value = """
+        <capabilities>
+          <host>
+            <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+            <cpu>
+              <arch>x86_64</arch>
+              <vendor>Intel</vendor>
+            </cpu>
+          </host>
+          <guest>
+            <os_type>hvm</os_type>
+            <arch name='x86_64'/>
+          </guest>
+        </capabilities>
+        """
+        mock_domcaps.return_value = """
+        <domainCapabilities>
+          <machine>pc-q35-5.1</machine>
+          <arch>x86_64</arch>
+          <os supported='yes'>
+            <enum name='firmware'>
+              <value>efi</value>
+            </enum>
+            <loader supported='yes'>
+              <value>/usr/share/edk2/ovmf/OVMF_CODE.fd</value>
+              <value>/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd</value>
+              <enum name='type'>
+                <value>rom</value>
+                <value>pflash</value>
+              </enum>
+              <enum name='readonly'>
+                <value>yes</value>
+                <value>no</value>
+              </enum>
+              <enum name='secure'>
+                <value>yes</value>
+                <value>no</value>
+              </enum>
+            </loader>
+          </os>
+        </domainCapabilities>
+        """
+        self.assertTrue(self.host.supports_secure_boot)
+
+    @mock.patch.object(host.Host, 'loaders', new_callable=mock.PropertyMock)
+    @mock.patch.object(host.Host, 'get_canonical_machine_type')
+    def test_get_loader(self, mock_get_mtype, mock_loaders):
+        loaders = [
+            {
+                'description': 'Sample descriptor',
+                'interface-types': ['uefi'],
+                'mapping': {
+                    'device': 'flash',
+                    'executable': {
+                        'filename': '/usr/share/edk2/ovmf/OVMF_CODE.fd',
+                        'format': 'raw',
+                    },
+                    'nvram-template': {
+                        'filename': '/usr/share/edk2/ovmf/OVMF_VARS.fd',
+                        'format': 'raw',
+                    },
+                },
+                'targets': [
+                    {
+                        'architecture': 'x86_64',
+                        'machines': ['pc-q35-*'],  # exclude pc-i440fx-*
+                    },
+                ],
+                'features': ['acpi-s3', 'amd-sev', 'verbose-dynamic'],
+                'tags': [],
+            },
+        ]
+
+        def fake_get_mtype(arch, machine):
+            return {
+                'x86_64': {
+                    'pc': 'pc-i440fx-5.1',
+                    'q35': 'pc-q35-5.1',
+                },
+                'aarch64': {
+                    'virt': 'virt-5.1',
+                },
+            }[arch][machine]
+
+        mock_get_mtype.side_effect = fake_get_mtype
+        mock_loaders.return_value = loaders
+
+        # this should pass because we're not reporting the secure-boot feature
+        # which is what we don't want
+        loader = self.host.get_loader('x86_64', 'q35', has_secure_boot=False)
+        self.assertIsNotNone(loader)
+
+        # while it should fail here since we want it now
+        self.assertRaises(
+            exception.UEFINotSupported,
+            self.host.get_loader,
+            'x86_64', 'q35', has_secure_boot=True)
+
+        # it should also fail for an unsupported architecture
+        self.assertRaises(
+            exception.UEFINotSupported,
+            self.host.get_loader,
+            'aarch64', 'virt', has_secure_boot=False)
+
+        # or an unsupported machine type
+        self.assertRaises(
+            exception.UEFINotSupported,
+            self.host.get_loader,
+            'x86_64', 'pc', has_secure_boot=False)
+
+        # add the secure-boot feature flag
+        loaders[0]['features'].append('secure-boot')
+
+        # this should pass because we're reporting the secure-boot feature
+        # which is what we want
+        loader = self.host.get_loader('x86_64', 'q35', has_secure_boot=True)
+        self.assertIsNotNone(loader)
+
+        # while it should fail here since we don't want it now
+        self.assertRaises(
+            exception.UEFINotSupported,
+            self.host.get_loader,
+            'x86_64', 'q35', has_secure_boot=False)
+
 
 vc = fakelibvirt.virConnect
 
@@ -1252,7 +1810,7 @@ class TestLibvirtSEV(test.NoDBTestCase):
     def setUp(self):
         super(TestLibvirtSEV, self).setUp()
 
-        self.useFixture(fakelibvirt.FakeLibvirtFixture())
+        self.useFixture(nova_fixtures.LibvirtFixture())
         self.host = host.Host("qemu:///system")
 
 
@@ -1264,37 +1822,51 @@ class TestLibvirtSEVUnsupported(TestLibvirtSEV):
             '/sys/module/kvm_amd/parameters/sev')
 
     @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch.object(builtins, 'open', mock.mock_open(read_data="0\n"))
+    @mock.patch('builtins.open', mock.mock_open(read_data="0\n"))
     def test_kernel_parameter_zero(self, fake_exists):
         self.assertFalse(self.host._kernel_supports_amd_sev())
         fake_exists.assert_called_once_with(
             '/sys/module/kvm_amd/parameters/sev')
 
     @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch.object(builtins, 'open', mock.mock_open(read_data="1\n"))
+    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     def test_kernel_parameter_one(self, fake_exists):
         self.assertTrue(self.host._kernel_supports_amd_sev())
         fake_exists.assert_called_once_with(
             '/sys/module/kvm_amd/parameters/sev')
 
     @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch.object(builtins, 'open', mock.mock_open(read_data="1\n"))
+    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     def test_unsupported_without_feature(self, fake_exists):
         self.assertFalse(self.host.supports_amd_sev)
 
     @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch.object(builtins, 'open', mock.mock_open(read_data="1\n"))
+    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     @mock.patch.object(vc, '_domain_capability_features',
         new=vc._domain_capability_features_with_SEV_unsupported)
     def test_unsupported_with_feature(self, fake_exists):
         self.assertFalse(self.host.supports_amd_sev)
+
+    def test_non_x86_architecture(self):
+        fake_caps_xml = '''
+<capabilities>
+  <host>
+    <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+    <cpu>
+      <arch>aarch64</arch>
+    </cpu>
+  </host>
+</capabilities>'''
+        with mock.patch.object(fakelibvirt.virConnect, 'getCapabilities',
+                               return_value=fake_caps_xml):
+            self.assertFalse(self.host.supports_amd_sev)
 
 
 class TestLibvirtSEVSupported(TestLibvirtSEV):
     """Libvirt driver tests for when AMD SEV support is present."""
 
     @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch.object(builtins, 'open', mock.mock_open(read_data="1\n"))
+    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     @mock.patch.object(vc, '_domain_capability_features',
                        new=vc._domain_capability_features_with_SEV)
     def test_supported_with_feature(self, fake_exists):
@@ -1305,7 +1877,7 @@ class LibvirtTpoolProxyTestCase(test.NoDBTestCase):
     def setUp(self):
         super(LibvirtTpoolProxyTestCase, self).setUp()
 
-        self.useFixture(fakelibvirt.FakeLibvirtFixture())
+        self.useFixture(nova_fixtures.LibvirtFixture())
         self.host = host.Host("qemu:///system")
 
         def _stub_xml(uuid):
@@ -1329,10 +1901,10 @@ class LibvirtTpoolProxyTestCase(test.NoDBTestCase):
         self.assertIn(fakelibvirt.virConnect, proxy_classes)
         self.assertIn(fakelibvirt.virNodeDevice, proxy_classes)
         self.assertIn(fakelibvirt.virSecret, proxy_classes)
-        self.assertIn(fakelibvirt.virNWFilter, proxy_classes)
 
-        # Assert that we filtered out libvirtError
+        # Assert that we filtered out libvirtError and any private classes
         self.assertNotIn(fakelibvirt.libvirtError, proxy_classes)
+        self.assertNotIn(fakelibvirt._EventAddHandleFunc, proxy_classes)
 
     def test_tpool_get_connection(self):
         # Test that Host.get_connection() returns a tpool.Proxy
@@ -1352,3 +1924,51 @@ class LibvirtTpoolProxyTestCase(test.NoDBTestCase):
         for domain in domains:
             self.assertIsInstance(domain, tpool.Proxy)
             self.assertIn(domain.UUIDString(), (uuids.vm1, uuids.vm2))
+
+
+class LoadersTestCase(test.NoDBTestCase):
+
+    def test_loaders(self):
+        loader = {
+            'description': 'Sample descriptor',
+            'interface-types': ['uefi'],
+            'mapping': {
+                'device': 'flash',
+                'executable': {
+                    'filename': '/usr/share/edk2/ovmf/OVMF_CODE.fd',
+                    'format': 'raw',
+                },
+                'nvram-template': {
+                    'filename': '/usr/share/edk2/ovmf/OVMF_VARS.fd',
+                    'format': 'raw',
+                },
+            },
+            'targets': [
+                {
+                    'architecture': 'x86_64',
+                    'machines': ['pc-i440fx-*', 'pc-q35-*'],
+                },
+            ],
+            'features': ['acpi-s3', 'amd-sev', 'verbose-dynamic'],
+            'tags': [],
+        }
+
+        m = mock.mock_open(read_data=jsonutils.dumps(loader).encode('utf-8'))
+        with test.nested(
+            mock.patch.object(
+                os.path, 'exists',
+                side_effect=lambda path: path == '/usr/share/qemu/firmware'),
+            mock.patch('glob.glob', return_value=['10_fake.json']),
+            mock.patch('builtins.open', m, create=True),
+        ) as (mock_exists, mock_glob, mock_open):
+            loaders = host._get_loaders()
+
+            self.assertEqual(loaders, [loader])
+
+            mock_exists.assert_has_calls([
+                mock.call('/usr/share/qemu/firmware'),
+                mock.call('/etc/qemu/firmware'),
+            ])
+            mock_glob.assert_called_once_with(
+                '/usr/share/qemu/firmware/*.json')
+            mock_open.assert_called_once_with('10_fake.json', 'rb')

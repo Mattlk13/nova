@@ -24,9 +24,10 @@ import sys
 from os_win import exceptions as os_win_exc
 from os_win import utilsfactory
 from oslo_log import log as logging
-import six
 
+from nova import context as nova_context
 from nova import exception
+from nova import objects
 from nova.virt import driver
 from nova.virt.hyperv import eventhandler
 from nova.virt.hyperv import hostops
@@ -38,6 +39,7 @@ from nova.virt.hyperv import serialconsoleops
 from nova.virt.hyperv import snapshotops
 from nova.virt.hyperv import vmops
 from nova.virt.hyperv import volumeops
+
 
 LOG = logging.getLogger(__name__)
 
@@ -59,12 +61,10 @@ def convert_exceptions(function, exception_map):
                         break
 
             exc_info = sys.exc_info()
-            # NOTE(claudiub): Python 3 raises the exception object given as
-            # the second argument in six.reraise.
-            # The original message will be maintained by passing the original
-            # exception.
-            exc = raised_exception(six.text_type(exc_info[1]))
-            six.reraise(raised_exception, exc, exc_info[2])
+            # NOTE(claudiub): The original message will be maintained
+            # by passing the original exception.
+            exc = raised_exception(str(exc_info[1]))
+            raise exc.with_traceback(exc_info[2])
     return wrapper
 
 
@@ -101,6 +101,8 @@ class HyperVDriver(driver.ComputeDriver):
         "supports_multiattach": False,
         "supports_trusted_certs": False,
         "supports_pcpus": False,
+        "supports_accelerators": False,
+        "supports_secure_boot": True,
 
         # Supported image types
         "supports_image_type_vhd": True,
@@ -160,21 +162,23 @@ class HyperVDriver(driver.ComputeDriver):
 
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
-              block_device_info=None, power_on=True):
+              block_device_info=None, power_on=True, accel_info=None):
         self._vmops.spawn(context, instance, image_meta, injected_files,
                           admin_password, network_info, block_device_info)
 
     def reboot(self, context, instance, network_info, reboot_type,
-               block_device_info=None, bad_volumes_callback=None):
+               block_device_info=None, bad_volumes_callback=None,
+               accel_info=None):
         self._vmops.reboot(instance, network_info, reboot_type)
 
     def destroy(self, context, instance, network_info, block_device_info=None,
-                destroy_disks=True):
+                destroy_disks=True, destroy_secrets=True):
         self._vmops.destroy(instance, network_info, block_device_info,
                             destroy_disks)
 
     def cleanup(self, context, instance, network_info, block_device_info=None,
-                destroy_disks=True, migrate_data=None, destroy_vifs=True):
+                destroy_disks=True, migrate_data=None, destroy_vifs=True,
+                destroy_secrets=True):
         """Cleanup after instance being destroyed by Hypervisor."""
         self.unplug_vifs(instance, network_info)
 
@@ -223,7 +227,7 @@ class HyperVDriver(driver.ComputeDriver):
         self._vmops.power_off(instance, timeout, retry_interval)
 
     def power_on(self, context, instance, network_info,
-                 block_device_info=None):
+                 block_device_info=None, accel_info=None):
         self._vmops.power_on(instance, block_device_info, network_info)
 
     def resume_state_on_host_boot(self, context, instance, network_info,
@@ -324,7 +328,7 @@ class HyperVDriver(driver.ComputeDriver):
 
     def finish_migration(self, context, migration, instance, disk_info,
                          network_info, image_meta, resize_instance,
-                         block_device_info=None, power_on=True):
+                         allocations, block_device_info=None, power_on=True):
         self._migrationops.finish_migration(context, migration, instance,
                                             disk_info, network_info,
                                             image_meta, resize_instance,
@@ -355,11 +359,15 @@ class HyperVDriver(driver.ComputeDriver):
         return self._vmops.detach_interface(instance, vif)
 
     def rescue(self, context, instance, network_info, image_meta,
-               rescue_password):
+               rescue_password, block_device_info):
         self._vmops.rescue_instance(context, instance, network_info,
                                     image_meta, rescue_password)
 
-    def unrescue(self, instance, network_info):
+    def unrescue(
+        self,
+        context: nova_context.RequestContext,
+        instance: 'objects.Instance',
+    ):
         self._vmops.unrescue_instance(instance)
 
     def update_provider_tree(self, provider_tree, nodename, allocations=None):

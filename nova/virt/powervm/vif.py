@@ -24,7 +24,6 @@ from pypowervm import exceptions as pvm_ex
 from pypowervm.tasks import cna as pvm_cna
 from pypowervm.tasks import partition as pvm_par
 from pypowervm.wrappers import event as pvm_evt
-import six
 
 from nova import exception
 from nova.network import model as network_model
@@ -148,8 +147,7 @@ def unplug(adapter, instance, vif, cna_w_list=None):
         _push_vif_event(adapter, 'unplug', vnet_w, instance, vif['type'])
 
 
-@six.add_metaclass(abc.ABCMeta)
-class PvmVifDriver(object):
+class PvmVifDriver(metaclass=abc.ABCMeta):
     """Represents an abstract class for a PowerVM Vif Driver.
 
     A VIF Driver understands a given virtual interface type (network).  It
@@ -211,7 +209,7 @@ class PvmVifDriver(object):
             LOG.exception('Unable to unplug VIF with mac %(mac)s.',
                           {'mac': vif['address']}, instance=self.instance)
             raise exception.VirtualInterfaceUnplugException(
-                reason=six.text_type(e))
+                reason=str(e))
         return cna_w
 
     @staticmethod

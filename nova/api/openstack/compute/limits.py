@@ -51,31 +51,36 @@ class LimitsController(wsgi.Controller):
         return self._index(req)
 
     @wsgi.Controller.api_version(MIN_WITHOUT_PROXY_API_SUPPORT_VERSION,  # noqa
-                                 MAX_IMAGE_META_PROXY_API_VERSION)  # noqa
+                                 MAX_IMAGE_META_PROXY_API_VERSION)
     @wsgi.expected_errors(())
     @validation.query_schema(limits.limits_query_schema)
-    def index(self, req):
+    def index(self, req):  # noqa
         return self._index(req, FILTERED_LIMITS_2_36)
 
     @wsgi.Controller.api_version(  # noqa
-        MIN_WITHOUT_IMAGE_META_PROXY_API_VERSION, '2.56')  # noqa
+        MIN_WITHOUT_IMAGE_META_PROXY_API_VERSION, '2.56')
     @wsgi.expected_errors(())
     @validation.query_schema(limits.limits_query_schema)
-    def index(self, req):
+    def index(self, req):  # noqa
         return self._index(req, FILTERED_LIMITS_2_36, max_image_meta=False)
 
     @wsgi.Controller.api_version('2.57')  # noqa
     @wsgi.expected_errors(())
     @validation.query_schema(limits.limits_query_schema_275, '2.75')
     @validation.query_schema(limits.limits_query_schema, '2.57', '2.74')
-    def index(self, req):
+    def index(self, req):  # noqa
         return self._index(req, FILTERED_LIMITS_2_57, max_image_meta=False)
 
     def _index(self, req, filtered_limits=None, max_image_meta=True):
         """Return all global limit information."""
         context = req.environ['nova.context']
-        context.can(limits_policies.BASE_POLICY_NAME)
-        project_id = req.params.get('tenant_id', context.project_id)
+        context.can(limits_policies.BASE_POLICY_NAME, target={})
+        project_id = context.project_id
+        if 'tenant_id' in req.GET:
+            project_id = req.GET.get('tenant_id')
+            context.can(limits_policies.OTHER_PROJECT_LIMIT_POLICY_NAME,
+                        target={'project_id': project_id})
+
         quotas = QUOTAS.get_project_quotas(context, project_id,
                                            usages=True)
         builder = limits_views.ViewBuilder()

@@ -219,7 +219,8 @@ class HostManagerTestCase(test.NoDBTestCase):
         inst2 = objects.Instance(host='host1', uuid=uuids.instance_2)
         inst3 = objects.Instance(host='host2', uuid=uuids.instance_3)
         cell = objects.CellMapping(database_connection='',
-                                   target_url='')
+                                   target_url='',
+                                   uuid=uuids.cell_uuid)
         mock_get_by_filters.return_value = objects.InstanceList(
                 objects=[inst1, inst2, inst3])
         hm = self.host_manager
@@ -398,7 +399,7 @@ class HostManagerTestCase(test.NoDBTestCase):
 
     def test_get_filtered_hosts_with_ignore_case_insensitive(self):
         fake_properties = objects.RequestSpec(
-            instance_uuids=uuids.fakehost,
+            instance_uuid=uuids.fakehost,
             ignore_hosts=['FAKE_HOST1', 'FaKe_HoSt3', 'Fake_Multihost'],
             force_hosts=[],
             force_nodes=[])
@@ -430,7 +431,7 @@ class HostManagerTestCase(test.NoDBTestCase):
 
     def test_get_filtered_hosts_with_force_case_insensitive(self):
         fake_properties = objects.RequestSpec(
-            instance_uuids=uuids.fakehost,
+            instance_uuid=uuids.fakehost,
             ignore_hosts=[],
             force_hosts=['FAKE_HOST1', 'FaKe_HoSt3', 'fake_host4',
                          'faKe_host5'],
@@ -589,7 +590,7 @@ class HostManagerTestCase(test.NoDBTestCase):
         mock_get_by_host.return_value = []
         mock_get_all.return_value = fakes.COMPUTE_NODES
         mock_get_by_binary.return_value = fakes.SERVICES
-        context = 'fake_context'
+        context = nova_context.get_admin_context()
         compute_nodes, services = self.host_manager._get_computes_for_cells(
             context, self.host_manager.enabled_cells)
 
@@ -786,7 +787,7 @@ class HostManagerTestCase(test.NoDBTestCase):
 
     @mock.patch('nova.objects.InstanceList.get_uuids_by_host')
     def test_host_state_not_updated(self, mock_get_by_host):
-        context = 'fake_context'
+        context = nova_context.get_admin_context()
         hm = self.host_manager
         inst1 = objects.Instance(uuid=uuids.instance)
         cn1 = objects.ComputeNode(host='host1')
@@ -806,10 +807,11 @@ class HostManagerTestCase(test.NoDBTestCase):
 
     @mock.patch('nova.objects.InstanceList.get_uuids_by_host')
     def test_recreate_instance_info(self, mock_get_by_host):
+        context = nova_context.get_admin_context()
         host_name = 'fake_host'
-        inst1 = fake_instance.fake_instance_obj('fake_context',
+        inst1 = fake_instance.fake_instance_obj(context,
                                                 uuid=uuids.instance_1)
-        inst2 = fake_instance.fake_instance_obj('fake_context',
+        inst2 = fake_instance.fake_instance_obj(context,
                                                 uuid=uuids.instance_2)
         orig_inst_dict = {inst1.uuid: inst1, inst2.uuid: inst2}
         mock_get_by_host.return_value = [uuids.instance_1, uuids.instance_2]
@@ -818,7 +820,7 @@ class HostManagerTestCase(test.NoDBTestCase):
                     'instances': orig_inst_dict,
                     'updated': True,
                 }}
-        self.host_manager._recreate_instance_info('fake_context', host_name)
+        self.host_manager._recreate_instance_info(context, host_name)
         new_info = self.host_manager._instance_info[host_name]
         self.assertEqual(len(new_info['instances']),
                          len(mock_get_by_host.return_value))
@@ -1231,7 +1233,7 @@ class HostManagerChangedNodesTestCase(test.NoDBTestCase):
         mock_get_by_host.return_value = []
         mock_get_all.return_value = fakes.COMPUTE_NODES
         mock_get_by_binary.return_value = fakes.SERVICES
-        context = 'fake_context'
+        context = nova_context.get_admin_context()
 
         compute_nodes, services = self.host_manager._get_computes_for_cells(
             context, self.host_manager.enabled_cells)
@@ -1256,7 +1258,7 @@ class HostManagerChangedNodesTestCase(test.NoDBTestCase):
         mock_get_by_host.return_value = []
         mock_get_all.side_effect = [fakes.COMPUTE_NODES, running_nodes]
         mock_get_by_binary.side_effect = [fakes.SERVICES, fakes.SERVICES]
-        context = 'fake_context'
+        context = nova_context.get_admin_context()
 
         # first call: all nodes
         compute_nodes, services = self.host_manager._get_computes_for_cells(
@@ -1286,7 +1288,7 @@ class HostManagerChangedNodesTestCase(test.NoDBTestCase):
         mock_get_by_host.return_value = []
         mock_get_all.side_effect = [fakes.COMPUTE_NODES, []]
         mock_get_by_binary.side_effect = [fakes.SERVICES, fakes.SERVICES]
-        context = 'fake_context'
+        context = nova_context.get_admin_context()
 
         # first call: all nodes
         compute_nodes, services = self.host_manager._get_computes_for_cells(
@@ -1566,10 +1568,9 @@ class HostStateTestCase(test.NoDBTestCase):
         host = host_manager.HostState("fakehost", "fakenode", uuids.cell)
         self.assertIsNone(host.updated)
         host.pci_stats = pci_stats.PciDeviceStats(
-                                      [objects.PciDevicePool(vendor_id='8086',
-                                                             product_id='15ed',
-                                                             numa_node=1,
-                                                             count=1)])
+            objects.NUMATopology(),
+            [objects.PciDevicePool(vendor_id='8086', product_id='15ed',
+                                   numa_node=1, count=1)])
         host.numa_topology = fakes.NUMA_TOPOLOGY
         host.consume_from_request(req_spec)
         self.assertIsInstance(req_spec.numa_topology,
@@ -1600,7 +1601,7 @@ class HostStateTestCase(test.NoDBTestCase):
         self.assertIsNone(host.updated)
         fake_updated = mock.sentinel.fake_updated
         host.updated = fake_updated
-        host.pci_stats = pci_stats.PciDeviceStats()
+        host.pci_stats = pci_stats.PciDeviceStats(objects.NUMATopology())
         with mock.patch.object(host.pci_stats, 'apply_requests',
                                side_effect=exception.PciDeviceRequestFailed):
             host.consume_from_request(req_spec)

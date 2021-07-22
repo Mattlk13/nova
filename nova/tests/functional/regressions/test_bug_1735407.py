@@ -10,14 +10,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nova.compute import manager
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional import fixtures as func_fixtures
 from nova.tests.functional import integrated_helpers
 from nova.tests.unit import fake_network
-from nova.tests.unit import fake_notifier
-import nova.tests.unit.image.fake
-from nova.tests.unit import policy_fixture
 
 
 class TestParallelEvacuationWithServerGroup(
@@ -29,7 +27,7 @@ class TestParallelEvacuationWithServerGroup(
     def setUp(self):
         super(TestParallelEvacuationWithServerGroup, self).setUp()
 
-        self.useFixture(policy_fixture.RealPolicyFixture())
+        self.useFixture(nova_fixtures.RealPolicyFixture())
 
         # The NeutronFixture is needed to stub out validate_networks in API.
         self.useFixture(nova_fixtures.NeutronFixture(self))
@@ -48,12 +46,11 @@ class TestParallelEvacuationWithServerGroup(
         # 2.14 is needed for evacuate without onSharedStorage flag
         self.api.microversion = '2.14'
 
-        fake_notifier.stub_notifier(self)
-        self.addCleanup(fake_notifier.reset)
+        self.notifier = self.useFixture(
+            nova_fixtures.NotificationFixture(self))
 
         # the image fake backend needed for image discovery
-        nova.tests.unit.image.fake.stub_out_image_service(self)
-        self.addCleanup(nova.tests.unit.image.fake.FakeImageService_reset)
+        self.useFixture(nova_fixtures.GlanceFixture(self))
 
         self.start_service('conductor')
         self.start_service('scheduler')
@@ -66,7 +63,7 @@ class TestParallelEvacuationWithServerGroup(
         self.image_id = self.api.get_images()[0]['id']
         self.flavor_id = self.api.get_flavors()[0]['id']
 
-        manager_class = nova.compute.manager.ComputeManager
+        manager_class = manager.ComputeManager
         original_rebuild = manager_class._do_rebuild_instance
 
         def fake_rebuild(self_, context, instance, *args, **kwargs):
@@ -79,7 +76,7 @@ class TestParallelEvacuationWithServerGroup(
             # validation
             if instance.host == 'host1':
                 # wait for the other instance rebuild to start
-                fake_notifier.wait_for_versioned_notifications(
+                self.notifier.wait_for_versioned_notifications(
                     'instance.rebuild.start', n_events=1)
 
             original_rebuild(self_, context, instance, *args, **kwargs)
@@ -129,7 +126,7 @@ class TestParallelEvacuationWithServerGroup(
         # NOTE(mdbooth): We only get 1 rebuild.start notification here because
         # we validate server group policy (and therefore fail) before emitting
         # rebuild.start.
-        fake_notifier.wait_for_versioned_notifications(
+        self.notifier.wait_for_versioned_notifications(
             'instance.rebuild.start', n_events=1)
         server1 = self._wait_for_server_parameter(
             server1, {'OS-EXT-STS:task_state': None})

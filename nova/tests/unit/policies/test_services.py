@@ -16,9 +16,9 @@ import mock
 from nova.api.openstack.compute import services as services_v21
 from nova import exception
 from nova.policies import base as base_policy
+from nova.tests import fixtures
 from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit.policies import base
-from nova.tests.unit import policy_fixture
 
 
 class ServicesPolicyTest(base.BasePolicyTest):
@@ -43,6 +43,7 @@ class ServicesPolicyTest(base.BasePolicyTest):
             self.system_member_context, self.system_reader_context,
             self.system_foo_context, self.project_member_context,
             self.other_project_member_context,
+            self.other_project_reader_context,
             self.project_foo_context, self.project_reader_context
         ]
 
@@ -62,7 +63,9 @@ class ServicesPolicyTest(base.BasePolicyTest):
         self.reader_unauthorized_contexts = [
             self.system_foo_context, self.other_project_member_context,
             self.project_foo_context, self.project_member_context,
-            self.project_reader_context]
+            self.project_reader_context,
+            self.other_project_reader_context,
+        ]
 
     def test_delete_service_policy(self):
         rule_name = "os_compute_api:os-services:delete"
@@ -128,6 +131,7 @@ class ServicesScopeTypePolicyTest(ServicesPolicyTest):
             self.system_reader_context, self.system_foo_context,
             self.project_admin_context, self.project_member_context,
             self.other_project_member_context,
+            self.other_project_reader_context,
             self.project_foo_context, self.project_reader_context
         ]
 
@@ -142,6 +146,7 @@ class ServicesScopeTypePolicyTest(ServicesPolicyTest):
             self.system_foo_context, self.legacy_admin_context,
             self.project_admin_context, self.project_member_context,
             self.other_project_member_context,
+            self.other_project_reader_context,
             self.project_foo_context, self.project_reader_context
         ]
 
@@ -150,7 +155,7 @@ class ServicesDeprecatedPolicyTest(base.BasePolicyTest):
     """Test os-services APIs Deprecated policies.
 
     This class checks if deprecated policy rules are
-    overridden by user on policy.json file then they
+    overridden by user on policy.yaml file then they
     still work because oslo.policy add deprecated rules
     in logical OR condition and enforce them for policy
     checks if overridden.
@@ -160,27 +165,27 @@ class ServicesDeprecatedPolicyTest(base.BasePolicyTest):
         super(ServicesDeprecatedPolicyTest, self).setUp()
         self.controller = services_v21.ServiceController()
         self.member_req = fakes.HTTPRequest.blank('')
-        self.member_req.environ['nova.context'] = self.project_member_context
+        self.member_req.environ['nova.context'] = self.system_reader_context
         self.reader_req = fakes.HTTPRequest.blank('')
         self.reader_req.environ['nova.context'] = self.project_reader_context
         self.deprecated_policy = "os_compute_api:os-services"
         # Overridde rule with different checks than defaults so that we can
         # verify the rule overridden case.
-        override_rules = {self.deprecated_policy: base_policy.PROJECT_MEMBER}
+        override_rules = {self.deprecated_policy: base_policy.SYSTEM_READER}
         # NOTE(gmann): Only override the deprecated rule in policy file so
         # that
         # we can verify if overridden checks are considered by oslo.policy.
         # Oslo.policy will consider the overridden rules if:
         #  1. overridden deprecated rule's checks are different than defaults
         #  2. new rules are not present in policy file
-        self.policy = self.useFixture(policy_fixture.OverridePolicyFixture(
+        self.policy = self.useFixture(fixtures.OverridePolicyFixture(
                                       rules_in_file=override_rules))
 
     def test_deprecated_policy_overridden_rule_is_checked(self):
         # Test to verify if deprecatd overridden policy is working.
 
         # check for success as member role. Deprecated rule
-        # has been overridden with member checks in policy.json
+        # has been overridden with member checks in policy.yaml
         # If member role pass it means overridden rule is enforced by
         # olso.policy because new default is system admin and the old
         # default is admin.

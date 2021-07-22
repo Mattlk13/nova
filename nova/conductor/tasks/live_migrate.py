@@ -12,7 +12,7 @@
 
 from oslo_log import log as logging
 import oslo_messaging as messaging
-import six
+from oslo_utils import excutils
 
 from nova import availability_zones
 from nova.compute import power_state
@@ -25,7 +25,6 @@ from nova.i18n import _
 from nova.network import neutron
 from nova import objects
 from nova.objects import fields as obj_fields
-from nova.objects import migrate_data as migrate_data_obj
 from nova.scheduler import utils as scheduler_utils
 
 LOG = logging.getLogger(__name__)
@@ -43,6 +42,17 @@ def supports_vif_related_pci_allocations(context, host):
     """
     svc = objects.Service.get_by_host_and_binary(context, host, 'nova-compute')
     return svc.version >= 36
+
+
+def supports_vpmem_live_migration(context):
+    """Checks if the commpute host service is new enough to support
+    instance live migration with virtual persistent memory.
+
+    :param context: The user request context.
+    :returns: True if the compute hosts are new enough to support live
+              migration with vpmem
+    """
+    return objects.Service.get_minimum_version(context, 'nova-compute') >= 51
 
 
 class LiveMigrationTask(base.TaskBase):
@@ -93,12 +103,12 @@ class LiveMigrationTask(base.TaskBase):
             # live migrating with a specific destination host so the scheduler
             # is bypassed. There are still some minimal checks performed here
             # though.
-            source_node, dest_node = self._check_requested_destination()
-            # Now that we're semi-confident in the force specified host, we
-            # need to copy the source compute node allocations in Placement
-            # to the destination compute node. Normally select_destinations()
-            # in the scheduler would do this for us, but when forcing the
-            # target host we don't call the scheduler.
+            self._check_destination_is_not_source()
+            self._check_host_is_up(self.destination)
+            self._check_destination_has_enough_memory()
+            source_node, dest_node = (
+                self._check_compatible_with_source_hypervisor(
+                    self.destination))
             # TODO(mriedem): Call select_destinations() with a
             # skip_filters=True flag so the scheduler does the work of claiming
             # resources on the destination in Placement but still bypass the
@@ -111,11 +121,20 @@ class LiveMigrationTask(base.TaskBase):
             # this assumption fails then placement will return consumer
             # generation conflict and this call raise a AllocationUpdateFailed
             # exception. We let that propagate here to abort the migration.
+            # NOTE(luyao): When forcing the target host we don't call the
+            # scheduler, that means we need to get allocations from placement
+            # first, then claim resources in resource tracker on the
+            # destination host based on these allocations.
             scheduler_utils.claim_resources_on_destination(
                 self.context, self.report_client,
                 self.instance, source_node, dest_node,
                 source_allocations=self._held_allocations,
                 consumer_generation=None)
+            try:
+                self._check_requested_destination()
+            except Exception:
+                with excutils.save_and_reraise_exception():
+                    self._remove_host_allocations(dest_node.uuid)
 
             # dest_node is a ComputeNode object, so we need to get the actual
             # node name off it to set in the Migration object below.
@@ -241,6 +260,27 @@ class LiveMigrationTask(base.TaskBase):
                        "source and destination nodes do not support "
                        "the operation.")
 
+    def _check_can_migrate_specific_resources(self):
+        """Checks that an instance can migrate with specific resources.
+
+        For virtual persistent memory resource:
+            1. check if Instance contains vpmem resources
+            2. check if live migration with vpmem is supported
+        """
+        if not self.instance.resources:
+            return
+
+        has_vpmem = False
+        for resource in self.instance.resources:
+            if resource.resource_class.startswith("CUSTOM_PMEM_NAMESPACE_"):
+                has_vpmem = True
+                break
+
+        if has_vpmem and not supports_vpmem_live_migration(self.context):
+            raise exception.MigrationPreCheckError(
+                reason="Cannot live migrate with virtual persistent memory, "
+                       "the operation is not supported.")
+
     def _check_host_is_up(self, host):
         service = objects.Service.get_by_compute_host(self.context, host)
 
@@ -248,15 +288,7 @@ class LiveMigrationTask(base.TaskBase):
             raise exception.ComputeServiceUnavailable(host=host)
 
     def _check_requested_destination(self):
-        """Performs basic pre-live migration checks for the forced host.
-
-        :returns: tuple of (source ComputeNode, destination ComputeNode)
-        """
-        self._check_destination_is_not_source()
-        self._check_host_is_up(self.destination)
-        self._check_destination_has_enough_memory()
-        source_node, dest_node = self._check_compatible_with_source_hypervisor(
-            self.destination)
+        """Performs basic pre-live migration checks for the forced host."""
         # NOTE(gibi): This code path is used when the live migration is forced
         # to a target host and skipping the scheduler. Such operation is
         # rejected for servers with nested resource allocations since
@@ -273,7 +305,6 @@ class LiveMigrationTask(base.TaskBase):
             raise exception.MigrationPreCheckError(
                 reason=(_('Unable to force live migrate instance %s '
                           'across cells.') % self.instance.uuid))
-        return source_node, dest_node
 
     def _check_destination_is_not_source(self):
         if self.destination == self.source:
@@ -322,6 +353,7 @@ class LiveMigrationTask(base.TaskBase):
         return source_info, destination_info
 
     def _call_livem_checks_on_host(self, destination, provider_mapping):
+        self._check_can_migrate_specific_resources()
         self._check_can_migrate_pci(self.source, destination)
         try:
             self.migrate_data = self.compute_rpcapi.\
@@ -335,14 +367,6 @@ class LiveMigrationTask(base.TaskBase):
 
         # Check to see that neutron supports the binding-extended API.
         if self.network_api.supports_port_binding_extension(self.context):
-            if 'vifs' not in self.migrate_data:
-                # migrate data vifs were not constructed in dest compute
-                # during check_can_live_migrate_destination, construct a
-                # skeleton to be updated after port binding.
-                # TODO(adrianc): This can be removed once we move to U release
-                self.migrate_data.vifs = migrate_data_obj.VIFMigrateData.\
-                    create_skeleton_migrate_vifs(
-                    self.instance.get_network_info())
             bindings = self._bind_ports_on_destination(
                 destination, provider_mapping)
             self._update_migrate_vifs_from_bindings(self.migrate_data.vifs,
@@ -398,8 +422,13 @@ class LiveMigrationTask(base.TaskBase):
 
     def _update_migrate_vifs_from_bindings(self, migrate_vifs, bindings):
         for migrate_vif in migrate_vifs:
-            for attr_name, attr_val in bindings[migrate_vif.port_id].items():
-                setattr(migrate_vif, attr_name, attr_val)
+            binding = bindings[migrate_vif.port_id]
+            migrate_vif.profile = binding.get('profile')
+            migrate_vif.vnic_type = binding['vnic_type']
+            if 'vif_details' in binding:
+                migrate_vif.vif_details = binding['vif_details']
+            if 'vif_type' in binding:
+                migrate_vif.vif_type = binding['vif_type']
 
     def _get_source_cell_mapping(self):
         """Returns the CellMapping for the cell in which the instance lives
@@ -473,7 +502,7 @@ class LiveMigrationTask(base.TaskBase):
                 cell=cell_mapping)
 
         request_spec.ensure_project_and_user_id(self.instance)
-        request_spec.ensure_network_metadata(self.instance)
+        request_spec.ensure_network_information(self.instance)
         compute_utils.heal_reqspec_is_bfv(
             self.context, request_spec, self.instance)
 
@@ -503,8 +532,7 @@ class LiveMigrationTask(base.TaskBase):
                 # Note(ShaoHe Feng) There are types of RemoteError, such as
                 # NoSuchMethod, UnsupportedVersion, we can distinguish it by
                 # ex.exc_type.
-                raise exception.MigrationSchedulerRPCError(
-                    reason=six.text_type(ex))
+                raise exception.MigrationSchedulerRPCError(reason=str(ex))
 
             scheduler_utils.fill_provider_mapping(request_spec, selection)
 
@@ -517,8 +545,8 @@ class LiveMigrationTask(base.TaskBase):
                 # runs.
                 compute_utils.\
                     update_pci_request_spec_with_allocated_interface_name(
-                        self.context, self.report_client, self.instance,
-                        provider_mapping)
+                        self.context, self.report_client,
+                        self.instance.pci_requests.requests, provider_mapping)
             try:
                 self._check_compatible_with_source_hypervisor(host)
                 self._call_livem_checks_on_host(host, provider_mapping)

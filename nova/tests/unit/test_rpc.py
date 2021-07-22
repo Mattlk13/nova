@@ -16,7 +16,6 @@ import mock
 import oslo_messaging as messaging
 from oslo_messaging.rpc import dispatcher
 from oslo_serialization import jsonutils
-import six
 
 import nova.conf
 from nova import context
@@ -298,18 +297,6 @@ class TestRPC(test.NoDBTestCase):
         mock_prep.return_value = 'notifier'
         mock_LEGACY_NOTIFIER.prepare = mock_prep
 
-        notifier = rpc.get_notifier('service', publisher_id='foo')
-
-        mock_prep.assert_called_once_with(publisher_id='foo')
-        self.assertIsInstance(notifier, rpc.LegacyValidatingNotifier)
-        self.assertEqual('notifier', notifier.notifier)
-
-    @mock.patch.object(rpc, 'LEGACY_NOTIFIER')
-    def test_get_notifier_null_publisher(self, mock_LEGACY_NOTIFIER):
-        mock_prep = mock.Mock()
-        mock_prep.return_value = 'notifier'
-        mock_LEGACY_NOTIFIER.prepare = mock_prep
-
         notifier = rpc.get_notifier('service', host='bar')
 
         mock_prep.assert_called_once_with(publisher_id='service.bar')
@@ -354,7 +341,7 @@ class TestJsonPayloadSerializer(test.NoDBTestCase):
         self.assertIsInstance(primitive, dict)
         # Convert anything else, should get a string.
         primitive = rpc.JsonPayloadSerializer.fallback(mock.sentinel.entity)
-        self.assertIsInstance(primitive, six.text_type)
+        self.assertIsInstance(primitive, str)
 
 
 class TestRequestContextSerializer(test.NoDBTestCase):

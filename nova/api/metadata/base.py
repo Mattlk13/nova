@@ -16,6 +16,7 @@
 
 """Instance Metadata information."""
 
+import itertools
 import os
 import posixpath
 
@@ -23,7 +24,6 @@ from oslo_log import log as logging
 from oslo_serialization import base64
 from oslo_serialization import jsonutils
 from oslo_utils import timeutils
-import six
 
 from nova.api.metadata import password
 from nova.api.metadata import vendordata_dynamic
@@ -70,6 +70,7 @@ NEWTON_ONE = '2016-06-30'
 NEWTON_TWO = '2016-10-06'
 OCATA = '2017-02-22'
 ROCKY = '2018-08-27'
+VICTORIA = '2020-10-14'
 
 OPENSTACK_VERSIONS = [
     FOLSOM,
@@ -80,6 +81,7 @@ OPENSTACK_VERSIONS = [
     NEWTON_TWO,
     OCATA,
     ROCKY,
+    VICTORIA,
 ]
 
 VERSION = "version"
@@ -109,8 +111,7 @@ class InstanceMetadata(object):
     """Instance metadata."""
 
     def __init__(self, instance, address=None, content=None, extra_md=None,
-                 network_info=None, network_metadata=None,
-                 request_context=None):
+                 network_info=None, network_metadata=None):
         """Creation of this object should basically cover all time consuming
         collection.  Methods after that should not cause time delays due to
         network operations or lengthy cpu operations.
@@ -121,7 +122,12 @@ class InstanceMetadata(object):
         if not content:
             content = []
 
+        # NOTE(gibi): this is not a cell targeted context even if we are called
+        # in a situation when the instance is in a different cell than the
+        # metadata service itself.
         ctxt = context.get_admin_context()
+
+        self.mappings = _format_instance_mapping(instance)
 
         # NOTE(danms): Sanitize the instance to limit the amount of stuff
         # inside that may not pickle well (i.e. context). We also touch
@@ -130,6 +136,7 @@ class InstanceMetadata(object):
         instance.ec2_ids
         instance.keypairs
         instance.device_metadata
+        instance.numa_topology
         instance = objects.Instance.obj_from_primitive(
             instance.obj_to_primitive())
 
@@ -142,8 +149,6 @@ class InstanceMetadata(object):
 
         self.security_groups = security_group_api.get_instance_security_groups(
             ctxt, instance)
-
-        self.mappings = _format_instance_mapping(ctxt, instance)
 
         if instance.user_data is not None:
             self.userdata_raw = base64.decode_as_bytes(instance.user_data)
@@ -200,12 +205,9 @@ class InstanceMetadata(object):
         # contain the admin password for the instance, and we shouldn't
         # pass that to external services.
         self.vendordata_providers = {
-            'StaticJSON': vendordata_json.JsonFileVendorData(
-                instance=instance, address=address,
-                extra_md=extra_md, network_info=network_info),
+            'StaticJSON': vendordata_json.JsonFileVendorData(),
             'DynamicJSON': vendordata_dynamic.DynamicVendorData(
-                instance=instance, address=address,
-                network_info=network_info, context=request_context)
+                instance=instance)
         }
 
     def _route_configuration(self):
@@ -277,8 +279,8 @@ class InstanceMetadata(object):
             meta_data['public-ipv4'] = floating_ip
 
         if self._check_version('2007-08-29', version):
-            instance_type = self.instance.get_flavor()
-            meta_data['instance-type'] = instance_type['name']
+            flavor = self.instance.get_flavor()
+            meta_data['instance-type'] = flavor['name']
 
         if self._check_version('2007-12-15', version):
             meta_data['block-device-mapping'] = self.mappings
@@ -358,6 +360,9 @@ class InstanceMetadata(object):
         if self._check_os_version(NEWTON_ONE, version):
             metadata['devices'] = self._get_device_metadata(version)
 
+        if self._check_os_version(VICTORIA, version):
+            metadata['dedicated_cpus'] = self._get_instance_dedicated_cpus()
+
         self.set_mimetype(MIME_TYPE_APPLICATION_JSON)
         return jsonutils.dump_as_bytes(metadata)
 
@@ -434,6 +439,15 @@ class InstanceMetadata(object):
 
                 device_metadata_list.append(device_metadata)
         return device_metadata_list
+
+    def _get_instance_dedicated_cpus(self):
+        dedicated_cpus = []
+        if self.instance.numa_topology:
+            dedicated_cpus = sorted(list(itertools.chain.from_iterable([
+                cell.pcpuset for cell in self.instance.numa_topology.cells
+            ])))
+
+        return dedicated_cpus
 
     def _handle_content(self, path_tokens):
         if len(path_tokens) == 1:
@@ -658,7 +672,7 @@ def get_metadata_by_instance_id(instance_id, address, ctxt=None):
     attrs = ['ec2_ids', 'flavor', 'info_cache',
              'metadata', 'system_metadata',
              'security_groups', 'keypairs',
-             'device_metadata']
+             'device_metadata', 'numa_topology']
 
     if CONF.api.local_metadata_per_cell:
         instance = objects.Instance.get_by_uuid(ctxt, instance_id,
@@ -680,9 +694,8 @@ def get_metadata_by_instance_id(instance_id, address, ctxt=None):
         return InstanceMetadata(instance, address)
 
 
-def _format_instance_mapping(ctxt, instance):
-    bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
-            ctxt, instance.uuid)
+def _format_instance_mapping(instance):
+    bdms = instance.get_bdms()
     return block_device.instance_block_mapping(instance, bdms)
 
 
@@ -704,7 +717,7 @@ def ec2_md_print(data):
         return output[:-1]
     elif isinstance(data, list):
         return '\n'.join(data)
-    elif isinstance(data, (bytes, six.text_type)):
+    elif isinstance(data, (bytes, str)):
         return data
     else:
         return str(data)

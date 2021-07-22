@@ -15,13 +15,11 @@
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional import integrated_helpers
-from nova.tests.unit import cast_as_call
-from nova.tests.unit.image import fake as image_fake
-from nova.tests.unit import policy_fixture
 
 
-class ServerListLimitMarkerCell0Test(test.TestCase,
-                                     integrated_helpers.InstanceHelperMixin):
+class ServerListLimitMarkerCell0Test(
+    test.TestCase, integrated_helpers.InstanceHelperMixin,
+):
     """Regression test for bug 1689692 introduced in Ocata.
 
     The user specifies a limit which is greater than the number of instances
@@ -34,7 +32,7 @@ class ServerListLimitMarkerCell0Test(test.TestCase,
 
     def setUp(self):
         super(ServerListLimitMarkerCell0Test, self).setUp()
-        self.useFixture(policy_fixture.RealPolicyFixture())
+        self.useFixture(nova_fixtures.RealPolicyFixture())
         # The NeutronFixture is needed to stub out validate_networks in API.
         self.useFixture(nova_fixtures.NeutronFixture(self))
         api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
@@ -42,8 +40,7 @@ class ServerListLimitMarkerCell0Test(test.TestCase,
         self.api = api_fixture.api
 
         # the image fake backend needed for image discovery
-        image_fake.stub_out_image_service(self)
-        self.addCleanup(image_fake.FakeImageService_reset)
+        self.useFixture(nova_fixtures.GlanceFixture(self))
 
         # Use the latest microversion available to make sure something does
         # not regress in new microversions; cap as necessary.
@@ -53,7 +50,7 @@ class ServerListLimitMarkerCell0Test(test.TestCase,
         self.start_service('scheduler')
         # We don't start the compute service because we want NoValidHost so
         # all of the instances go into ERROR state and get put into cell0.
-        self.useFixture(cast_as_call.CastAsCall(self))
+        self.useFixture(nova_fixtures.CastAsCallFixture(self))
 
     def test_list_servers_marker_in_cell0_more_limit(self):
         """Creates three servers, then lists them with a marker on the first

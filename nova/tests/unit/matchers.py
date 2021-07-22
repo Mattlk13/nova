@@ -17,10 +17,10 @@
 """Matcher classes to be used inside of the testtools assertThat framework."""
 
 import copy
+import io
 import pprint
 
 from lxml import etree
-import six
 from testtools import content
 import testtools.matchers
 
@@ -408,10 +408,10 @@ class XMLMatches(object):
 
     @staticmethod
     def _parse(text_or_bytes):
-        if isinstance(text_or_bytes, six.text_type):
+        if isinstance(text_or_bytes, str):
             text_or_bytes = text_or_bytes.encode("utf-8")
         parser = etree.XMLParser(encoding="UTF-8")
-        return etree.parse(six.BytesIO(text_or_bytes), parser)
+        return etree.parse(io.BytesIO(text_or_bytes), parser)
 
     def __init__(self, expected, allow_mixed_nodes=False,
                  skip_empty_text_nodes=True, skip_values=('DONTCARE',)):
@@ -559,14 +559,14 @@ class XMLMatches(object):
 
 class EncodedByUTF8(object):
     def match(self, obj):
-        if isinstance(obj, six.binary_type):
+        if isinstance(obj, bytes):
             if hasattr(obj, "decode"):
                 try:
                     obj.decode("utf-8")
                 except UnicodeDecodeError:
                     return testtools.matchers.Mismatch(
                         "%s is not encoded in UTF-8." % obj)
-        elif isinstance(obj, six.text_type):
+        elif isinstance(obj, str):
             try:
                 obj.encode("utf-8", "strict")
             except UnicodeDecodeError:
@@ -578,6 +578,6 @@ class EncodedByUTF8(object):
                       % {
                           "obj": obj,
                           "obj_type": type(obj).__name__,
-                          "correct_type": six.binary_type.__name__
+                          "correct_type": bytes.__name__
                       })
             return testtools.matchers.Mismatch(reason)

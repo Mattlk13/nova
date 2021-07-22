@@ -24,6 +24,18 @@ A full guide on configuring and using SR-IOV is provided in the
 :neutron-doc:`OpenStack Networking service documentation
 <admin/config-sriov.html>`
 
+.. note::
+
+   Nova only supports PCI addresses where the fields are restricted to the
+   following maximum value:
+
+   * domain - 0xFFFF
+   * bus - 0xFF
+   * slot - 0x1F
+   * function - 0x7
+
+   Nova will ignore PCI devices reported by the hypervisor if the address is
+   outside of these ranges.
 
 NUMA Affinity
 -------------
@@ -50,14 +62,10 @@ Fortunately, nova provides functionality to ensure NUMA affinitization is
 provided for instances using neutron. How this works depends on the type of
 port you are trying to use.
 
-.. todo::
-
-   Add documentation for PCI NUMA affinity and PCI policies and link to it from
-   here.
-
 For SR-IOV ports, virtual functions, which are PCI devices, are attached to the
 instance. This means the instance can benefit from the NUMA affinity guarantees
-provided for PCI devices. This happens automatically.
+provided for PCI devices. This happens automatically and is described in detail
+in :ref:`pci-numa-affinity-policy`.
 
 For all other types of ports, some manual configuration is required.
 
@@ -175,8 +183,9 @@ with ``provider:physical_network=foo`` must be scheduled on host cores from
 NUMA nodes 0, while instances using one or more networks with
 ``provider:physical_network=bar`` must be scheduled on host cores from both
 NUMA nodes 2 and 3. For the latter case, it will be necessary to split the
-guest across two or more host NUMA nodes using the ``hw:numa_nodes``
-:ref:`flavor extra spec <extra-specs-numa-topology>`.
+guest across two or more host NUMA nodes using the
+:nova:extra-spec:`hw:numa_nodes` extra spec, as discussed :ref:`here
+<numa-topologies>`.
 
 Now, take an example for a deployment using L3 networks.
 

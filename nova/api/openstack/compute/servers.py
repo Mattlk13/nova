@@ -21,7 +21,6 @@ import oslo_messaging as messaging
 from oslo_utils import strutils
 from oslo_utils import timeutils
 from oslo_utils import uuidutils
-import six
 import webob
 from webob import exc
 
@@ -58,6 +57,8 @@ INVALID_FLAVOR_IMAGE_EXCEPTIONS = (
     exception.BadRequirementEmulatorThreadsPolicy,
     exception.CPUThreadPolicyConfigurationInvalid,
     exception.FlavorImageConflict,
+    exception.FlavorDiskTooSmall,
+    exception.FlavorMemoryTooSmall,
     exception.ImageCPUPinningForbidden,
     exception.ImageCPUThreadPolicyForbidden,
     exception.ImageNUMATopologyAsymmetric,
@@ -85,9 +86,10 @@ INVALID_FLAVOR_IMAGE_EXCEPTIONS = (
     exception.PciRequestAliasNotDefined,
     exception.RealtimeConfigurationInvalid,
     exception.RealtimeMaskNotFoundOrInvalid,
+    exception.RequiredMixedInstancePolicy,
+    exception.RequiredMixedOrRealtimeCPUMask,
+    exception.InvalidMixedInstanceDedicatedMask,
 )
-
-MIN_COMPUTE_MOVE_BANDWIDTH = 39
 
 
 class ServersController(wsgi.Controller):
@@ -101,7 +103,8 @@ class ServersController(wsgi.Controller):
         if 'server' not in robj.obj:
             return robj
 
-        link = [l for l in robj.obj['server']['links'] if l['rel'] == 'self']
+        link = [link for link in robj.obj['server'][
+            'links'] if link['rel'] == 'self']
         if link:
             robj['Location'] = link[0]['href']
 
@@ -401,7 +404,7 @@ class ServersController(wsgi.Controller):
         # Starting in the 2.37 microversion, requested_networks is either a
         # list or a string enum with value 'auto' or 'none'. The auto/none
         # values are verified via jsonschema so we don't check them again here.
-        if isinstance(requested_networks, six.string_types):
+        if isinstance(requested_networks, str):
             return objects.NetworkRequestList(
                 objects=[objects.NetworkRequest(
                     network_id=requested_networks)])
@@ -448,7 +451,6 @@ class ServersController(wsgi.Controller):
     def show(self, req, id):
         """Returns server details by server id."""
         context = req.environ['nova.context']
-        context.can(server_policies.SERVERS % 'show')
         cell_down_support = api_version_request.is_supported(
             req, min_version=PARTIAL_CONSTRUCT_FOR_CELL_DOWN_MIN_VERSION)
         show_server_groups = api_version_request.is_supported(
@@ -457,6 +459,9 @@ class ServersController(wsgi.Controller):
         instance = self._get_server(
             context, req, id, is_detail=True,
             cell_down_support=cell_down_support)
+        context.can(server_policies.SERVERS % 'show',
+                    target={'project_id': instance.project_id})
+
         return self._view_builder.show(
             req, instance, cell_down_support=cell_down_support,
             show_server_groups=show_server_groups)
@@ -656,9 +661,10 @@ class ServersController(wsgi.Controller):
             availability_zone, host, node = parse_az(context,
                                                      availability_zone)
         except exception.InvalidInput as err:
-            raise exc.HTTPBadRequest(explanation=six.text_type(err))
+            raise exc.HTTPBadRequest(explanation=str(err))
         if host or node:
-            context.can(server_policies.SERVERS % 'create:forced_host', {})
+            context.can(server_policies.SERVERS % 'create:forced_host',
+                        target=target)
 
         if api_version_request.is_supported(req, min_version='2.74'):
             self._process_hosts_for_create(context, target, server_dict,
@@ -674,14 +680,15 @@ class ServersController(wsgi.Controller):
 
         flavor_id = self._flavor_id_from_req_data(body)
         try:
-            inst_type = flavors.get_flavor_by_flavor_id(
-                    flavor_id, ctxt=context, read_deleted="no")
+            flavor = flavors.get_flavor_by_flavor_id(
+                flavor_id, ctxt=context, read_deleted="no")
 
             supports_multiattach = common.supports_multiattach_volume(req)
             supports_port_resource_request = \
                 common.supports_port_resource_request(req)
-            (instances, resv_id) = self.compute_api.create(context,
-                inst_type,
+            instances, resv_id = self.compute_api.create(
+                context,
+                flavor,
                 image_uuid,
                 display_name=name,
                 display_description=description,
@@ -722,10 +729,9 @@ class ServersController(wsgi.Controller):
                 exception.ImageUnacceptable,
                 exception.FixedIpNotFoundForAddress,
                 exception.FlavorNotFound,
-                exception.FlavorDiskTooSmall,
-                exception.FlavorMemoryTooSmall,
                 exception.InvalidMetadata,
                 exception.InvalidVolume,
+                exception.VolumeNotFound,
                 exception.MismatchVolumeAZException,
                 exception.MultiplePortsNotApplicable,
                 exception.InvalidFixedIpAndMaxCountRequest,
@@ -746,6 +752,7 @@ class ServersController(wsgi.Controller):
                 exception.InvalidBDMEphemeralSize,
                 exception.InvalidBDMFormat,
                 exception.InvalidBDMSwapSize,
+                exception.InvalidBDMDiskBus,
                 exception.VolumeTypeNotFound,
                 exception.AutoDiskConfigDisabledByImage,
                 exception.InstanceGroupNotFound,
@@ -754,6 +761,7 @@ class ServersController(wsgi.Controller):
                 exception.MultiattachNotSupportedOldMicroversion,
                 exception.CertificateValidationFailed,
                 exception.CreateWithPortResourceRequestOldVersion,
+                exception.DeviceProfileError,
                 exception.ComputeHostNotFound) as error:
             raise exc.HTTPBadRequest(explanation=error.format_message())
         except INVALID_FLAVOR_IMAGE_EXCEPTIONS as error:
@@ -761,7 +769,8 @@ class ServersController(wsgi.Controller):
         except (exception.PortInUse,
                 exception.InstanceExists,
                 exception.NetworkAmbiguous,
-                exception.NoUniqueMatch) as error:
+                exception.NoUniqueMatch,
+                exception.MixedInstanceNotSupportByComputeService) as error:
             raise exc.HTTPConflict(explanation=error.format_message())
 
         # If the caller wanted a reservation_id, return it
@@ -868,14 +877,18 @@ class ServersController(wsgi.Controller):
     @wsgi.action('confirmResize')
     def _action_confirm_resize(self, req, id, body):
         context = req.environ['nova.context']
-        context.can(server_policies.SERVERS % 'confirm_resize')
         instance = self._get_server(context, req, id)
+        context.can(server_policies.SERVERS % 'confirm_resize',
+                    target={'project_id': instance.project_id})
         try:
             self.compute_api.confirm_resize(context, instance)
         except exception.MigrationNotFound:
             msg = _("Instance has not been resized.")
             raise exc.HTTPBadRequest(explanation=msg)
-        except exception.InstanceIsLocked as e:
+        except (
+            exception.InstanceIsLocked,
+            exception.ServiceUnavailable,
+        ) as e:
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
@@ -886,8 +899,9 @@ class ServersController(wsgi.Controller):
     @wsgi.action('revertResize')
     def _action_revert_resize(self, req, id, body):
         context = req.environ['nova.context']
-        context.can(server_policies.SERVERS % 'revert_resize')
         instance = self._get_server(context, req, id)
+        context.can(server_policies.SERVERS % 'revert_resize',
+                    target={'project_id': instance.project_id})
         try:
             self.compute_api.revert_resize(context, instance)
         except exception.MigrationNotFound:
@@ -910,8 +924,9 @@ class ServersController(wsgi.Controller):
 
         reboot_type = body['reboot']['type'].upper()
         context = req.environ['nova.context']
-        context.can(server_policies.SERVERS % 'reboot')
         instance = self._get_server(context, req, id)
+        context.can(server_policies.SERVERS % 'reboot',
+                    target={'project_id': instance.project_id})
 
         try:
             self.compute_api.reboot(context, instance, reboot_type)
@@ -930,27 +945,20 @@ class ServersController(wsgi.Controller):
                     target={'user_id': instance.user_id,
                             'project_id': instance.project_id})
 
-        if common.instance_has_port_with_resource_request(
-                instance_id, self.network_api):
-            # TODO(gibi): Remove when nova only supports compute newer than
-            # Train
-            source_service = objects.Service.get_by_host_and_binary(
-                context, instance.host, 'nova-compute')
-            if source_service.version < MIN_COMPUTE_MOVE_BANDWIDTH:
-                msg = _("The resize action on a server with ports having "
-                        "resource requests, like a port with a QoS "
-                        "minimum bandwidth policy, is not yet supported.")
-                raise exc.HTTPConflict(explanation=msg)
-
         try:
             self.compute_api.resize(context, instance, flavor_id,
                                     auto_disk_config=auto_disk_config)
-        except exception.QuotaError as error:
+        except (exception.QuotaError,
+                exception.ForbiddenWithAccelerators) as error:
             raise exc.HTTPForbidden(
                 explanation=error.format_message())
-        except (exception.InstanceIsLocked,
-                exception.InstanceNotReady,
-                exception.ServiceUnavailable) as e:
+        except (
+            exception.OperationNotSupportedForVDPAInterface,
+            exception.InstanceIsLocked,
+            exception.InstanceNotReady,
+            exception.MixedInstanceNotSupportByComputeService,
+            exception.ServiceUnavailable,
+        ) as e:
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
@@ -1098,7 +1106,11 @@ class ServersController(wsgi.Controller):
                                      image_href,
                                      password,
                                      **kwargs)
-        except exception.InstanceIsLocked as e:
+        except (
+            exception.InstanceIsLocked,
+            exception.OperationNotSupportedForVTPM,
+            exception.OperationNotSupportedForVDPAInterface,
+        ) as e:
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
@@ -1112,16 +1124,16 @@ class ServersController(wsgi.Controller):
         except exception.KeypairNotFound:
             msg = _("Invalid key_name provided.")
             raise exc.HTTPBadRequest(explanation=msg)
-        except exception.QuotaError as error:
+        except (exception.QuotaError,
+                exception.ForbiddenWithAccelerators) as error:
             raise exc.HTTPForbidden(explanation=error.format_message())
         except (exception.AutoDiskConfigDisabledByImage,
                 exception.CertificateValidationFailed,
-                exception.FlavorDiskTooSmall,
-                exception.FlavorMemoryTooSmall,
                 exception.ImageNotActive,
                 exception.ImageUnacceptable,
                 exception.InvalidMetadata,
                 exception.InvalidArchitectureName,
+                exception.InvalidVolume,
                 ) as error:
             raise exc.HTTPBadRequest(explanation=error.format_message())
         except INVALID_FLAVOR_IMAGE_EXCEPTIONS as error:
@@ -1190,7 +1202,10 @@ class ServersController(wsgi.Controller):
     def _action_create_image(self, req, id, body):
         """Snapshot a server instance."""
         context = req.environ['nova.context']
-        context.can(server_policies.SERVERS % 'create_image')
+        instance = self._get_server(context, req, id)
+        target = {'project_id': instance.project_id}
+        context.can(server_policies.SERVERS % 'create_image',
+                    target=target)
 
         entity = body["createImage"]
         image_name = common.normalize_name(entity["name"])
@@ -1202,8 +1217,6 @@ class ServersController(wsgi.Controller):
                 api_version_request.MAX_IMAGE_META_PROXY_API_VERSION):
             common.check_img_metadata_properties_quota(context, metadata)
 
-        instance = self._get_server(context, req, id)
-
         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
                     context, instance.uuid)
 
@@ -1211,7 +1224,7 @@ class ServersController(wsgi.Controller):
             if compute_utils.is_volume_backed_instance(context, instance,
                                                           bdms):
                 context.can(server_policies.SERVERS %
-                    'create_image:allow_volume_backed')
+                    'create_image:allow_volume_backed', target=target)
                 image = self.compute_api.snapshot_volume_backed(
                                                        context,
                                                        instance,
@@ -1269,6 +1282,11 @@ class ServersController(wsgi.Controller):
             opt_list += ('changes-before',)
         if api_version_request.is_supported(req, min_version='2.73'):
             opt_list += ('locked',)
+        if api_version_request.is_supported(req, min_version='2.83'):
+            opt_list += ('availability_zone', 'config_drive', 'key_name',
+                         'created_at', 'launched_at', 'terminated_at',
+                         'power_state', 'task_state', 'vm_state', 'progress',
+                         'user_id',)
         return opt_list
 
     def _get_instance(self, context, instance_uuid):
@@ -1290,7 +1308,9 @@ class ServersController(wsgi.Controller):
         """Start an instance."""
         context = req.environ['nova.context']
         instance = self._get_instance(context, id)
-        context.can(server_policies.SERVERS % 'start', instance)
+        context.can(server_policies.SERVERS % 'start',
+                    target={'user_id': instance.user_id,
+                            'project_id': instance.project_id})
         try:
             self.compute_api.start(context, instance)
         except (exception.InstanceNotReady, exception.InstanceIsLocked) as e:

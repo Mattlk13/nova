@@ -148,6 +148,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
         'host': fields.StringField(nullable=True),
         'node': fields.StringField(nullable=True),
 
+        # TODO(stephenfin): Remove this in version 3.0 of the object as it has
+        # been replaced by 'flavor'
         'instance_type_id': fields.IntegerField(nullable=True),
 
         'user_data': fields.StringField(nullable=True),
@@ -741,8 +743,9 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
         pass
 
     def _save_keypairs(self, context):
-        # NOTE(danms): Read-only so no need to save this.
-        pass
+        if 'keypairs' in self.obj_what_changed():
+            self._save_extra_generic('keypairs')
+            self.obj_reset_changes(['keypairs'], recursive=True)
 
     def _save_extra_generic(self, field):
         if field in self.obj_what_changed():
@@ -901,9 +904,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
         if db_topology is None:
             self.numa_topology = None
         elif db_topology is not _NO_DATA_SENTINEL:
-            self.numa_topology = \
-                objects.InstanceNUMATopology.obj_from_db_obj(self.uuid,
-                                                             db_topology)
+            self.numa_topology = objects.InstanceNUMATopology.obj_from_db_obj(
+                self._context, self.uuid, db_topology)
         else:
             try:
                 self.numa_topology = \
@@ -1047,8 +1049,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
                 setattr(self, inst_attr_name, attr_value)
 
     @contextlib.contextmanager
-    def mutated_migration_context(self):
-        """Context manager to temporarily apply the migration context.
+    def mutated_migration_context(self, revert=False):
+        """Context manager to temporarily apply/revert the migration context.
 
         Calling .save() from within the context manager means that the mutated
         context will be saved which can cause incorrect resource tracking, and
@@ -1063,7 +1065,10 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
         current_values = {}
         for attr_name in _MIGRATION_CONTEXT_ATTRS:
             current_values[attr_name] = getattr(self, attr_name)
-        self.apply_migration_context()
+        if revert:
+            self.revert_migration_context()
+        else:
+            self.apply_migration_context()
         try:
             yield
         finally:
@@ -1213,6 +1218,14 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
     def get_bdms(self):
         return objects.BlockDeviceMappingList.get_by_instance_uuid(
             self._context, self.uuid)
+
+    def remove_pci_device_and_request(self, pci_device):
+        """Remove the PciDevice and the related InstancePciRequest"""
+        if pci_device in self.pci_devices.objects:
+            self.pci_devices.objects.remove(pci_device)
+        self.pci_requests.requests = [
+            pci_req for pci_req in self.pci_requests.requests
+            if pci_req.request_id != pci_device.request_id]
 
 
 def _make_instance_list(context, inst_list, db_inst_list, expected_attrs):

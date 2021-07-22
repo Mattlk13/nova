@@ -16,6 +16,7 @@
 
 from webob import exc
 
+from nova.api.openstack import api_version_request
 from nova.api.openstack import common
 from nova.api.openstack.compute.schemas import rescue
 from nova.api.openstack import wsgi
@@ -56,21 +57,27 @@ class RescueController(wsgi.Controller):
         rescue_image_ref = None
         if body['rescue']:
             rescue_image_ref = body['rescue'].get('rescue_image_ref')
-
+        allow_bfv_rescue = api_version_request.is_supported(req, '2.87')
         try:
             self.compute_api.rescue(context, instance,
                                     rescue_password=password,
-                                    rescue_image_ref=rescue_image_ref)
-        except exception.InstanceIsLocked as e:
+                                    rescue_image_ref=rescue_image_ref,
+                                    allow_bfv_rescue=allow_bfv_rescue)
+        except (
+            exception.InstanceIsLocked,
+            exception.OperationNotSupportedForVTPM,
+            exception.OperationNotSupportedForVDPAInterface,
+            exception.InvalidVolume,
+        ) as e:
             raise exc.HTTPConflict(explanation=e.format_message())
-        except exception.InstanceInvalidState as state_error:
-            common.raise_http_conflict_for_instance_invalid_state(state_error,
-                                                                  'rescue', id)
-        except exception.InvalidVolume as volume_error:
-            raise exc.HTTPConflict(explanation=volume_error.format_message())
-        except exception.InstanceNotRescuable as non_rescuable:
-            raise exc.HTTPBadRequest(
-                explanation=non_rescuable.format_message())
+        except exception.InstanceInvalidState as e:
+            common.raise_http_conflict_for_instance_invalid_state(
+                e, 'rescue', id)
+        except (
+            exception.InstanceNotRescuable,
+            exception.UnsupportedRescueImage,
+        ) as e:
+            raise exc.HTTPBadRequest(explanation=e.format_message())
 
         if CONF.api.enable_instance_password:
             return {'adminPass': password}
@@ -83,8 +90,9 @@ class RescueController(wsgi.Controller):
     def _unrescue(self, req, id, body):
         """Unrescue an instance."""
         context = req.environ["nova.context"]
-        context.can(rescue_policies.BASE_POLICY_NAME)
         instance = common.get_instance(self.compute_api, context, id)
+        context.can(rescue_policies.UNRESCUE_POLICY_NAME,
+                    target={'project_id': instance.project_id})
         try:
             self.compute_api.unrescue(context, instance)
         except exception.InstanceIsLocked as e:

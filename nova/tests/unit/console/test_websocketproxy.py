@@ -356,34 +356,6 @@ class NovaProxyRequestHandlerTestCase(test.NoDBTestCase):
                                      mock.call(len(HTTP_RESP))])
         self.wh.do_proxy.assert_called_with(tsock)
 
-    @mock.patch.object(websocketproxy, 'sys')
-    @mock.patch('nova.console.websocketproxy.NovaProxyRequestHandler.'
-                '_check_console_port')
-    @mock.patch('nova.objects.ConsoleAuthToken.validate')
-    def test_new_websocket_client_py273_good_scheme(
-            self, validate, check_port, mock_sys):
-        mock_sys.version_info.return_value = (2, 7, 3)
-        params = {
-            'id': 1,
-            'token': '123-456-789',
-            'instance_uuid': uuids.instance,
-            'host': 'node1',
-            'port': '10000',
-            'console_type': 'novnc',
-            'access_url_base': 'https://example.net:6080'
-        }
-        validate.return_value = objects.ConsoleAuthToken(**params)
-
-        self.wh.socket.return_value = '<socket>'
-        self.wh.path = "http://127.0.0.1/?token=123-456-789"
-        self.wh.headers = self.fake_header
-
-        self.wh.new_websocket_client()
-
-        validate.assert_called_with(mock.ANY, "123-456-789")
-        self.wh.socket.assert_called_with('node1', 10000, connect=True)
-        self.wh.do_proxy.assert_called_with('<socket>')
-
     @mock.patch('socket.getfqdn')
     def test_address_string_doesnt_do_reverse_dns_lookup(self, getfqdn):
         request_mock = mock.MagicMock()
@@ -616,15 +588,71 @@ class NovaProxyRequestHandlerTestCase(test.NoDBTestCase):
         self.wh.socket.assert_called_with('node1', 10000, connect=True)
         self.wh.do_proxy.assert_called_with('<socket>')
 
-    def test_tcp_rst_no_compute_rpcapi(self):
-        # Tests that we don't create a ComputeAPI object if we receive a
-        # TCP RST message. Simulate by raising the socket.err upon recv.
-        err = socket.error('[Errno 104] Connection reset by peer')
-        self.wh.socket.recv.side_effect = err
-        conn = mock.MagicMock()
-        address = mock.MagicMock()
-        self.wh.server.top_new_client(conn, address)
-        self.assertIsNone(self.wh._compute_rpcapi)
+    def test_reject_open_redirect(self):
+        # This will test the behavior when an attempt is made to cause an open
+        # redirect. It should be rejected.
+        mock_req = mock.MagicMock()
+        mock_req.makefile().readline.side_effect = [
+            b'GET //example.com/%2F.. HTTP/1.1\r\n',
+            b''
+        ]
+
+        # Collect the response data to verify at the end. The
+        # SimpleHTTPRequestHandler writes the response data by calling the
+        # request socket sendall() method.
+        self.data = b''
+
+        def fake_sendall(data):
+            self.data += data
+
+        mock_req.sendall.side_effect = fake_sendall
+
+        client_addr = ('8.8.8.8', 54321)
+        mock_server = mock.MagicMock()
+        # This specifies that the server will be able to handle requests other
+        # than only websockets.
+        mock_server.only_upgrade = False
+
+        # Constructing a handler will process the mock_req request passed in.
+        websocketproxy.NovaProxyRequestHandler(
+            mock_req, client_addr, mock_server)
+
+        # Verify no redirect happens and instead a 400 Bad Request is returned.
+        self.data = self.data.decode()
+        self.assertIn('Error code: 400', self.data)
+        self.assertIn('Message: URI must not start with //', self.data)
+
+    @mock.patch('nova.objects.ConsoleAuthToken.validate')
+    def test_no_compute_rpcapi_with_invalid_token(self, mock_validate):
+        """Tests that we don't create a ComputeAPI object until we actually
+        need to use it to call the internal compute RPC API after token
+        validation succeeds. This way, we will not perform expensive object
+        creations when we receive unauthenticated (via token) messages. In the
+        past, it was possible for unauthenticated requests such as TCP RST or
+        requests with invalid tokens to be used to DOS the console proxy
+        service.
+        """
+        # We will simulate a request with an invalid token and verify it
+        # will not trigger a ComputeAPI object creation.
+        mock_req = mock.MagicMock()
+        mock_req.makefile().readline.side_effect = [
+            b'GET /vnc.html?token=123-456-789 HTTP/1.1\r\n',
+            b''
+        ]
+        client_addr = ('8.8.8.8', 54321)
+        mock_server = mock.MagicMock()
+        handler = websocketproxy.NovaProxyRequestHandler(
+            mock_req, client_addr, mock_server)
+        # Internal ComputeAPI reference should be None when the request handler
+        # is initially created.
+        self.assertIsNone(handler._compute_rpcapi)
+        # Set up a token validation to fail when the new_websocket_client
+        # is called to handle the request.
+        mock_validate.side_effect = exception.InvalidToken(token='123-456-789')
+        # We expect InvalidToken to be raised during handling.
+        self.assertRaises(exception.InvalidToken, handler.new_websocket_client)
+        # And our internal ComputeAPI reference should still be None.
+        self.assertIsNone(handler._compute_rpcapi)
 
     @mock.patch('websockify.websocketproxy.select_ssl_version')
     def test_ssl_min_version_is_not_set(self, mock_select_ssl):

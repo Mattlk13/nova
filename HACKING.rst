@@ -25,15 +25,13 @@ Nova Specific Commandments
   assertIsInstance(A, B).
 - [N317] Change assertEqual(type(A), B) by optimal assert like
   assertIsInstance(A, B)
-- [N319] Validate that debug level logs are not translated.
+- [N319] Validate that logs are not translated.
 - [N320] Setting CONF.* attributes directly in tests is forbidden. Use
   self.flags(option=value) instead.
 - [N322] Method's default argument shouldn't be mutable
 - [N323] Ensure that the _() function is explicitly imported to ensure proper translations.
 - [N324] Ensure that jsonutils.%(fun)s must be used instead of json.%(fun)s
-- [N325] str() and unicode() cannot be used on an exception.  Remove use or use six.text_type()
 - [N326] Translated messages cannot be concatenated.  String should be included in translated message.
-- [N327] Do not use xrange(). xrange() is not compatible with Python 3. Use range() or six.moves.range() instead.
 - [N332] Check that the api_version decorator is the first decorator on a method
 - [N334] Change assertTrue/False(A in/not in B, message) to the more specific
   assertIn/NotIn(A, B, message)
@@ -48,9 +46,6 @@ Nova Specific Commandments
 - [N341] contextlib.nested is deprecated
 - [N342] Config options should be in the central location ``nova/conf/``
 - [N343] Check for common double word typos
-- [N344] Python 3: do not use dict.iteritems.
-- [N345] Python 3: do not use dict.iterkeys.
-- [N346] Python 3: do not use dict.itervalues.
 - [N348] Deprecated library function os.popen()
 - [N349] Check for closures in tests which are not used
 - [N350] Policy registration should be in the central location ``nova/policies/``
@@ -72,6 +67,7 @@ Nova Specific Commandments
 - [N363] Disallow ``(not_a_tuple)`` because you meant ``(a_tuple_of_one,)``.
 - [N364] Check non-existent mock assertion methods and attributes.
 - [N365] Check misuse of assertTrue/assertIsNone.
+- [N366] The assert_has_calls is a method rather than a variable.
 
 Creating Unit Tests
 -------------------

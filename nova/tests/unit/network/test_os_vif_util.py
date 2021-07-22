@@ -14,7 +14,6 @@
 
 from os_vif import objects as osv_objects
 from os_vif.objects import fields as os_vif_fields
-import six
 
 from nova import exception
 from nova.network import model
@@ -459,7 +458,8 @@ class OSVIFUtilTestCase(test.NoDBTestCase):
                 subnets=[]),
             details={
                 model.VIF_DETAILS_PORT_FILTER: True,
-            }
+            },
+            delegate_create=False,
         )
 
         actual = os_vif_util.nova_to_osvif_vif(vif)
@@ -472,7 +472,8 @@ class OSVIFUtilTestCase(test.NoDBTestCase):
             plugin="ovs",
             port_profile=osv_objects.vif.VIFPortProfileOpenVSwitch(
                 interface_id="dc065497-3c8d-4f44-8fb4-e1d33c16a536",
-                datapath_type=None),
+                datapath_type=None,
+                create_port=False),
             preserve_on_delete=False,
             vif_name="nicdc065497-3c",
             network=osv_objects.network.Network(
@@ -589,6 +590,7 @@ class OSVIFUtilTestCase(test.NoDBTestCase):
                 model.VIF_DETAILS_OVS_DATAPATH_TYPE:
                     model.VIF_DETAILS_OVS_DATAPATH_SYSTEM
             },
+            delegate_create=True,
         )
 
         actual = os_vif_util.nova_to_osvif_vif(vif)
@@ -601,7 +603,8 @@ class OSVIFUtilTestCase(test.NoDBTestCase):
             plugin="ovs",
             port_profile=osv_objects.vif.VIFPortProfileOpenVSwitch(
                 interface_id="dc065497-3c8d-4f44-8fb4-e1d33c16a536",
-                datapath_type=model.VIF_DETAILS_OVS_DATAPATH_SYSTEM),
+                datapath_type=model.VIF_DETAILS_OVS_DATAPATH_SYSTEM,
+                create_port=True),
             preserve_on_delete=False,
             vif_name="nicdc065497-3c",
             network=osv_objects.network.Network(
@@ -659,6 +662,46 @@ class OSVIFUtilTestCase(test.NoDBTestCase):
             type=model.VIF_TYPE_OVS,
             address="22:52:25:62:e2:aa",
             vnic_type=model.VNIC_TYPE_DIRECT,
+            network=model.Network(
+                id="b82c1929-051e-481d-8110-4669916c7915",
+                label="Demo Net",
+                subnets=[]),
+            profile={'pci_slot': '0000:0a:00.1'}
+        )
+
+        actual = os_vif_util.nova_to_osvif_vif(vif)
+
+        expect = osv_objects.vif.VIFHostDevice(
+            id="dc065497-3c8d-4f44-8fb4-e1d33c16a536",
+            active=False,
+            address="22:52:25:62:e2:aa",
+            dev_address='0000:0a:00.1',
+            dev_type=os_vif_fields.VIFHostDeviceDevType.ETHERNET,
+            plugin="ovs",
+            port_profile=osv_objects.vif.VIFPortProfileOVSRepresentor(
+                interface_id="dc065497-3c8d-4f44-8fb4-e1d33c16a536",
+                representor_name="nicdc065497-3c",
+                representor_address="0000:0a:00.1",
+                datapath_offload=osv_objects.vif.DatapathOffloadRepresentor(
+                    representor_name="nicdc065497-3c",
+                    representor_address="0000:0a:00.1")),
+            has_traffic_filtering=False,
+            preserve_on_delete=False,
+            network=osv_objects.network.Network(
+                id="b82c1929-051e-481d-8110-4669916c7915",
+                bridge_interface=None,
+                label="Demo Net",
+                subnets=osv_objects.subnet.SubnetList(
+                    objects=[])))
+
+        self.assertObjEqual(expect, actual)
+
+    def test_nova_to_osvif_ovs_with_vnic_vdpa(self):
+        vif = model.VIF(
+            id="dc065497-3c8d-4f44-8fb4-e1d33c16a536",
+            type=model.VIF_TYPE_OVS,
+            address="22:52:25:62:e2:aa",
+            vnic_type=model.VNIC_TYPE_VDPA,
             network=model.Network(
                 id="b82c1929-051e-481d-8110-4669916c7915",
                 label="Demo Net",
@@ -1016,7 +1059,7 @@ class OSVIFUtilTestCase(test.NoDBTestCase):
 
         ex = self.assertRaises(exception.NovaException,
                                os_vif_util.nova_to_osvif_vif, vif)
-        self.assertIn('Unsupported VIF type wibble', six.text_type(ex))
+        self.assertIn('Unsupported VIF type wibble', str(ex))
 
     def test_nova_to_osvif_vif_binding_failed(self):
         vif = model.VIF(

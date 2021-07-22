@@ -169,6 +169,7 @@ class ManagedObjectReference(object):
         # typically have values like vm-123 or
         # host-232 and not UUID.
         self.value = value
+        self._value_1 = value
         # Managed Object Reference type
         # attributes hold the name of the type
         # of the vCenter object the value
@@ -186,10 +187,10 @@ class ObjectContent(object):
     def __init__(self, obj_ref, prop_list=None, missing_list=None):
         self.obj = obj_ref
 
-        if not isinstance(prop_list, collections.Iterable):
+        if not isinstance(prop_list, collections.abc.Iterable):
             prop_list = []
 
-        if not isinstance(missing_list, collections.Iterable):
+        if not isinstance(missing_list, collections.abc.Iterable):
             missing_list = []
 
         # propSet is the name your Python code will need to
@@ -1224,12 +1225,7 @@ class FakeVim(object):
         self.client = FakeClient()
         self.client.factory = FakeFactory()
 
-        transport = DataObject()
-        transport.cookiejar = "Fake-CookieJar"
-        options = DataObject()
-        options.transport = transport
-
-        self.client.options = options
+        self.client.cookiejar = "Fake-CookieJar"
 
         service_content = self.client.factory.create('ns0:ServiceContent')
         service_content.propertyCollector = "PropCollector"

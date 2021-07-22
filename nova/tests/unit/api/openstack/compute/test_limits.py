@@ -17,18 +17,19 @@
 Tests dealing with HTTP rate-limiting.
 """
 
+from http import client as httplib
+from io import StringIO
+
 import mock
 from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
-from six.moves import http_client as httplib
-from six.moves import StringIO
 
 from nova.api.openstack.compute import limits as limits_v21
 from nova.api.openstack.compute import views
 from nova.api.openstack import wsgi
 import nova.context
 from nova import exception
-from nova.policies import used_limits as ul_policies
+from nova.policies import limits as l_policies
 from nova import quota
 from nova import test
 from nova.tests.unit.api.openstack import fakes
@@ -202,10 +203,6 @@ class LimitsControllerTestV21(BaseLimitTestSuite):
         project_id = "123456"
         user_id = "A1234"
         tenant_id = 'abcd'
-        target = {
-            "project_id": tenant_id,
-            "user_id": user_id
-        }
         fake_req = self._get_index_request(tenant_id=tenant_id,
                                            user_id=user_id,
                                            project_id=project_id)
@@ -214,8 +211,9 @@ class LimitsControllerTestV21(BaseLimitTestSuite):
                               return_value={}) as mock_get_quotas:
             fake_req.get_response(self.controller)
             self.assertEqual(2, self.mock_can.call_count)
-            self.mock_can.assert_called_with(ul_policies.BASE_POLICY_NAME,
-                                             target)
+            self.mock_can.assert_called_with(
+                l_policies.OTHER_PROJECT_LIMIT_POLICY_NAME,
+                target={"project_id": tenant_id})
             mock_get_quotas.assert_called_once_with(context,
                 tenant_id, usages=True)
 
@@ -349,9 +347,6 @@ class LimitsViewBuilderTest(test.NoDBTestCase):
         self.view_builder = views.limits.ViewBuilder()
         self.req = fakes.HTTPRequest.blank('/?tenant_id=None')
         self.rate_limits = []
-        patcher = self.mock_can = mock.patch('nova.context.RequestContext.can')
-        self.mock_can = patcher.start()
-        self.addCleanup(patcher.stop)
         self.absolute_limits = {"metadata_items": {'limit': 1, 'in_use': 1},
                                 "injected_files": {'limit': 5, 'in_use': 1},
                                 "injected_file_content_bytes":
@@ -375,45 +370,6 @@ class LimitsViewBuilderTest(test.NoDBTestCase):
         quotas = {}
         output = self.view_builder.build(self.req, quotas)
         self.assertThat(output, matchers.DictMatches(expected_limits))
-
-    def test_non_admin_cannot_fetch_used_limits_for_any_other_project(self):
-        project_id = "123456"
-        user_id = "A1234"
-        tenant_id = "abcd"
-        target = {
-            "project_id": tenant_id,
-            "user_id": user_id
-        }
-        req = fakes.HTTPRequest.blank('/?tenant_id=%s' % tenant_id)
-        context = nova.context.RequestContext(user_id, project_id)
-        req.environ["nova.context"] = context
-
-        self.mock_can.side_effect = exception.PolicyNotAuthorized(
-            action="os_compute_api:os-used-limits")
-        self.assertRaises(exception.PolicyNotAuthorized,
-                          self.view_builder.build,
-                          req, self.absolute_limits)
-
-        self.mock_can.assert_called_with(ul_policies.BASE_POLICY_NAME,
-                                         target)
-
-
-class LimitsPolicyEnforcementV21(test.NoDBTestCase):
-
-    def setUp(self):
-        super(LimitsPolicyEnforcementV21, self).setUp()
-        self.controller = limits_v21.LimitsController()
-
-    def test_limits_index_policy_failed(self):
-        rule_name = "os_compute_api:limits"
-        self.policy.set_rules({rule_name: "project:non_fake"})
-        req = fakes.HTTPRequest.blank('')
-        exc = self.assertRaises(
-            exception.PolicyNotAuthorized,
-            self.controller.index, req=req)
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % rule_name,
-            exc.format_message())
 
 
 class LimitsControllerTestV236(BaseLimitTestSuite):

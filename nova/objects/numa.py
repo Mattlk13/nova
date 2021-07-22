@@ -28,7 +28,8 @@ class NUMACell(base.NovaObject):
     # Version 1.2: Added mempages field
     # Version 1.3: Add network_metadata field
     # Version 1.4: Add pcpuset
-    VERSION = '1.4'
+    # Version 1.5: Add socket
+    VERSION = '1.5'
 
     fields = {
         'id': obj_fields.IntegerField(read_only=True),
@@ -41,11 +42,14 @@ class NUMACell(base.NovaObject):
         'siblings': obj_fields.ListOfSetsOfIntegersField(),
         'mempages': obj_fields.ListOfObjectsField('NUMAPagesTopology'),
         'network_metadata': obj_fields.ObjectField('NetworkMetadata'),
+        'socket': obj_fields.IntegerField(nullable=True),
     }
 
     def obj_make_compatible(self, primitive, target_version):
         super(NUMACell, self).obj_make_compatible(primitive, target_version)
         target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 5):
+            primitive.pop('socket', None)
         if target_version < (1, 4):
             primitive.pop('pcpuset', None)
         if target_version < (1, 3):
@@ -106,30 +110,36 @@ class NUMACell(base.NovaObject):
         self.pinned_cpus -= cpus
 
     def pin_cpus_with_siblings(self, cpus):
+        """Pin (consume) both thread siblings if one of them is requested to
+        be pinned.
+
+        :param cpus: set of CPUs to pin
+        """
         pin_siblings = set()
         for sib in self.siblings:
             if cpus & sib:
+                # NOTE(artom) If the intersection between cpus and sib is not
+                # empty - IOW, the CPU we want to pin has sibligns - pin the
+                # sibling as well. This is because we normally got here because
+                # the `isolate` CPU thread policy is set, so we don't want to
+                # place guest CPUs on host thread siblings.
                 pin_siblings.update(sib)
         self.pin_cpus(pin_siblings)
 
     def unpin_cpus_with_siblings(self, cpus):
+        """Unpin (free up) both thread siblings if one of them is requested to
+        be freed.
+
+        :param cpus: set of CPUs to unpin.
+        """
         pin_siblings = set()
         for sib in self.siblings:
             if cpus & sib:
+                # NOTE(artom) This is the inverse operation of
+                # pin_cpus_with_siblings() - see the NOTE there. If the CPU
+                # we're unpinning has siblings, unpin the sibling as well.
                 pin_siblings.update(sib)
         self.unpin_cpus(pin_siblings)
-
-    @classmethod
-    def _from_dict(cls, data_dict):
-        cpuset = hardware.parse_cpu_spec(
-            data_dict.get('cpus', ''))
-        cpu_usage = data_dict.get('cpu_usage', 0)
-        memory = data_dict.get('mem', {}).get('total', 0)
-        memory_usage = data_dict.get('mem', {}).get('used', 0)
-        cell_id = data_dict.get('id')
-        return cls(id=cell_id, cpuset=cpuset, memory=memory,
-                   cpu_usage=cpu_usage, memory_usage=memory_usage,
-                   mempages=[], pinned_cpus=set([]), siblings=[])
 
     def can_fit_pagesize(self, pagesize, memory, use_free=True):
         """Returns whether memory can fit into a given pagesize.
@@ -219,18 +229,6 @@ class NUMATopology(base.NovaObject):
         """Check if any cell use SMT threads (a.k.a. Hyperthreads)"""
         return any(cell.has_threads for cell in self.cells)
 
-    @classmethod
-    def obj_from_primitive(cls, primitive, context=None):
-        if 'nova_object.name' in primitive:
-            obj_topology = super(NUMATopology, cls).obj_from_primitive(
-                primitive, context=context)
-        else:
-            # NOTE(sahid): This compatibility code needs to stay until we can
-            # guarantee that there are no cases of the old format stored in
-            # the database (or forever, if we can never guarantee that).
-            obj_topology = NUMATopology._from_dict(primitive)
-        return obj_topology
-
     def _to_json(self):
         return jsonutils.dumps(self.obj_to_primitive())
 
@@ -243,15 +241,32 @@ class NUMATopology(base.NovaObject):
         """
         return cls.obj_from_primitive(jsonutils.loads(db_obj))
 
+    @classmethod
+    def from_legacy_object(cls, primitive: str):
+        """Convert a pre-Liberty object to a (serialized) real o.vo.
+
+        :param primitive: A serialized representation of the legacy object.
+        :returns: A serialized representation of the updated object.
+        """
+        topology = cls(
+            cells=[
+                NUMACell(
+                    id=cell.get('id'),
+                    cpuset=hardware.parse_cpu_spec(cell.get('cpus', '')),
+                    cpu_usage=cell.get('cpu_usage', 0),
+                    memory=cell.get('mem', {}).get('total', 0),
+                    memory_usage=cell.get('mem', {}).get('used', 0),
+                    mempages=[],
+                    pinned_cpus=set(),
+                    siblings=[],
+                ) for cell in jsonutils.loads(primitive).get('cells', [])
+            ],
+        )
+        return topology._to_json()
+
     def __len__(self):
         """Defined so that boolean testing works the same as for lists."""
         return len(self.cells)
-
-    @classmethod
-    def _from_dict(cls, data_dict):
-        return cls(cells=[
-            NUMACell._from_dict(cell_dict)
-            for cell_dict in data_dict.get('cells', [])])
 
 
 @base.NovaObjectRegistry.register

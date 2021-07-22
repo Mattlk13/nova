@@ -10,15 +10,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+from nova.compute import manager
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional import fixtures as func_fixtures
 from nova.tests.functional import integrated_helpers
 from nova.tests.unit import fake_network
-from nova.tests.unit import fake_notifier
-import nova.tests.unit.image.fake
-from nova.tests.unit import policy_fixture
 
 
 class TestEvacuationWithSourceReturningDuringRebuild(
@@ -33,7 +30,7 @@ class TestEvacuationWithSourceReturningDuringRebuild(
     def setUp(self):
         super(TestEvacuationWithSourceReturningDuringRebuild, self).setUp()
 
-        self.useFixture(policy_fixture.RealPolicyFixture())
+        self.useFixture(nova_fixtures.RealPolicyFixture())
 
         # The NeutronFixture is needed to stub out validate_networks in API.
         self.useFixture(nova_fixtures.NeutronFixture(self))
@@ -53,28 +50,22 @@ class TestEvacuationWithSourceReturningDuringRebuild(
         self.api.microversion = '2.14'
 
         # the image fake backend needed for image discovery
-        nova.tests.unit.image.fake.stub_out_image_service(self)
-        self.addCleanup(nova.tests.unit.image.fake.FakeImageService_reset)
+        self.useFixture(nova_fixtures.GlanceFixture(self))
 
         self.start_service('conductor')
         self.start_service('scheduler')
 
         # Start two computes
-        self.computes = {}
-
-        self.computes['host1'] = self.start_service('compute', host='host1')
-
-        self.computes['host2'] = self.start_service('compute', host='host2')
+        self._start_compute('host1')
+        self._start_compute('host2')
 
         self.image_id = self.api.get_images()[0]['id']
         self.flavor_id = self.api.get_flavors()[0]['id']
 
-        self.addCleanup(fake_notifier.reset)
-
         # Stub out rebuild with a slower method allowing the src compute to be
         # restarted once the migration hits pre-migrating after claiming
         # resources on the dest.
-        manager_class = nova.compute.manager.ComputeManager
+        manager_class = manager.ComputeManager
         original_rebuild = manager_class._do_rebuild_instance
 
         def start_src_rebuild(self_, context, instance, *args, **kwargs):
@@ -102,12 +93,9 @@ class TestEvacuationWithSourceReturningDuringRebuild(
         self.computes.get(self.source_compute).stop()
         self.api.force_down_service(self.source_compute, 'nova-compute', True)
 
-        # Start evacuating the instance from the source_host
-        self.api.post_server_action(server['id'], {'evacuate': {}})
-
-        # Wait for the instance to go into an ACTIVE state
-        self._wait_for_state_change(server, 'ACTIVE')
-        server = self.api.get_server(server['id'])
+        # Evacuate the instance from the source_host
+        server = self._evacuate_server(
+            server, expected_migration_status='done')
         host = server['OS-EXT-SRV-ATTR:host']
         migrations = self.api.get_migrations()
 

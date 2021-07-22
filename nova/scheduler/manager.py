@@ -25,8 +25,6 @@ from oslo_log import log as logging
 import oslo_messaging as messaging
 from oslo_serialization import jsonutils
 from oslo_service import periodic_task
-import six
-from stevedore import driver
 
 import nova.conf
 from nova import exception
@@ -35,6 +33,7 @@ from nova import objects
 from nova.objects import host_mapping as host_mapping_obj
 from nova import quota
 from nova.scheduler.client import report
+from nova.scheduler import filter_scheduler
 from nova.scheduler import request_filter
 from nova.scheduler import utils
 
@@ -57,11 +56,7 @@ class SchedulerManager(manager.Manager):
 
     def __init__(self, *args, **kwargs):
         self.placement_client = report.SchedulerReportClient()
-        self.driver = driver.DriverManager(
-            'nova.scheduler.driver',
-            CONF.scheduler.driver,
-            invoke_on_load=True
-        ).driver
+        self.driver = filter_scheduler.FilterScheduler()
 
         super(SchedulerManager, self).__init__(
             service_name='scheduler', *args, **kwargs
@@ -83,17 +78,12 @@ class SchedulerManager(manager.Manager):
         except exception.HostMappingExists as exp:
             msg = ('This periodic task should only be enabled on a single '
                    'scheduler to prevent collisions between multiple '
-                   'schedulers: %s' % six.text_type(exp))
+                   'schedulers: %s' % str(exp))
             if not HOST_MAPPING_EXISTS_WARNING:
                 LOG.warning(msg)
                 HOST_MAPPING_EXISTS_WARNING = True
             else:
                 LOG.debug(msg)
-
-    @periodic_task.periodic_task(spacing=CONF.scheduler.periodic_task_interval,
-                                 run_immediately=True)
-    def _run_periodic_tasks(self, context):
-        self.driver.run_periodic_tasks(context)
 
     def reset(self):
         # NOTE(tssurya): This is a SIGHUP handler which will reset the cells

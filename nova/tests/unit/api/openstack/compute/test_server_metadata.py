@@ -18,7 +18,6 @@ from oslo_config import cfg
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
-import six
 import webob
 
 from nova.api.openstack.compute import server_metadata \
@@ -47,7 +46,7 @@ def fake_instance_save(inst, **kwargs):
 
 
 def return_server_metadata(context, server_id):
-    if not isinstance(server_id, six.string_types) or not len(server_id) == 36:
+    if not isinstance(server_id, str) or not len(server_id) == 36:
         msg = 'id %s must be a uuid in return server metadata' % server_id
         raise Exception(msg)
     return stub_server_metadata()
@@ -82,10 +81,6 @@ def return_server_nonexistent(context, server_id,
     raise exception.InstanceNotFound(instance_id=server_id)
 
 
-def fake_change_instance_metadata(self, context, instance, diff):
-    pass
-
-
 class ServerMetaDataTestV21(test.TestCase):
     validation_ex = exception.ValidationError
     validation_ex_large = validation_ex
@@ -104,9 +99,6 @@ class ServerMetaDataTestV21(test.TestCase):
         self.stub_out('nova.db.api.instance_metadata_get',
                       return_server_metadata)
 
-        self.stub_out(
-            'nova.compute.rpcapi.ComputeAPI.change_instance_metadata',
-            fake_change_instance_metadata)
         self._set_up_resources()
 
     def _set_up_resources(self):
@@ -655,9 +647,6 @@ class BadStateServerMetaDataTestV21(test.TestCase):
         super(BadStateServerMetaDataTestV21, self).setUp()
         self.stub_out('nova.db.api.instance_metadata_get',
                       return_server_metadata)
-        self.stub_out(
-            'nova.compute.rpcapi.ComputeAPI.change_instance_metadata',
-            fake_change_instance_metadata)
         self.stub_out('nova.compute.api.API.get',
                       fakes.fake_compute_get(
                           **{'uuid': '0cc3346e-9fef-4445-abe6-5d2b2690ec64',
@@ -712,74 +701,3 @@ class BadStateServerMetaDataTestV21(test.TestCase):
         req.body = jsonutils.dump_as_bytes(expected)
         self.assertRaises(webob.exc.HTTPConflict, self.controller.update_all,
                 req, self.uuid, body=expected)
-
-
-class ServerMetaPolicyEnforcementV21(test.NoDBTestCase):
-
-    def setUp(self):
-        super(ServerMetaPolicyEnforcementV21, self).setUp()
-        self.controller = server_metadata_v21.ServerMetadataController()
-        self.req = fakes.HTTPRequest.blank('')
-
-    def test_create_policy_failed(self):
-        rule_name = "os_compute_api:server-metadata:create"
-        self.policy.set_rules({rule_name: "project:non_fake"})
-        exc = self.assertRaises(
-            exception.PolicyNotAuthorized,
-            self.controller.create, self.req, fakes.FAKE_UUID,
-            body={'metadata': {}})
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % rule_name,
-            exc.format_message())
-
-    def test_index_policy_failed(self):
-        rule_name = "os_compute_api:server-metadata:index"
-        self.policy.set_rules({rule_name: "project:non_fake"})
-        exc = self.assertRaises(
-            exception.PolicyNotAuthorized,
-            self.controller.index, self.req, fakes.FAKE_UUID)
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % rule_name,
-            exc.format_message())
-
-    def test_update_policy_failed(self):
-        rule_name = "os_compute_api:server-metadata:update"
-        self.policy.set_rules({rule_name: "project:non_fake"})
-        exc = self.assertRaises(
-            exception.PolicyNotAuthorized,
-            self.controller.update, self.req, fakes.FAKE_UUID, fakes.FAKE_UUID,
-            body={'meta': {'fake_meta': 'fake_meta'}})
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % rule_name,
-            exc.format_message())
-
-    def test_update_all_policy_failed(self):
-        rule_name = "os_compute_api:server-metadata:update_all"
-        self.policy.set_rules({rule_name: "project:non_fake"})
-        exc = self.assertRaises(
-            exception.PolicyNotAuthorized,
-            self.controller.update_all, self.req, fakes.FAKE_UUID,
-            body={'metadata': {}})
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % rule_name,
-            exc.format_message())
-
-    def test_delete_policy_failed(self):
-        rule_name = "os_compute_api:server-metadata:delete"
-        self.policy.set_rules({rule_name: "project:non_fake"})
-        exc = self.assertRaises(
-            exception.PolicyNotAuthorized,
-            self.controller.delete, self.req, fakes.FAKE_UUID, fakes.FAKE_UUID)
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % rule_name,
-            exc.format_message())
-
-    def test_show_policy_failed(self):
-        rule_name = "os_compute_api:server-metadata:show"
-        self.policy.set_rules({rule_name: "project:non_fake"})
-        exc = self.assertRaises(
-            exception.PolicyNotAuthorized,
-            self.controller.show, self.req, fakes.FAKE_UUID, fakes.FAKE_UUID)
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % rule_name,
-            exc.format_message())

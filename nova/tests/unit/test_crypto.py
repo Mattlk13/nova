@@ -16,17 +16,21 @@
 Tests for Crypto module.
 """
 
+import io
 import os
 
+from castellan.common import exception as castellan_exception
 from cryptography.hazmat import backends
 from cryptography.hazmat.primitives import serialization
 import mock
 from oslo_concurrency import processutils
+from oslo_utils.fixture import uuidsentinel as uuids
 import paramiko
-import six
 
+from nova import context as nova_context
 from nova import crypto
 from nova import exception
+from nova import objects
 from nova import test
 from nova import utils
 
@@ -95,12 +99,9 @@ e6fCXWECgYEAqgpGvva5kJ1ISgNwnJbwiNw0sOT9BMOsdNZBElf0kJIIy6FMPvap
         self.assertIsInstance(enc, bytes)
         # Comparison between bytes and str raises a TypeError
         # when using python3 -bb
-        if six.PY2:
-            self.assertNotEqual(enc, self.text)
         result = self._ssh_decrypt_text(self.prikey, enc)
         self.assertIsInstance(result, bytes)
-        if six.PY3:
-            result = result.decode('utf-8')
+        result = result.decode('utf-8')
         self.assertEqual(result, self.text)
 
     def test_ssh_encrypt_failure(self):
@@ -209,7 +210,7 @@ class KeyPairTest(test.NoDBTestCase):
         self.assertEqual(bits, pkey.key_size)
 
     def test_generate_key_pair_mocked_private_key(self):
-        keyin = six.StringIO()
+        keyin = io.StringIO()
         keyin.write(self.rsa_prv)
         keyin.seek(0)
         key = paramiko.RSAKey.from_private_key(keyin)
@@ -219,3 +220,130 @@ class KeyPairTest(test.NoDBTestCase):
             (private_key, public_key, fingerprint) = crypto.generate_key_pair()
             self.assertEqual(self.rsa_pub, public_key)
             self.assertEqual(self.rsa_fp, fingerprint)
+
+
+class FakePassphrase():
+    """A fake castellan ManagedObject."""
+
+    def __init__(self):
+        self.id = 1
+
+    def get_encoded(self):
+        return b'foo'
+
+
+class VTPMTest(test.NoDBTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.ctxt = nova_context.get_admin_context()
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_ensure_vtpm_secret(self, mock_get_manager):
+        """Check behavior when instance already has an associated secret.
+
+        We should attempt to retrieve the details via castellan.
+        """
+        instance = objects.Instance()
+        instance.system_metadata = {'vtpm_secret_uuid': uuids.vtpm}
+        passphrase = FakePassphrase()
+        mock_get_manager.return_value.get.return_value = passphrase
+
+        s_id, s_encoded = crypto.ensure_vtpm_secret(self.ctxt, instance)
+
+        mock_get_manager.return_value.get.assert_called_once_with(
+            self.ctxt, uuids.vtpm)
+        self.assertEqual(passphrase.id, s_id)
+        self.assertEqual(passphrase.get_encoded(), s_encoded)
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_ensure_vtpm_secret_error(self, mock_get_manager):
+        """Check behavior when we fail to retrieve a secret via castellan.
+
+        We should bubble up the error.
+        """
+        instance = objects.Instance()
+        instance.system_metadata = {'vtpm_secret_uuid': uuids.vtpm}
+        mock_get_manager.return_value.get.side_effect = (
+            castellan_exception.ManagedObjectNotFoundError(uuid=uuids.vtpm))
+
+        self.assertRaises(
+            castellan_exception.ManagedObjectNotFoundError,
+            crypto.ensure_vtpm_secret,
+            self.ctxt, instance)
+
+    @mock.patch('castellan.common.objects.passphrase.Passphrase')
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_ensure_vtpm_secret_no_secret(self, mock_get_manager, mock_pass):
+        """Check behavior when instance has no associated vTPM secret.
+
+        We should create a new one.
+        """
+        instance = objects.Instance()
+        instance.uuid = uuids.instance
+        instance.system_metadata = {}
+        mock_get_manager.return_value.store.return_value = uuids.secret
+        passphrase = FakePassphrase()
+        mock_pass.return_value = passphrase
+
+        with mock.patch.object(instance, 'save') as mock_save:
+            secret_uuid, _ = crypto.ensure_vtpm_secret(self.ctxt, instance)
+
+        mock_pass.assert_called_once_with(mock.ANY, name=mock.ANY)
+        mock_get_manager.return_value.store.assert_called_once_with(
+            self.ctxt, passphrase)
+        mock_save.assert_called_once()
+        self.assertEqual(uuids.secret, secret_uuid)
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_delete_vtpm_secret(self, mock_get_manager):
+        """Check behavior when instance has an associated vTPM secret.
+
+        We should delete it.
+        """
+        instance = objects.Instance()
+        instance.system_metadata = {'vtpm_secret_uuid': uuids.vtpm}
+
+        with mock.patch.object(instance, 'save') as mock_save:
+            crypto.delete_vtpm_secret(self.ctxt, instance)
+
+        self.assertNotIn('vtpm_secret_uuid', instance.system_metadata)
+        mock_save.assert_called_once()
+        mock_get_manager.assert_called_once()
+        mock_get_manager.return_value.delete.assert_called_once_with(
+            self.ctxt, uuids.vtpm,
+        )
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_delete_vtpm_secret_error(self, mock_get_manager):
+        """Check behavior when we fail to retrieve the secret via castellan.
+
+        We should carry on and delete the reference from the instance.
+        """
+        instance = objects.Instance()
+        instance.system_metadata = {'vtpm_secret_uuid': uuids.vtpm}
+        mock_get_manager.return_value.delete.side_effect = (
+            castellan_exception.ManagedObjectNotFoundError(uuid=uuids.vtpm))
+
+        with mock.patch.object(instance, 'save') as mock_save:
+            crypto.delete_vtpm_secret(self.ctxt, instance)
+
+        self.assertNotIn('vtpm_secret_uuid', instance.system_metadata)
+        mock_save.assert_called_once()
+        mock_get_manager.assert_called_once()
+        mock_get_manager.return_value.delete.assert_called_once_with(
+            self.ctxt, uuids.vtpm,
+        )
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_delete_vtpm_secret_no_secret(self, mock_get_manager):
+        """Check behavior when instance has no associated vTPM secret.
+
+        This should be effectively a no-op.
+        """
+        instance = objects.Instance()
+        instance.system_metadata = {}
+
+        crypto.delete_vtpm_secret(self.ctxt, instance)
+
+        mock_get_manager.assert_not_called()

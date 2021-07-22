@@ -39,7 +39,9 @@ from nova.compute import task_states
 from nova.compute import vm_states
 import nova.conf
 from nova.console import type as ctype
+from nova import context as nova_context
 from nova import exception
+from nova import objects
 from nova.objects import diagnostics as diagnostics_obj
 from nova.objects import fields as obj_fields
 from nova.objects import migrate_data
@@ -113,6 +115,7 @@ class FakeDriver(driver.ComputeDriver):
         "supports_multiattach": True,
         "supports_trusted_certs": True,
         "supports_pcpus": False,
+        "supports_accelerators": True,
 
         # Supported image types
         "supports_image_type_raw": True,
@@ -181,7 +184,7 @@ class FakeDriver(driver.ComputeDriver):
 
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
-              block_device_info=None, power_on=True):
+              block_device_info=None, power_on=True, accel_info=None):
 
         if network_info:
             for vif in network_info:
@@ -208,7 +211,8 @@ class FakeDriver(driver.ComputeDriver):
         update_task_state(task_state=task_states.IMAGE_UPLOADING)
 
     def reboot(self, context, instance, network_info, reboot_type,
-               block_device_info=None, bad_volumes_callback=None):
+               block_device_info=None, bad_volumes_callback=None,
+               accel_info=None):
         # If the guest is not on the hypervisor and we're doing a hard reboot
         # then mimic the libvirt driver by spawning the guest.
         if (instance.uuid not in self.instances and
@@ -228,18 +232,19 @@ class FakeDriver(driver.ComputeDriver):
     def set_admin_password(self, instance, new_pass):
         pass
 
-    def inject_file(self, instance, b64_path, b64_contents):
-        pass
-
     def resume_state_on_host_boot(self, context, instance, network_info,
                                   block_device_info=None):
         pass
 
     def rescue(self, context, instance, network_info, image_meta,
-               rescue_password):
+               rescue_password, block_device_info):
         pass
 
-    def unrescue(self, instance, network_info):
+    def unrescue(
+        self,
+        context: nova_context.RequestContext,
+        instance: 'objects.Instance',
+    ):
         self.instances[instance.uuid].state = power_state.RUNNING
 
     def poll_rebooting_instances(self, timeout, instances):
@@ -275,7 +280,7 @@ class FakeDriver(driver.ComputeDriver):
             raise exception.InstanceNotFound(instance_id=instance.uuid)
 
     def power_on(self, context, instance, network_info,
-                 block_device_info=None):
+                 block_device_info=None, accel_info=None):
         if instance.uuid in self.instances:
             self.instances[instance.uuid].state = power_state.RUNNING
         else:
@@ -303,7 +308,7 @@ class FakeDriver(driver.ComputeDriver):
         pass
 
     def destroy(self, context, instance, network_info, block_device_info=None,
-                destroy_disks=True):
+                destroy_disks=True, destroy_secrets=True):
         key = instance.uuid
         if key in self.instances:
             flavor = instance.flavor
@@ -318,7 +323,8 @@ class FakeDriver(driver.ComputeDriver):
                          'inst': self.instances}, instance=instance)
 
     def cleanup(self, context, instance, network_info, block_device_info=None,
-                destroy_disks=True, migrate_data=None, destroy_vifs=True):
+                destroy_disks=True, migrate_data=None, destroy_vifs=True,
+                destroy_secrets=True):
         # cleanup() should not be called when the guest has not been destroyed.
         if instance.uuid in self.instances:
             raise exception.InstanceExists(
@@ -348,7 +354,8 @@ class FakeDriver(driver.ComputeDriver):
             self._mounts[instance_name] = {}
         self._mounts[instance_name][mountpoint] = new_connection_info
 
-    def extend_volume(self, connection_info, instance, requested_size):
+    def extend_volume(self, context, connection_info, instance,
+                      requested_size):
         """Extend the disk attached to the instance."""
         pass
 
@@ -414,18 +421,6 @@ class FakeDriver(driver.ComputeDriver):
             maximum=524288, used=0)
         return diags
 
-    def get_all_bw_counters(self, instances):
-        """Return bandwidth usage counters for each interface on each
-           running VM.
-        """
-        bw = []
-        for instance in instances:
-            bw.append({'uuid': instance.uuid,
-                       'mac_address': 'fa:16:3e:4c:2c:30',
-                       'bw_in': 0,
-                       'bw_out': 0})
-        return bw
-
     def get_all_volume_usage(self, context, compute_host_bdms):
         """Return usage info for volumes attached to vms on
            a given host.
@@ -482,11 +477,6 @@ class FakeDriver(driver.ComputeDriver):
                                 host='fakemksconsole.com',
                                 port=6969)
 
-    def get_console_pool_info(self, console_type):
-        return {'address': '127.0.0.1',
-                'username': 'fakeuser',
-                'password': 'fakepassword'}
-
     def get_available_resource(self, nodename):
         """Updates compute manager resource info on ComputeNode table.
 
@@ -504,7 +494,7 @@ class FakeDriver(driver.ComputeDriver):
                 'sockets': 4,
                 }),
             ])
-        if nodename not in self._nodes:
+        if nodename not in self.get_available_nodes():
             return {}
 
         host_status = self.host_status_base.copy()
@@ -598,8 +588,8 @@ class FakeDriver(driver.ComputeDriver):
 
     def finish_migration(self, context, migration, instance, disk_info,
                          network_info, image_meta, resize_instance,
-                         block_device_info=None, power_on=True):
-        injected_files = admin_password = allocations = None
+                         allocations, block_device_info=None, power_on=True):
+        injected_files = admin_password = None
         # Finish migration is just like spawning the guest on a destination
         # host during resize/cold migrate, so re-use the spawn() fake to
         # claim resources and track the instance on this "hypervisor".
@@ -708,6 +698,10 @@ class SameHostColdMigrateDriver(MediumFakeDriver):
                         supports_migrate_to_same_host=True)
 
 
+class RescueBFVDriver(MediumFakeDriver):
+    capabilities = dict(FakeDriver.capabilities, supports_bfv_rescue=True)
+
+
 class PowerUpdateFakeDriver(SmallFakeDriver):
     # A specific fake driver for the power-update external event testing.
 
@@ -783,7 +777,7 @@ class FakeRescheduleDriver(FakeDriver):
 
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
-              block_device_info=None, power_on=True):
+              block_device_info=None, power_on=True, accel_info=None):
         if not self.rescheduled.get(instance.uuid, False):
             # We only reschedule on the first time something hits spawn().
             self.rescheduled[instance.uuid] = True
@@ -806,7 +800,7 @@ class FakeBuildAbortDriver(FakeDriver):
     """
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
-              block_device_info=None, power_on=True):
+              block_device_info=None, power_on=True, accel_info=None):
         raise exception.BuildAbortException(
             instance_uuid=instance.uuid, reason='FakeBuildAbortDriver')
 
@@ -822,7 +816,7 @@ class FakeUnshelveSpawnFailDriver(FakeDriver):
     """
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
-              block_device_info=None, power_on=True):
+              block_device_info=None, power_on=True, accel_info=None):
         if instance.vm_state == vm_states.SHELVED_OFFLOADED:
             raise exception.VirtualInterfaceCreateException(
                 'FakeUnshelveSpawnFailDriver')

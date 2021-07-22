@@ -14,7 +14,6 @@
 
 import collections
 import datetime
-import six
 
 import mock
 import netaddr
@@ -76,8 +75,10 @@ class _TestInstanceObject(object):
 
         db_inst['info_cache'] = dict(test_instance_info_cache.fake_info_cache,
                                      instance_uuid=db_inst['uuid'])
+        db_inst['image_ref'] = uuids.image_ref
 
         db_inst['system_metadata'] = {
+            'image_id': uuids.image_id,
             'image_name': 'os2-warp',
             'image_min_ram': 100,
             'image_hw_disk_bus': 'ide',
@@ -597,8 +598,11 @@ class _TestInstanceObject(object):
     def test_save_updates_numa_topology(self, mock_fdo, mock_update,
             mock_extra_update):
         fake_obj_numa_topology = objects.InstanceNUMATopology(cells=[
-            objects.InstanceNUMACell(id=0, cpuset=set([0]), memory=128),
-            objects.InstanceNUMACell(id=1, cpuset=set([1]), memory=128)])
+            objects.InstanceNUMACell(id=0, cpuset=set([0]), pcpuset=set(),
+                memory=128),
+            objects.InstanceNUMACell(id=1, cpuset=set([1]), pcpuset=set(),
+                memory=128),
+        ])
         fake_obj_numa_topology.instance_uuid = uuids.instance
         jsonified = fake_obj_numa_topology._to_json()
 
@@ -683,14 +687,31 @@ class _TestInstanceObject(object):
         inst.numa_topology = None
         inst.migration_context = None
         inst.vcpu_model = test_vcpu_model.fake_vcpumodel
-        inst.save()
+        inst.keypairs = objects.KeyPairList(
+            objects=[objects.KeyPair(name='foo')])
+
         json_vcpu_model = jsonutils.dumps(
             test_vcpu_model.fake_vcpumodel.obj_to_primitive())
-        expected_vals = {'numa_topology': None,
-                         'migration_context': None,
-                         'vcpu_model': json_vcpu_model}
+        json_keypairs = jsonutils.dumps(inst.keypairs.obj_to_primitive())
+
+        # Check changed fields in the instance object
+        self.assertIn('keypairs', inst.obj_what_changed())
+        self.assertEqual({'objects'}, inst.keypairs.obj_what_changed())
+
+        inst.save()
+
+        expected_vals = {
+            'numa_topology': None,
+            'migration_context': None,
+            'vcpu_model': json_vcpu_model,
+            'keypairs': json_keypairs,
+        }
         mock_update.assert_called_once_with(self.context, inst.uuid,
                                             expected_vals)
+
+        # Verify that the record of changed fields has been cleared
+        self.assertNotIn('keypairs', inst.obj_what_changed())
+        self.assertEqual(set(), inst.keypairs.obj_what_changed())
 
     @mock.patch.object(db, 'instance_get_by_uuid')
     def test_get_deleted(self, mock_get):
@@ -943,12 +964,12 @@ class _TestInstanceObject(object):
         fake_inst = dict(self.fake_instance)
         mock_get.return_value = fake_inst
 
-        inst = instance.Instance.get_by_uuid(self.context,
-                                             fake_inst['uuid'],
-                                             expected_attrs=['image_meta'])
+        inst = instance.Instance.get_by_uuid(
+            self.context, fake_inst['uuid'], expected_attrs=['image_meta'])
 
         image_meta = inst.image_meta
         self.assertIsInstance(image_meta, objects.ImageMeta)
+        self.assertEqual(uuids.image_ref, image_meta.id)
         self.assertEqual(100, image_meta.min_ram)
         self.assertEqual('ide', image_meta.properties.hw_disk_bus)
         self.assertEqual('ne2k_pci', image_meta.properties.hw_vif_model)
@@ -1190,7 +1211,7 @@ class _TestInstanceObject(object):
         inst.host = None
         ex = self.assertRaises(exception.ObjectActionError,
                                inst.destroy, hard_delete=True)
-        self.assertIn('host changed', six.text_type(ex))
+        self.assertIn('host changed', str(ex))
 
     def test_name_does_not_trigger_lazy_loads(self):
         values = {'user_id': self.context.user_id,
@@ -1419,6 +1440,13 @@ class _TestInstanceObject(object):
                 inst_value = getattr(inst, attr_name)
                 migration_context_value = (
                     getattr(inst.migration_context, 'new_' + attr_name))
+                self.assertIs(inst_value, migration_context_value)
+
+        with inst.mutated_migration_context(revert=True):
+            for attr_name in instance._MIGRATION_CONTEXT_ATTRS:
+                inst_value = getattr(inst, attr_name)
+                migration_context_value = (
+                    getattr(inst.migration_context, 'old_' + attr_name))
                 self.assertIs(inst_value, migration_context_value)
 
         for attr_name in instance._MIGRATION_CONTEXT_ATTRS:

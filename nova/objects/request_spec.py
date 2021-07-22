@@ -19,7 +19,6 @@ import os_resource_classes as orc
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import versionutils
-import six
 
 from nova.db.sqlalchemy import api as db
 from nova.db.sqlalchemy import api_models
@@ -35,7 +34,8 @@ REQUEST_SPEC_OPTIONAL_ATTRS = ['requested_destination',
                                'security_groups',
                                'network_metadata',
                                'requested_resources',
-                               'request_level_params']
+                               'request_level_params',
+                               'requested_networks']
 
 
 @base.NovaObjectRegistry.register
@@ -54,7 +54,8 @@ class RequestSpec(base.NovaObject):
     # Version 1.11: Added is_bfv
     # Version 1.12: Added requested_resources
     # Version 1.13: Added request_level_params
-    VERSION = '1.13'
+    # Version 1.14: Added requested_networks
+    VERSION = '1.14'
 
     fields = {
         'id': fields.IntegerField(),
@@ -109,11 +110,16 @@ class RequestSpec(base.NovaObject):
                                                          default=None),
         # NOTE(efried): This field won't be persisted.
         'request_level_params': fields.ObjectField('RequestLevelParams'),
+        # NOTE(sbauza); This field won't be persisted. For move operations, we
+        # reevaluate it using the network-related instance info_cache.
+        'requested_networks': fields.ObjectField('NetworkRequestList')
     }
 
     def obj_make_compatible(self, primitive, target_version):
         super(RequestSpec, self).obj_make_compatible(primitive, target_version)
         target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 14) and 'requested_networks' in primitive:
+            del primitive['requested_networks']
         if target_version < (1, 13) and 'request_level_params' in primitive:
             del primitive['request_level_params']
         if target_version < (1, 12):
@@ -151,6 +157,10 @@ class RequestSpec(base.NovaObject):
 
         if attrname == 'request_level_params':
             self.request_level_params = RequestLevelParams()
+            return
+
+        if attrname == 'requested_networks':
+            self.requested_networks = objects.NetworkRequestList(objects=[])
             return
 
         # NOTE(sbauza): In case the primitive was not providing that field
@@ -239,7 +249,7 @@ class RequestSpec(base.NovaObject):
             self.pci_requests = pci_requests
 
     def _from_instance_numa_topology(self, numa_topology):
-        if isinstance(numa_topology, six.string_types):
+        if isinstance(numa_topology, str):
             numa_topology = objects.InstanceNUMATopology.obj_from_primitive(
                 jsonutils.loads(numa_topology))
 
@@ -535,12 +545,16 @@ class RequestSpec(base.NovaObject):
         if 'user_id' not in self or self.user_id is None:
             self.user_id = instance.user_id
 
-    def ensure_network_metadata(self, instance):
+    def ensure_network_information(self, instance):
         if not (instance.info_cache and instance.info_cache.network_info):
+            # NOTE(sbauza): On create, the network_info field is null but we
+            # directly set the RequestSpec nested network_requests field, so we
+            # are fine returning here.
             return
 
         physnets = set([])
         tunneled = True
+        network_requests = []
 
         # physical_network and tunneled might not be in the cache for old
         # instances that haven't had their info_cache healed yet
@@ -552,8 +566,21 @@ class RequestSpec(base.NovaObject):
             tunneled |= vif.get('network', {}).get('meta', {}).get(
                 'tunneled', False)
 
+            # We also want to recreate the original NetworkRequests
+            # TODO(sbauza): We miss tag and pci_request_id information that is
+            # not stored in the VIF model to fully provide all fields
+            # FIXME(sbauza): We can't also guess whether the user provided us
+            # a specific IP address to use for create, and which one.
+            nr_args = {
+                'network_id': vif['network']['id'],
+                'port_id': vif['id'],
+            }
+            network_request = objects.NetworkRequest(**nr_args)
+            network_requests.append(network_request)
         self.network_metadata = objects.NetworkMetadata(
             physnets=physnets, tunneled=tunneled)
+        self.requested_networks = objects.NetworkRequestList(
+            objects=network_requests)
 
     @staticmethod
     def _from_db_object(context, spec, db_spec):
@@ -564,7 +591,8 @@ class RequestSpec(base.NovaObject):
             if key in ['id', 'instance_uuid']:
                 setattr(spec, key, db_spec[key])
             elif key in ('requested_destination', 'requested_resources',
-                         'network_metadata', 'request_level_params'):
+                         'network_metadata', 'request_level_params',
+                         'requested_networks'):
                 # Do not override what we already have in the object as this
                 # field is not persisted. If save() is called after
                 # one of these fields is populated, it will reset the field to
@@ -646,14 +674,21 @@ class RequestSpec(base.NovaObject):
                 spec.instance_group.hosts = None
             # NOTE(mriedem): Don't persist these since they are per-request
             for excluded in ('retry', 'requested_destination',
-                             'requested_resources', 'ignore_hosts',
-                             'request_level_params'):
+                             'requested_resources', 'ignore_hosts'):
                 if excluded in spec and getattr(spec, excluded):
                     setattr(spec, excluded, None)
             # NOTE(stephenfin): Don't persist network metadata since we have
             # no need for it after scheduling
             if 'network_metadata' in spec and spec.network_metadata:
                 del spec.network_metadata
+            # NOTE(sbauza): Don't persist requested_networks since we have
+            # no need for it after scheduling
+            if 'requested_networks' in spec and spec.requested_networks:
+                del spec.requested_networks
+            # NOTE(gibi): Don't persist requested_networks since we have
+            # no need for it after scheduling
+            if 'request_level_params' in spec and spec.request_level_params:
+                del spec.request_level_params
 
             db_updates = {'spec': jsonutils.dumps(spec.obj_to_primitive())}
             if 'instance_uuid' in updates:
@@ -1204,6 +1239,51 @@ class RequestGroup(base.NovaEphemeralObject):
         for rclass in list(self.resources):
             if self.resources[rclass] == 0:
                 self.resources.pop(rclass)
+
+    def to_queryparams(self):
+        """Convert the RequestGroup to placement allocation candidates query
+        parameters.
+        """
+
+        # NOTE(efried): The sorting herein is not necessary for the API; it is
+        # to make testing easier and logging/debugging predictable.
+        res = self.resources
+        required_traits = self.required_traits
+        forbidden_traits = self.forbidden_traits
+        aggregates = self.aggregates
+        in_tree = self.in_tree
+        forbidden_aggregates = self.forbidden_aggregates
+        suffix = self.requester_id or ''
+
+        resource_query = ",".join(
+            sorted("%s:%s" % (rc, amount)
+                   for (rc, amount) in res.items()))
+        qs_params = [('resources%s' % suffix, resource_query)]
+
+        # Assemble required and forbidden traits, allowing for either/both
+        # to be empty.
+        required_val = ','.join(
+            sorted(required_traits) +
+            ['!%s' % ft for ft in sorted(forbidden_traits)])
+        if required_val:
+            qs_params.append(('required%s' % suffix, required_val))
+        if aggregates:
+            aggs = []
+            # member_of$S is a list of lists.  We need a tuple of
+            # ('member_of$S', 'in:uuid,uuid,...') for each inner list.
+            for agglist in aggregates:
+                aggs.append(('member_of%s' % suffix,
+                             'in:' + ','.join(sorted(agglist))))
+            qs_params.extend(sorted(aggs))
+        if in_tree:
+            qs_params.append(('in_tree%s' % suffix, in_tree))
+        if forbidden_aggregates:
+            # member_of$S is a list of aggregate uuids. We need a
+            # tuple of ('member_of$S, '!in:uuid,uuid,...').
+            forbidden_aggs = '!in:' + ','.join(
+                sorted(forbidden_aggregates))
+            qs_params.append(('member_of%s' % suffix, forbidden_aggs))
+        return qs_params
 
 
 @base.NovaObjectRegistry.register

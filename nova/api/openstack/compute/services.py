@@ -16,7 +16,6 @@ from keystoneauth1 import exceptions as ks_exc
 from oslo_log import log as logging
 from oslo_utils import strutils
 from oslo_utils import uuidutils
-import six
 import webob.exc
 
 from nova.api.openstack import api_version_request
@@ -190,6 +189,9 @@ class ServiceController(wsgi.Controller):
         host = body['host']
         binary = body['binary']
 
+        if binary == 'nova-compute' and forced_down is False:
+            self._check_for_evacuations(context, host)
+
         ret_value = {'service': {'host': host,
                                  'binary': binary,
                                  'forced_down': forced_down}}
@@ -226,12 +228,31 @@ class ServiceController(wsgi.Controller):
 
         return action(body, context)
 
+    def _check_for_evacuations(self, context, hostname):
+        # NOTE(lyarwood): When forcing a compute service back up ensure that
+        # there are no evacuation migration records against this host as the
+        # source that are marked as done, suggesting that the compute service
+        # hasn't restarted and moved such records to a completed state.
+        filters = {
+            'source_compute': hostname,
+            'status': 'done',
+            'migration_type': objects.fields.MigrationType.EVACUATION,
+        }
+        if any(objects.MigrationList.get_by_filters(context, filters)):
+            msg = _("Unable to force up host %(host)s as `done` evacuation "
+                    "migration records remain associated with the host. "
+                    "Ensure the compute service has been restarted, "
+                    "allowing these records to move to `completed` before "
+                    "retrying this request.") % {'host': hostname}
+            # TODO(lyarwood): Move to 409 HTTPConflict under a new microversion
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
     @wsgi.response(204)
     @wsgi.expected_errors((400, 404, 409))
     def delete(self, req, id):
         """Deletes the specified service."""
         context = req.environ['nova.context']
-        context.can(services_policies.BASE_POLICY_NAME % 'delete')
+        context.can(services_policies.BASE_POLICY_NAME % 'delete', target={})
 
         if api_version_request.is_supported(
                 req, min_version=UUID_FOR_ID_MIN_VERSION):
@@ -290,7 +311,7 @@ class ServiceController(wsgi.Controller):
                         LOG.error(
                             "Failed to delete compute node resource provider "
                             "for compute node %s: %s",
-                            compute_node.uuid, six.text_type(e))
+                            compute_node.uuid, str(e))
                 # remove the host_mapping of this host.
                 try:
                     hm = objects.HostMapping.get_by_host(context, service.host)
@@ -347,7 +368,7 @@ class ServiceController(wsgi.Controller):
         name
         """
         context = req.environ['nova.context']
-        context.can(services_policies.BASE_POLICY_NAME % 'list')
+        context.can(services_policies.BASE_POLICY_NAME % 'list', target={})
         if api_version_request.is_supported(req, min_version='2.11'):
             _services = self._get_services_list(req, ['forced_down'])
         else:
@@ -368,7 +389,7 @@ class ServiceController(wsgi.Controller):
         PUT /os-services/disable.
         """
         context = req.environ['nova.context']
-        context.can(services_policies.BASE_POLICY_NAME % 'update')
+        context.can(services_policies.BASE_POLICY_NAME % 'update', target={})
         if api_version_request.is_supported(req, min_version='2.11'):
             actions = self.actions.copy()
             actions["force-down"] = self._forced_down
@@ -380,7 +401,7 @@ class ServiceController(wsgi.Controller):
     @wsgi.Controller.api_version(UUID_FOR_ID_MIN_VERSION)  # noqa F811
     @wsgi.expected_errors((400, 404))
     @validation.schema(services.service_update_v2_53, UUID_FOR_ID_MIN_VERSION)
-    def update(self, req, id, body):
+    def update(self, req, id, body):   # noqa
         """Perform service update
 
         Starting with microversion 2.53, the service uuid is passed in on the
@@ -395,7 +416,7 @@ class ServiceController(wsgi.Controller):
 
         # Validate the request context against the policy.
         context = req.environ['nova.context']
-        context.can(services_policies.BASE_POLICY_NAME % 'update')
+        context.can(services_policies.BASE_POLICY_NAME % 'update', target={})
 
         # Get the service by uuid.
         try:
@@ -447,6 +468,8 @@ class ServiceController(wsgi.Controller):
         if 'forced_down' in body:
             service.forced_down = strutils.bool_from_string(
                 body['forced_down'], strict=True)
+            if service.forced_down is False:
+                self._check_for_evacuations(context, service.host)
 
         # Check to see if anything was actually updated since the schema does
         # not define any required fields.

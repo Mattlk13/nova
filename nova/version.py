@@ -14,11 +14,12 @@
 
 import pbr.version
 
-from nova.i18n import _LE
-
 NOVA_VENDOR = "OpenStack Foundation"
 NOVA_PRODUCT = "OpenStack Nova"
 NOVA_PACKAGE = None  # OS distro package version suffix
+NOVA_SUPPORT = (
+    "Please report this at http://bugs.launchpad.net/nova/ "
+    "and attach the Nova API log if possible.")
 
 loaded = False
 version_info = pbr.version.VersionInfo('nova')
@@ -29,13 +30,13 @@ def _load_config():
     # Don't load in global context, since we can't assume
     # these modules are accessible when distutils uses
     # this module
-    from six.moves import configparser
+    import configparser
 
     from oslo_config import cfg
 
     from oslo_log import log as logging
 
-    global loaded, NOVA_VENDOR, NOVA_PRODUCT, NOVA_PACKAGE
+    global loaded, NOVA_VENDOR, NOVA_PRODUCT, NOVA_PACKAGE, NOVA_SUPPORT
     if loaded:
         return
 
@@ -57,9 +58,12 @@ def _load_config():
 
         if cfg.has_option("Nova", "package"):
             NOVA_PACKAGE = cfg.get("Nova", "package")
+
+        if cfg.has_option("Nova", "support"):
+            NOVA_SUPPORT = cfg.get("Nova", "support")
     except Exception as ex:
         LOG = logging.getLogger(__name__)
-        LOG.error(_LE("Failed to load %(cfgfile)s: %(ex)s"),
+        LOG.error("Failed to load %(cfgfile)s: %(ex)s",
                   {'cfgfile': cfgfile, 'ex': ex})
 
 
@@ -86,3 +90,9 @@ def version_string_with_package():
         return version_info.version_string()
     else:
         return "%s-%s" % (version_info.version_string(), package_string())
+
+
+def support_string():
+    _load_config()
+
+    return NOVA_SUPPORT

@@ -18,13 +18,10 @@ import fixtures
 import io
 import mock
 
-import nova
 from nova import test
 from nova.tests import fixtures as nova_fixtures
+from nova.tests.fixtures import libvirt as fakelibvirt
 from nova.tests.functional import fixtures as func_fixtures
-from nova.tests.unit import cast_as_call
-from nova.tests.unit import policy_fixture
-from nova.tests.unit.virt.libvirt import fakelibvirt
 from nova.virt.libvirt import guest as libvirt_guest
 
 
@@ -33,8 +30,9 @@ class TestSerialConsoleLiveMigrate(test.TestCase):
 
     def setUp(self):
         super(TestSerialConsoleLiveMigrate, self).setUp()
-        self.useFixture(policy_fixture.RealPolicyFixture())
+        self.useFixture(nova_fixtures.RealPolicyFixture())
         self.useFixture(nova_fixtures.NeutronFixture(self))
+        self.useFixture(nova_fixtures.GlanceFixture(self))
         self.useFixture(func_fixtures.PlacementFixture())
         api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
             api_version='v2.1'))
@@ -48,31 +46,26 @@ class TestSerialConsoleLiveMigrate(test.TestCase):
         self.useFixture(fixtures.MonkeyPatch(
            'nova.virt.libvirt.guest.libvirt',
            fakelibvirt))
-        self.useFixture(fakelibvirt.FakeLibvirtFixture())
+        self.useFixture(nova_fixtures.LibvirtFixture())
 
         self.admin_api = api_fixture.admin_api
         self.api = api_fixture.api
-
-        # the image fake backend needed for image discovery
-        nova.tests.unit.image.fake.stub_out_image_service(self)
-        nova.tests.unit.fake_network.set_stub_network_methods(self)
 
         self.flags(compute_driver='libvirt.LibvirtDriver')
         self.flags(enabled=True, group="serial_console")
         self.flags(enabled=False, group="vnc")
         self.flags(enabled=False, group="spice")
-        self.flags(use_usb_tablet=False, group="libvirt")
 
         self.start_service('conductor')
         self.start_service('scheduler')
         self.compute = self.start_service('compute', host='test_compute1')
 
-        self.useFixture(cast_as_call.CastAsCall(self))
-        self.addCleanup(nova.tests.unit.image.fake.FakeImageService_reset)
+        self.useFixture(nova_fixtures.CastAsCallFixture(self))
 
         self.image_id = self.api.get_images()[0]['id']
         self.flavor_id = self.api.get_flavors()[0]['id']
 
+    @mock.patch.object(fakelibvirt.Domain, 'undefine')
     @mock.patch('nova.virt.libvirt.LibvirtDriver.get_volume_connector')
     @mock.patch('nova.virt.libvirt.guest.Guest.get_job_info')
     @mock.patch.object(fakelibvirt.Domain, 'migrateToURI3')
@@ -81,7 +74,8 @@ class TestSerialConsoleLiveMigrate(test.TestCase):
     @mock.patch('os.path.getsize', return_value=1024)
     @mock.patch('nova.conductor.tasks.live_migrate.LiveMigrationTask.'
                 '_check_destination_is_not_source', return_value=False)
-    @mock.patch('nova.virt.libvirt.LibvirtDriver._create_image')
+    @mock.patch('nova.virt.libvirt.LibvirtDriver._create_image',
+                return_value=(False, False))
     @mock.patch('nova.virt.libvirt.LibvirtDriver._get_local_gb_info',
                 return_value={'total': 128,
                               'used': 44,
@@ -100,7 +94,8 @@ class TestSerialConsoleLiveMigrate(test.TestCase):
                                          mock_host_get_connection,
                                          mock_migrate_to_uri,
                                          mock_get_job_info,
-                                         mock_get_volume_connector):
+                                         mock_get_volume_connector,
+                                         mock_undefine):
         """Regression test for bug #1595962.
 
         If the graphical consoles VNC and SPICE are disabled, the
@@ -120,6 +115,12 @@ class TestSerialConsoleLiveMigrate(test.TestCase):
                                 version=fakelibvirt.FAKE_LIBVIRT_VERSION,
                                 hv_version=fakelibvirt.FAKE_QEMU_VERSION)
         mock_host_get_connection.return_value = fake_connection
+        # We invoke cleanup on source host first which will call undefine
+        # method currently. Since in functional test we make all compute
+        # services linked to the same connection, we need to mock the undefine
+        # method to avoid triggering 'Domain not found' error in subsequent
+        # rpc call post_live_migration_at_destination.
+        mock_undefine.return_value = True
 
         server_attr = dict(name='server1',
                            imageRef=self.image_id,

@@ -135,8 +135,7 @@ system or find a system with this support.
    and enable the VT option.
 
 If KVM acceleration is not supported, configure Compute to use a different
-hypervisor, such as ``QEMU`` or ``Xen``. See :ref:`compute_qemu` or
-:ref:`compute_xen_api` for details.
+hypervisor, such as :ref:`QEMU <compute_qemu>`.
 
 These procedures help you load the kernel modules for Intel-based and AMD-based
 processors if they do not load automatically during KVM installation.
@@ -260,154 +259,36 @@ Local `LVM volumes
 used. Set the :oslo.config:option:`libvirt.images_volume_group` configuration
 option to the name of the LVM group you have created.
 
-Specify the CPU model of KVM guests
+Direct download of images from Ceph
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The Compute service enables you to control the guest CPU model that is exposed
-to KVM virtual machines. Use cases include:
+When the Glance image service is set up with the Ceph backend and Nova is using
+a local ephemeral store (``[libvirt]/images_type!=rbd``), it is possible to
+configure Nova to download images directly into the local compute image cache.
 
-* To maximize performance of virtual machines by exposing new host CPU features
-  to the guest
+With the following configuration, images are downloaded using the RBD export
+command instead of using the Glance HTTP API. In some situations, especially
+for very large images, this could be substantially faster and can improve the
+boot times of instances.
 
-* To ensure a consistent default CPU across all machines, removing reliance of
-  variable QEMU defaults
-
-In libvirt, the CPU is specified by providing a base CPU model name (which is a
-shorthand for a set of feature flags), a set of additional feature flags, and
-the topology (sockets/cores/threads). The libvirt KVM driver provides a number
-of standard CPU model names. These models are defined in the
-``/usr/share/libvirt/cpu_map.xml`` file for libvirt prior to version 4.7.0 or
-``/usr/share/libvirt/cpu_map/*.xml`` files thereafter. Make a check to
-determine which models are supported by your local installation.
-
-Two Compute configuration options in the :oslo.config:group:`libvirt` group
-of ``nova.conf`` define which type of CPU model is exposed to the hypervisor
-when using KVM: :oslo.config:option:`libvirt.cpu_mode` and
-:oslo.config:option:`libvirt.cpu_models`.
-
-The :oslo.config:option:`libvirt.cpu_mode` option can take one of the following
-values: ``none``, ``host-passthrough``, ``host-model``, and ``custom``.
-
-See `Effective Virtual CPU configuration in Nova`_ for a recorded presentation
-about this topic.
-
-.. _Effective Virtual CPU configuration in Nova: https://www.openstack.org/videos/summits/berlin-2018/effective-virtual-cpu-configuration-in-nova
-
-Host model (default for KVM & QEMU)
------------------------------------
-
-If your ``nova.conf`` file contains ``cpu_mode=host-model``, libvirt identifies
-the CPU model in ``/usr/share/libvirt/cpu_map.xml`` for version prior to 4.7.0
-or ``/usr/share/libvirt/cpu_map/*.xml`` for version 4.7.0 and higher that most
-closely matches the host, and requests additional CPU flags to complete the
-match. This configuration provides the maximum functionality and performance
-and maintains good reliability.
-
-With regard to enabling and facilitating live migration between
-compute nodes, you should assess whether ``host-model`` is suitable
-for your compute architecture. In general, using ``host-model`` is a
-safe choice if your compute node CPUs are largely identical. However,
-if your compute nodes span multiple processor generations, you may be
-better advised to select a ``custom`` CPU model.
-
-Host pass through
------------------
-
-If your ``nova.conf`` file contains ``cpu_mode=host-passthrough``, libvirt
-tells KVM to pass through the host CPU with no modifications.  The difference
-to host-model, instead of just matching feature flags, every last detail of the
-host CPU is matched. This gives the best performance, and can be important to
-some apps which check low level CPU details, but it comes at a cost with
-respect to migration.
-
-In ``host-passthrough`` mode, the guest can only be live-migrated to a
-target host that matches the source host extremely closely. This
-definitely includes the physical CPU model and running microcode, and
-may even include the running kernel. Use this mode only if
-
-* your compute nodes have a very large degree of homogeneity
-  (i.e. substantially all of your compute nodes use the exact same CPU
-  generation and model), and you make sure to only live-migrate
-  between hosts with exactly matching kernel versions, *or*
-
-* you decide, for some reason and against established best practices,
-  that your compute infrastructure should not support any live
-  migration at all.
-
-Custom
-------
-
-If :file:`nova.conf` contains :oslo.config:option:`libvirt.cpu_mode`\ =custom,
-you can explicitly specify an ordered list of supported named models using
-the :oslo.config:option:`libvirt.cpu_models` configuration option. It is
-expected that the list is ordered so that the more common and less advanced cpu
-models are listed earlier.
-
-An end user can specify required CPU features through traits. When specified,
-the libvirt driver will select the first cpu model in the
-:oslo.config:option:`libvirt.cpu_models` list that can provide the requested
-feature traits. If no CPU feature traits are specified then the instance will
-be configured with the first cpu model in the list.
-
-For example, if specifying CPU features ``avx`` and ``avx2`` as follows:
-
-.. code-block:: console
-
-    $ openstack flavor set FLAVOR_ID --property trait:HW_CPU_X86_AVX=required \
-                                     --property trait:HW_CPU_X86_AVX2=required
-
-and :oslo.config:option:`libvirt.cpu_models` is configured like this:
+On the Glance API node in ``glance-api.conf``:
 
 .. code-block:: ini
 
-    [libvirt]
-    cpu_mode = custom
-    cpu_models = Penryn,IvyBridge,Haswell,Broadwell,Skylake-Client
+   [DEFAULT]
+   show_image_direct_url=true
 
-Then ``Haswell``, the first cpu model supporting both ``avx`` and ``avx2``,
-will be chosen by libvirt.
-
-In selecting the ``custom`` mode, along with a
-:oslo.config:option:`libvirt.cpu_models` that matches the oldest of your compute
-node CPUs, you can ensure that live migration between compute nodes will always
-be possible. However, you should ensure that the
-:oslo.config:option:`libvirt.cpu_models` you select passes the correct CPU
-feature flags to the guest.
-
-If you need to further tweak your CPU feature flags in the ``custom``
-mode, see `Set CPU feature flags`_.
-
-.. note::
-
-  If :oslo.config:option:`libvirt.cpu_models` is configured,
-  the CPU models in the list needs to be compatible with the host CPU. Also, if
-  :oslo.config:option:`libvirt.cpu_model_extra_flags` is configured, all flags
-  needs to be compatible with the host CPU. If incompatible CPU models or flags
-  are specified, nova service will raise an error and fail to start.
-
-
-None (default for all libvirt-driven hypervisors other than KVM & QEMU)
------------------------------------------------------------------------
-
-If your ``nova.conf`` file contains ``cpu_mode=none``, libvirt does not specify
-a CPU model. Instead, the hypervisor chooses the default model.
-
-Set CPU feature flags
-~~~~~~~~~~~~~~~~~~~~~
-
-Regardless of whether your selected :oslo.config:option:`libvirt.cpu_mode` is
-``host-passthrough``, ``host-model``, or ``custom``, it is also
-possible to selectively enable additional feature flags. Suppose your
-selected ``custom`` CPU model is ``IvyBridge``, which normally does
-not enable the ``pcid`` feature flag --- but you do want to pass
-``pcid`` into your guest instances. In that case, you would set:
+On the Nova compute node in nova.conf:
 
 .. code-block:: ini
 
-   [libvirt]
-   cpu_mode = custom
-   cpu_models = IvyBridge
-   cpu_model_extra_flags = pcid
+   [glance]
+   enable_rbd_download=true
+   rbd_user=glance
+   rbd_pool=images
+   rbd_ceph_conf=/etc/ceph/ceph.conf
+   rbd_connect_timeout=5
+
 
 Nested guest support
 ~~~~~~~~~~~~~~~~~~~~
@@ -417,8 +298,8 @@ your Nova instances to themselves run hardware-accelerated virtual
 machines with KVM. Doing so requires a module parameter on
 your KVM kernel module, and corresponding ``nova.conf`` settings.
 
-Nested guest support in the KVM kernel module
----------------------------------------------
+Host configuration
+------------------
 
 To enable nested KVM guests, your compute node must load the
 ``kvm_intel`` or ``kvm_amd`` module with ``nested=1``. You can enable
@@ -433,14 +314,14 @@ content:
 
 A reboot may be required for the change to become effective.
 
-Nested guest support in ``nova.conf``
--------------------------------------
+Nova configuration
+------------------
 
 To support nested guests, you must set your
 :oslo.config:option:`libvirt.cpu_mode` configuration to one of the following
 options:
 
-Host pass through
+Host passthrough (``host-passthrough``)
   In this mode, nested virtualization is automatically enabled once
   the KVM kernel module is loaded with nesting support.
 
@@ -449,10 +330,11 @@ Host pass through
      [libvirt]
      cpu_mode = host-passthrough
 
-  However, do consider the other implications that `Host pass
-  through`_ mode has on compute functionality.
+  However, do consider the other implications that
+  :doc:`host passthrough </admin/cpu-models>` mode has on compute
+  functionality.
 
-Host model
+Host model (``host-model``)
   In this mode, nested virtualization is automatically enabled once
   the KVM kernel module is loaded with nesting support, **if** the
   matching CPU model exposes the ``vmx`` feature flag to guests by
@@ -466,10 +348,10 @@ Host model
      cpu_mode = host-model
      cpu_model_extra_flags = vmx
 
-  Again, consider the other implications that apply to the `Host model
-  (default for KVM & Qemu)`_ mode.
+  Again, consider the other implications that apply to the
+  :doc:`host model </admin/cpu-models>` mode.
 
-Custom
+Custom (``custom``)
   In custom mode, the same considerations apply as in host-model mode,
   but you may *additionally* want to ensure that libvirt passes not only
   the ``vmx``, but also the ``pcid`` flag to its guests:
@@ -481,8 +363,10 @@ Custom
      cpu_models = IvyBridge
      cpu_model_extra_flags = vmx,pcid
 
-Nested guest support limitations
---------------------------------
+More information on CPU models can be found in :doc:`/admin/cpu-models`.
+
+Limitations
+-----------
 
 When enabling nested guests, you should be aware of (and inform your
 users about) certain limitations that are currently inherent to nested
@@ -495,271 +379,6 @@ virtualization will, *while nested guests are running*,
 See `the KVM documentation
 <https://www.linux-kvm.org/page/Nested_Guests#Limitations>`_ for more
 information on these limitations.
-
-.. _amd-sev:
-
-AMD SEV (Secure Encrypted Virtualization)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-`Secure Encrypted Virtualization (SEV)`__ is a technology from AMD which
-enables the memory for a VM to be encrypted with a key unique to the VM.
-SEV is particularly applicable to cloud computing since it can reduce the
-amount of trust VMs need to place in the hypervisor and administrator of
-their host system.
-
-__ https://developer.amd.com/sev/
-
-Nova supports SEV from the Train release onwards.
-
-Requirements for SEV
---------------------
-
-First the operator will need to ensure the following prerequisites are met:
-
-- At least one of the Nova compute hosts must be AMD hardware capable
-  of supporting SEV.  It is entirely possible for the compute plane to
-  be a mix of hardware which can and cannot support SEV, although as
-  per the section on `Permanent limitations`_ below, the maximum
-  number of simultaneously running guests with SEV will be limited by
-  the quantity and quality of SEV-capable hardware available.
-
-- An appropriately configured software stack on those compute hosts,
-  so that the various layers are all SEV ready:
-
-  - kernel >= 4.16
-  - QEMU >= 2.12
-  - libvirt >= 4.5
-  - ovmf >= commit 75b7aa9528bd 2018-07-06
-
-.. _deploying-sev-capable-infrastructure:
-
-Deploying SEV-capable infrastructure
-------------------------------------
-
-In order for users to be able to use SEV, the operator will need to
-perform the following steps:
-
-- Ensure that sufficient memory is reserved on the SEV compute hosts
-  for host-level services to function correctly at all times.  This is
-  particularly important when hosting SEV-enabled guests, since they
-  pin pages in RAM, preventing any memory overcommit which may be in
-  normal operation on other compute hosts.
-
-  It is `recommended`__ to achieve this by configuring an ``rlimit`` at
-  the ``/machine.slice`` top-level ``cgroup`` on the host, with all VMs
-  placed inside that.  (For extreme detail, see `this discussion on the
-  spec`__.)
-
-  __ http://specs.openstack.org/openstack/nova-specs/specs/train/approved/amd-sev-libvirt-support.html#memory-reservation-solutions
-  __ https://review.opendev.org/#/c/641994/2/specs/train/approved/amd-sev-libvirt-support.rst@167
-
-  An alternative approach is to configure the
-  :oslo.config:option:`reserved_host_memory_mb` option in the
-  ``[DEFAULT]`` section of :file:`nova.conf`, based on the expected
-  maximum number of SEV guests simultaneously running on the host, and
-  the details provided in `an earlier version of the AMD SEV spec`__
-  regarding memory region sizes, which cover how to calculate it
-  correctly.
-
-  __ https://specs.openstack.org/openstack/nova-specs/specs/stein/approved/amd-sev-libvirt-support.html#proposed-change
-
-  See `the Memory Locking and Accounting section of the AMD SEV spec`__
-  and `previous discussion for further details`__.
-
-  __ http://specs.openstack.org/openstack/nova-specs/specs/train/approved/amd-sev-libvirt-support.html#memory-locking-and-accounting
-  __ https://review.opendev.org/#/c/641994/2/specs/train/approved/amd-sev-libvirt-support.rst@167
-
-- A cloud administrator will need to define one or more SEV-enabled
-  flavors :ref:`as described in the user guide
-  <extra-specs-memory-encryption>`, unless it is sufficient for users
-  to define SEV-enabled images.
-
-Additionally the cloud operator should consider the following optional
-steps:
-
-.. _num_memory_encrypted_guests:
-
-- Configure the :oslo.config:option:`libvirt.num_memory_encrypted_guests`
-  option in :file:`nova.conf` to represent the number of guests an SEV
-  compute node can host concurrently with memory encrypted at the
-  hardware level.  For example:
-
-  .. code-block:: ini
-
-     [libvirt]
-     num_memory_encrypted_guests = 15
-
-  This option exists because on AMD SEV-capable hardware, the memory
-  controller has a fixed number of slots for holding encryption keys,
-  one per guest.  For example, at the time of writing, earlier
-  generations of hardware only have 15 slots, thereby limiting the
-  number of SEV guests which can be run concurrently to 15.  Nova
-  needs to track how many slots are available and used in order to
-  avoid attempting to exceed that limit in the hardware.
-
-  At the time of writing (September 2019), work is in progress to
-  allow QEMU and libvirt to expose the number of slots available on
-  SEV hardware; however until this is finished and released, it will
-  not be possible for Nova to programmatically detect the correct
-  value.
-
-  So this configuration option serves as a stop-gap, allowing the
-  cloud operator the option of providing this value manually.  It may
-  later be demoted to a fallback value for cases where the limit
-  cannot be detected programmatically, or even removed altogether when
-  Nova's minimum QEMU version guarantees that it can always be
-  detected.
-
-  .. note::
-
-     When deciding whether to use the default of ``None`` or manually
-     impose a limit, operators should carefully weigh the benefits
-     vs. the risk.  The benefits of using the default are a) immediate
-     convenience since nothing needs to be done now, and b) convenience
-     later when upgrading compute hosts to future versions of Nova,
-     since again nothing will need to be done for the correct limit to
-     be automatically imposed.  However the risk is that until
-     auto-detection is implemented, users may be able to attempt to
-     launch guests with encrypted memory on hosts which have already
-     reached the maximum number of guests simultaneously running with
-     encrypted memory.  This risk may be mitigated by other limitations
-     which operators can impose, for example if the smallest RAM
-     footprint of any flavor imposes a maximum number of simultaneously
-     running guests which is less than or equal to the SEV limit.
-
-- Configure :oslo.config:option:`libvirt.hw_machine_type` on all
-  SEV-capable compute hosts to include ``x86_64=q35``, so that all
-  x86_64 images use the ``q35`` machine type by default.  (Currently
-  Nova defaults to the ``pc`` machine type for the ``x86_64``
-  architecture, although `it is expected that this will change in the
-  future`__.)
-
-  Changing the default from ``pc`` to ``q35`` makes the creation and
-  configuration of images by users more convenient by removing the
-  need for the ``hw_machine_type`` property to be set to ``q35`` on
-  every image for which SEV booting is desired.
-
-  .. caution::
-
-     Consider carefully whether to set this option.  It is
-     particularly important since a limitation of the implementation
-     prevents the user from receiving an error message with a helpful
-     explanation if they try to boot an SEV guest when neither this
-     configuration option nor the image property are set to select
-     a ``q35`` machine type.
-
-     On the other hand, setting it to ``q35`` may have other
-     undesirable side-effects on other images which were expecting to
-     be booted with ``pc``, so it is suggested to set it on a single
-     compute node or aggregate, and perform careful testing of typical
-     images before rolling out the setting to all SEV-capable compute
-     hosts.
-
-  __ https://bugs.launchpad.net/nova/+bug/1780138
-
-Launching SEV instances
------------------------
-
-Once an operator has covered the above steps, users can launch SEV
-instances either by requesting a flavor for which the operator set the
-``hw:mem_encryption`` extra spec to ``True``, or by using an image
-with the ``hw_mem_encryption`` property set to ``True``.
-
-These do not inherently cause a preference for SEV-capable hardware,
-but for now SEV is the only way of fulfilling the requirement for
-memory encryption.  However in the future, support for other
-hardware-level guest memory encryption technology such as Intel MKTME
-may be added.  If a guest specifically needs to be booted using SEV
-rather than any other memory encryption technology, it is possible to
-ensure this by adding ``trait:HW_CPU_X86_AMD_SEV=required`` to the
-flavor extra specs or image properties.
-
-In all cases, SEV instances can only be booted from images which have
-the ``hw_firmware_type`` property set to ``uefi``, and only when the
-machine type is set to ``q35``.  This can be set per image by setting
-the image property ``hw_machine_type=q35``, or per compute node by
-the operator via :oslo.config:option:`libvirt.hw_machine_type` as
-explained above.
-
-Impermanent limitations
------------------------
-
-The following limitations may be removed in the future as the
-hardware, firmware, and various layers of software receive new
-features:
-
-- SEV-encrypted VMs cannot yet be live-migrated or suspended,
-  therefore they will need to be fully shut down before migrating off
-  an SEV host, e.g. if maintenance is required on the host.
-
-- SEV-encrypted VMs cannot contain directly accessible host devices
-  (PCI passthrough).  So for example mdev vGPU support will not
-  currently work.  However technologies based on `vhost-user`__ should
-  work fine.
-
-  __ https://wiki.qemu.org/Features/VirtioVhostUser
-
-- The boot disk of SEV-encrypted VMs can only be ``virtio``.
-  (``virtio-blk`` is typically the default for libvirt disks on x86,
-  but can also be explicitly set e.g. via the image property
-  ``hw_disk_bus=virtio``). Valid alternatives for the disk
-  include using ``hw_disk_bus=scsi`` with
-  ``hw_scsi_model=virtio-scsi`` , or ``hw_disk_bus=sata``.
-
-- QEMU and libvirt cannot yet expose the number of slots available for
-  encrypted guests in the memory controller on SEV hardware.  Until
-  this is implemented, it is not possible for Nova to programmatically
-  detect the correct value.  As a short-term workaround, operators can
-  optionally manually specify the upper limit of SEV guests for each
-  compute host, via the new
-  :oslo.config:option:`libvirt.num_memory_encrypted_guests`
-  configuration option :ref:`described above
-  <num_memory_encrypted_guests>`.
-
-Permanent limitations
----------------------
-
-The following limitations are expected long-term:
-
-- The number of SEV guests allowed to run concurrently will always be
-  limited.  `On the first generation of EPYC machines it will be
-  limited to 15 guests`__; however this limit becomes much higher with
-  the second generation (Rome).
-
-  __ https://www.redhat.com/archives/libvir-list/2019-January/msg00652.html
-
-- The operating system running in an encrypted virtual machine must
-  contain SEV support.
-
-Non-limitations
----------------
-
-For the sake of eliminating any doubt, the following actions are *not*
-expected to be limited when SEV encryption is used:
-
-- Cold migration or shelve, since they power off the VM before the
-  operation at which point there is no encrypted memory (although this
-  could change since there is work underway to add support for `PMEM
-  <https://pmem.io/>`_)
-
-- Snapshot, since it only snapshots the disk
-
-- ``nova evacuate`` (despite the name, more akin to resurrection than
-  evacuation), since this is only initiated when the VM is no longer
-  running
-
-- Attaching any volumes, as long as they do not require attaching via
-  an IDE bus
-
-- Use of spice / VNC / serial / RDP consoles
-
-- `VM guest virtual NUMA (a.k.a. vNUMA)
-  <https://www.suse.com/documentation/sles-12/singlehtml/article_vt_best_practices/article_vt_best_practices.html#sec.vt.best.perf.numa.vmguest>`_
-
-For further technical details, see `the nova spec for SEV support`__.
-
-__ http://specs.openstack.org/openstack/nova-specs/specs/train/approved/amd-sev-libvirt-support.html
-
 
 Guest agent support
 ~~~~~~~~~~~~~~~~~~~

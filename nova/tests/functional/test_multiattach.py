@@ -25,15 +25,12 @@ class TestMultiattachVolumes(integrated_helpers._IntegratedTestBase):
     # These are all used in _IntegratedTestBase.
     api_major_version = 'v2.1'
     microversion = '2.60'
-    _image_ref_parameter = 'imageRef'
-    _flavor_ref_parameter = 'flavorRef'
 
     def setUp(self):
         # Everything has been upgraded to the latest code to support
         # multiattach.
         self.useFixture(nova_fixtures.AllServicesCurrent())
         super(TestMultiattachVolumes, self).setUp()
-        self.useFixture(nova_fixtures.CinderFixture(self))
 
     def test_boot_from_volume_and_attach_to_second_server(self):
         """This scenario creates a server from the multiattach volume, waits

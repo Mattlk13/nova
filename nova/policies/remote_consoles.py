@@ -23,10 +23,18 @@ BASE_POLICY_NAME = 'os_compute_api:os-remote-consoles'
 
 remote_consoles_policies = [
     policy.DocumentedRuleDefault(
-        BASE_POLICY_NAME,
-        base.RULE_ADMIN_OR_OWNER,
-        "Generate a URL to access remove server console",
-        [
+        name=BASE_POLICY_NAME,
+        check_str=base.PROJECT_MEMBER_OR_SYSTEM_ADMIN,
+        description="""Generate a URL to access remove server console.
+
+This policy is for ``POST /remote-consoles`` API and below Server actions APIs
+are deprecated:
+
+- ``os-getRDPConsole``
+- ``os-getSerialConsole``
+- ``os-getSPICEConsole``
+- ``os-getVNCConsole``.""",
+        operations=[
             {
                 'method': 'POST',
                 'path': '/servers/{server_id}/action (os-getRDPConsole)'
@@ -47,7 +55,8 @@ remote_consoles_policies = [
                 'method': 'POST',
                 'path': '/servers/{server_id}/remote-consoles'
             },
-        ]),
+        ],
+        scope_types=['system', 'project']),
 ]
 
 

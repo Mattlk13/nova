@@ -17,7 +17,6 @@ import functools
 
 import netaddr
 from oslo_serialization import jsonutils
-import six
 
 from nova import exception
 from nova.i18n import _
@@ -104,14 +103,16 @@ VNIC_TYPE_MACVTAP = 'macvtap'
 VNIC_TYPE_DIRECT_PHYSICAL = 'direct-physical'
 VNIC_TYPE_BAREMETAL = 'baremetal'
 VNIC_TYPE_VIRTIO_FORWARDER = 'virtio-forwarder'
+VNIC_TYPE_VDPA = 'vdpa'
 
 # Define list of ports which needs pci request.
 # Note: The macvtap port needs a PCI request as it is a tap interface
 # with VF as the lower physical interface.
 # Note: Currently, VNIC_TYPE_VIRTIO_FORWARDER assumes a 1:1
 # relationship with a VF. This is expected to change in the future.
-VNIC_TYPES_SRIOV = (VNIC_TYPE_DIRECT, VNIC_TYPE_MACVTAP,
-                    VNIC_TYPE_DIRECT_PHYSICAL, VNIC_TYPE_VIRTIO_FORWARDER)
+VNIC_TYPES_SRIOV = (
+    VNIC_TYPE_DIRECT, VNIC_TYPE_MACVTAP, VNIC_TYPE_DIRECT_PHYSICAL,
+    VNIC_TYPE_VIRTIO_FORWARDER, VNIC_TYPE_VDPA)
 
 # Define list of ports which are passthrough to the guest
 # and need a special treatment on snapshot and suspend/resume
@@ -383,7 +384,8 @@ class VIF(Model):
                  details=None, devname=None, ovs_interfaceid=None,
                  qbh_params=None, qbg_params=None, active=False,
                  vnic_type=VNIC_TYPE_NORMAL, profile=None,
-                 preserve_on_delete=False, **kwargs):
+                 preserve_on_delete=False, delegate_create=False,
+                 **kwargs):
         super(VIF, self).__init__()
 
         self['id'] = id
@@ -400,6 +402,7 @@ class VIF(Model):
         self['vnic_type'] = vnic_type
         self['profile'] = profile
         self['preserve_on_delete'] = preserve_on_delete
+        self['delegate_create'] = delegate_create
 
         self._set_meta(kwargs)
 
@@ -407,7 +410,7 @@ class VIF(Model):
         keys = ['id', 'address', 'network', 'vnic_type',
                 'type', 'profile', 'details', 'devname',
                 'ovs_interfaceid', 'qbh_params', 'qbg_params',
-                'active', 'preserve_on_delete']
+                'active', 'preserve_on_delete', 'delegate_create']
         return all(self[k] == other[k] for k in keys)
 
     def __ne__(self, other):
@@ -469,6 +472,14 @@ class VIF(Model):
         return (self.is_hybrid_plug_enabled() and not
                 migration.is_same_host())
 
+    @property
+    def has_live_migration_plug_time_event(self):
+        """Returns whether this VIF's network-vif-plugged external event will
+        be sent by Neutron at "plugtime" - in other words, as soon as neutron
+        completes configuring the network backend.
+        """
+        return self.is_hybrid_plug_enabled()
+
     def is_hybrid_plug_enabled(self):
         return self['details'].get(VIF_DETAILS_OVS_HYBRID_PLUG, False)
 
@@ -513,7 +524,7 @@ class NetworkInfo(list):
 
     @classmethod
     def hydrate(cls, network_info):
-        if isinstance(network_info, six.string_types):
+        if isinstance(network_info, str):
             network_info = jsonutils.loads(network_info)
         return cls([VIF.hydrate(vif) for vif in network_info])
 
@@ -530,15 +541,22 @@ class NetworkInfo(list):
         return jsonutils.dumps(self)
 
     def get_bind_time_events(self, migration):
-        """Returns whether any of our VIFs have "bind-time" events. See
-        has_bind_time_event() docstring for more details.
+        """Returns a list of external events for any VIFs that have
+        "bind-time" events during cold migration.
         """
         return [('network-vif-plugged', vif['id'])
                 for vif in self if vif.has_bind_time_event(migration)]
 
+    def get_live_migration_plug_time_events(self):
+        """Returns a list of external events for any VIFs that have
+        "plug-time" events during live migration.
+        """
+        return [('network-vif-plugged', vif['id'])
+                for vif in self if vif.has_live_migration_plug_time_event]
+
     def get_plug_time_events(self, migration):
-        """Complementary to get_bind_time_events(), any event that does not
-        fall in that category is a plug-time event.
+        """Returns a list of external events for any VIFs that have
+        "plug-time" events during cold migration.
         """
         return [('network-vif-plugged', vif['id'])
                 for vif in self if not vif.has_bind_time_event(migration)]

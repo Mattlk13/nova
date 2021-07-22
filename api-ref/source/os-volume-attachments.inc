@@ -70,6 +70,10 @@ Error response codes: badRequest(400), unauthorized(401), forbidden(403), itemNo
           to actually support a multiattach volume depends on the volume type
           and compute hosting the instance.
 
+.. note:: This is an asynchronous API, callers should poll the status and list
+          of attachments of the volume within the volume API to determine when
+          the attachment has completed successfully.
+
 Request
 -------
 
@@ -177,19 +181,25 @@ Update a volume attachment.
 .. note:: This action only valid when the server is in ACTIVE, PAUSED and RESIZED state,
           or a conflict(409) error will be returned.
 
-.. warning:: This API is typically meant to only be used as part of a larger
-             orchestrated volume migration operation initiated in the block
-             storage service via the ``os-retype`` or ``os-migrate_volume``
-             volume actions. Direct usage of this API is not recommended and
-             may result in needing to hard reboot the server to update details
-             within the guest such as block storage serial IDs. Furthermore,
-             this API is only implemented by `certain compute drivers`_.
+.. warning:: When updating volumeId, this API is typically meant to
+             only be used as part of a larger orchestrated volume
+             migration operation initiated in the block storage
+             service via the ``os-retype`` or ``os-migrate_volume``
+             volume actions. Direct usage of this API to update
+             volumeId is not recommended and may result in needing to
+             hard reboot the server to update details within the guest
+             such as block storage serial IDs. Furthermore, updating
+             volumeId via this API is only implemented by `certain
+             compute drivers`_.
 
 .. _certain compute drivers: https://docs.openstack.org/nova/latest/user/support-matrix.html#operation_swap_volume
 
-Policy defaults enable only users with the administrative role to perform
-this operation. Cloud providers can change these permissions through the
-``policy.json`` file.
+Policy default role is 'rule:system_admin_or_owner', its scope is
+[system, project], which allow project members or system admins to
+change the fields of an attached volume of a server. Policy defaults
+enable only users with the administrative role to change ``volumeId``
+via this operation. Cloud providers can change these permissions
+through the ``policy.json`` file.
 
 Updating, or what is commonly referred to as "swapping", volume attachments
 with volumes that have more than one read/write attachment, is not supported.
@@ -207,10 +217,19 @@ Request
   - volume_id: volume_id_swap_src
   - volumeAttachment: volumeAttachment_put
   - volumeId: volumeId_swap
+  - delete_on_termination: delete_on_termination_put_req
+  - device: attachment_device_put_req
+  - serverId: attachment_server_id_put_req
+  - tag: device_tag_bdm_attachment_put_req
+  - id: attachment_id_put_req
 
-**Example Update a volume attachment: JSON request**
+.. note:: Other than ``volumeId``, as of v2.85 only
+          ``delete_on_termination`` may be changed from the current
+          value.
 
-.. literalinclude:: ../../doc/api_samples/os-volumes/update-volume-req.json
+**Example Update a volume attachment (v2.85): JSON request**
+
+.. literalinclude:: ../../doc/api_samples/os-volumes/v2.85/update-volume-attachment-delete-flag-req.json
    :language: javascript
 
 Response
@@ -231,6 +250,11 @@ Error response codes: badRequest(400), unauthorized(401), forbidden(403), itemNo
 
 .. note:: From v2.20 detach a volume from an instance in SHELVED or SHELVED_OFFLOADED
           state is allowed.
+
+.. note:: This is an asynchronous API, callers should poll the list
+          of volume attachments provided by ``GET
+          /servers/{server_id}/os-volume_attachments`` to determine when the
+          detachment of the volume has completed successfully.
 
 Request
 -------

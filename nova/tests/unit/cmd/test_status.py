@@ -20,16 +20,16 @@ Unit tests for the nova-status CLI interfaces.
 # nova/tests/functional/test_nova_status.py. Those tests use the external
 # PlacementFixture, which is only available in functioanl tests.
 
+from io import StringIO
+
 import fixtures
 import mock
-from six.moves import StringIO
 
 from keystoneauth1 import exceptions as ks_exc
 from keystoneauth1 import loading as keystone
 from keystoneauth1 import session
 from oslo_upgradecheck import upgradecheck
 from oslo_utils.fixture import uuidsentinel as uuids
-from oslo_utils import uuidutils
 from requests import models
 
 from nova.cmd import status
@@ -39,6 +39,8 @@ from nova import exception
 # NOTE(mriedem): We only use objects as a convenience to populate the database
 # in the tests, we don't use them in the actual CLI.
 from nova import objects
+from nova.objects import service
+from nova import policy
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 
@@ -353,162 +355,6 @@ class TestUpgradeCheckCellsV2(test.NoDBTestCase):
         self.assertIsNone(result.details)
 
 
-class TestUpgradeCheckIronicFlavorMigration(test.NoDBTestCase):
-    """Tests for the nova-status upgrade check on ironic flavor migration."""
-
-    # We'll setup the database ourselves because we need to use cells fixtures
-    # for multiple cell mappings.
-    USES_DB_SELF = True
-
-    # This will create three cell mappings: cell0, cell1 (default) and cell2
-    NUMBER_OF_CELLS = 2
-
-    def setUp(self):
-        super(TestUpgradeCheckIronicFlavorMigration, self).setUp()
-        self.output = StringIO()
-        self.useFixture(fixtures.MonkeyPatch('sys.stdout', self.output))
-        # We always need the API DB to be setup.
-        self.useFixture(nova_fixtures.Database(database='api'))
-        self.cmd = status.UpgradeCommands()
-
-    @staticmethod
-    def _create_node_in_cell(ctxt, cell, hypervisor_type, nodename):
-        with context.target_cell(ctxt, cell) as cctxt:
-            cn = objects.ComputeNode(
-                context=cctxt,
-                hypervisor_type=hypervisor_type,
-                hypervisor_hostname=nodename,
-                # The rest of these values are fakes.
-                host=uuids.host,
-                vcpus=4,
-                memory_mb=8 * 1024,
-                local_gb=40,
-                vcpus_used=2,
-                memory_mb_used=2 * 1024,
-                local_gb_used=10,
-                hypervisor_version=1,
-                cpu_info='{"arch": "x86_64"}')
-            cn.create()
-            return cn
-
-    @staticmethod
-    def _create_instance_in_cell(ctxt, cell, node, is_deleted=False,
-                                 flavor_migrated=False):
-        with context.target_cell(ctxt, cell) as cctxt:
-            inst = objects.Instance(
-                context=cctxt,
-                host=node.host,
-                node=node.hypervisor_hostname,
-                uuid=uuidutils.generate_uuid())
-            inst.create()
-
-            if is_deleted:
-                inst.destroy()
-            else:
-                # Create an embedded flavor for the instance. We don't create
-                # this because we're in a cell context and flavors are global,
-                # but we don't actually care about global flavors in this
-                # check.
-                extra_specs = {}
-                if flavor_migrated:
-                    extra_specs['resources:CUSTOM_BAREMETAL_GOLD'] = '1'
-                inst.flavor = objects.Flavor(cctxt, extra_specs=extra_specs)
-                inst.old_flavor = None
-                inst.new_flavor = None
-                inst.save()
-
-            return inst
-
-    def test_fresh_install_no_cell_mappings(self):
-        """Tests the scenario where we don't have any cell mappings (no cells
-        v2 setup yet) so we don't know what state we're in and we return a
-        warning.
-        """
-        result = self.cmd._check_ironic_flavor_migration()
-        self.assertEqual(upgradecheck.Code.WARNING, result.code)
-        self.assertIn('Unable to determine ironic flavor migration without '
-                      'cell mappings', result.details)
-
-    def test_fresh_install_no_computes(self):
-        """Tests a fresh install scenario where we have two non-cell0 cells
-        but no compute nodes in either cell yet, so there is nothing to do
-        and we return success.
-        """
-        self._setup_cells()
-        result = self.cmd._check_ironic_flavor_migration()
-        self.assertEqual(upgradecheck.Code.SUCCESS, result.code)
-
-    def test_mixed_computes_deleted_ironic_instance(self):
-        """Tests the scenario where we have a kvm compute node in one cell
-        and an ironic compute node in another cell. The kvm compute node does
-        not have any instances. The ironic compute node has an instance with
-        the same hypervisor_hostname match but the instance is (soft) deleted
-        so it's ignored.
-        """
-        self._setup_cells()
-        ctxt = context.get_admin_context()
-        # Create the ironic compute node in cell1
-        ironic_node = self._create_node_in_cell(
-            ctxt, self.cell_mappings['cell1'], 'ironic', uuids.node_uuid)
-        # Create the kvm compute node in cell2
-        self._create_node_in_cell(
-            ctxt, self.cell_mappings['cell2'], 'kvm', 'fake-kvm-host')
-
-        # Now create an instance in cell1 which is on the ironic node but is
-        # soft deleted (instance.deleted == instance.id).
-        self._create_instance_in_cell(
-            ctxt, self.cell_mappings['cell1'], ironic_node, is_deleted=True)
-
-        result = self.cmd._check_ironic_flavor_migration()
-        self.assertEqual(upgradecheck.Code.SUCCESS, result.code)
-
-    def test_unmigrated_ironic_instances(self):
-        """Tests a scenario where we have two cells with only ironic compute
-        nodes. The first cell has one migrated and one unmigrated instance.
-        The second cell has two unmigrated instances. The result is the check
-        returns failure.
-        """
-        self._setup_cells()
-        ctxt = context.get_admin_context()
-
-        # Create the ironic compute nodes in cell1
-        for x in range(2):
-            cell = self.cell_mappings['cell1']
-            ironic_node = self._create_node_in_cell(
-                ctxt, cell, 'ironic', getattr(uuids, 'cell1-node-%d' % x))
-            # Create an instance for this node. In cell1, we have one
-            # migrated and one unmigrated instance.
-            flavor_migrated = True if x % 2 else False
-            self._create_instance_in_cell(
-                ctxt, cell, ironic_node, flavor_migrated=flavor_migrated)
-
-        # Create the ironic compute nodes in cell2
-        for x in range(2):
-            cell = self.cell_mappings['cell2']
-            ironic_node = self._create_node_in_cell(
-                ctxt, cell, 'ironic', getattr(uuids, 'cell2-node-%d' % x))
-            # Create an instance for this node. In cell2, all instances are
-            # unmigrated.
-            self._create_instance_in_cell(
-                ctxt, cell, ironic_node, flavor_migrated=False)
-
-        result = self.cmd._check_ironic_flavor_migration()
-        self.assertEqual(upgradecheck.Code.FAILURE, result.code)
-        # Check the message - it should point out cell1 has one unmigrated
-        # instance and cell2 has two unmigrated instances.
-        unmigrated_instance_count_by_cell = {
-            self.cell_mappings['cell1'].uuid: 1,
-            self.cell_mappings['cell2'].uuid: 2
-        }
-        self.assertIn(
-            'There are (cell=x) number of unmigrated instances in each '
-            'cell: %s.' % ' '.join('(%s=%s)' % (
-                cell_id, unmigrated_instance_count_by_cell[cell_id])
-                    for cell_id in
-                    sorted(unmigrated_instance_count_by_cell.keys())),
-            result.details)
-
-
 class TestUpgradeCheckCinderAPI(test.NoDBTestCase):
 
     def setUp(self):
@@ -546,3 +392,113 @@ class TestUpgradeCheckCinderAPI(test.NoDBTestCase):
         result = self.cmd._check_cinder()
         mock_version_check.assert_called_once()
         self.assertEqual(upgradecheck.Code.SUCCESS, result.code)
+
+
+class TestUpgradeCheckPolicy(test.NoDBTestCase):
+
+    new_default_status = upgradecheck.Code.WARNING
+
+    def setUp(self):
+        super(TestUpgradeCheckPolicy, self).setUp()
+        self.cmd = status.UpgradeCommands()
+        self.rule_name = "system_admin_api"
+
+    def tearDown(self):
+        super(TestUpgradeCheckPolicy, self).tearDown()
+        # Check if policy is reset back after the upgrade check
+        self.assertIsNone(policy._ENFORCER)
+
+    def test_policy_rule_with_new_defaults(self):
+        new_default = "role:admin and system_scope:all"
+        rule = {self.rule_name: new_default}
+        self.policy.set_rules(rule, overwrite=False)
+        self.assertEqual(self.new_default_status,
+                         self.cmd._check_policy().code)
+
+    def test_policy_rule_with_old_defaults(self):
+        new_default = "is_admin:True"
+        rule = {self.rule_name: new_default}
+        self.policy.set_rules(rule, overwrite=False)
+
+        self.assertEqual(upgradecheck.Code.SUCCESS,
+                         self.cmd._check_policy().code)
+
+    def test_policy_rule_with_both_defaults(self):
+        new_default = "(role:admin and system_scope:all) or is_admin:True"
+        rule = {self.rule_name: new_default}
+        self.policy.set_rules(rule, overwrite=False)
+
+        self.assertEqual(upgradecheck.Code.SUCCESS,
+                         self.cmd._check_policy().code)
+
+    def test_policy_checks_with_fresh_init_and_no_policy_override(self):
+        self.policy = self.useFixture(nova_fixtures.OverridePolicyFixture(
+                                      rules_in_file={}))
+        policy.reset()
+        self.assertEqual(upgradecheck.Code.SUCCESS,
+                         self.cmd._check_policy().code)
+
+
+class TestUpgradeCheckPolicyEnableScope(TestUpgradeCheckPolicy):
+
+    new_default_status = upgradecheck.Code.SUCCESS
+
+    def setUp(self):
+        super(TestUpgradeCheckPolicyEnableScope, self).setUp()
+        self.flags(enforce_scope=True, group="oslo_policy")
+
+
+class TestUpgradeCheckOldCompute(test.NoDBTestCase):
+
+    def setUp(self):
+        super(TestUpgradeCheckOldCompute, self).setUp()
+        self.cmd = status.UpgradeCommands()
+
+    def test_no_compute(self):
+        self.assertEqual(
+            upgradecheck.Code.SUCCESS, self.cmd._check_old_computes().code)
+
+    def test_only_new_compute(self):
+        last_supported_version = service.SERVICE_VERSION_ALIASES[
+            service.OLDEST_SUPPORTED_SERVICE_VERSION]
+        with mock.patch(
+                "nova.objects.service.get_minimum_version_all_cells",
+                return_value=last_supported_version):
+            self.assertEqual(
+                upgradecheck.Code.SUCCESS, self.cmd._check_old_computes().code)
+
+    def test_old_compute(self):
+        too_old = service.SERVICE_VERSION_ALIASES[
+            service.OLDEST_SUPPORTED_SERVICE_VERSION] - 1
+        with mock.patch(
+                "nova.objects.service.get_minimum_version_all_cells",
+                return_value=too_old):
+            result = self.cmd._check_old_computes()
+            self.assertEqual(upgradecheck.Code.WARNING, result.code)
+
+
+class TestCheckMachineTypeUnset(test.NoDBTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.cmd = status.UpgradeCommands()
+
+    @mock.patch(
+        'nova.virt.libvirt.machine_type_utils.get_instances_without_type',
+        new=mock.Mock(return_value=[mock.Mock(spec=objects.Instance)]))
+    def test_instances_found_without_hw_machine_type(self):
+        result = self.cmd._check_machine_type_set()
+        self.assertEqual(
+            upgradecheck.Code.WARNING,
+            result.code
+        )
+
+    @mock.patch(
+        'nova.virt.libvirt.machine_type_utils.get_instances_without_type',
+        new=mock.Mock(return_value=[]))
+    def test_instances_not_found_without_hw_machine_type(self):
+        result = self.cmd._check_machine_type_set()
+        self.assertEqual(
+            upgradecheck.Code.SUCCESS,
+            result.code
+        )

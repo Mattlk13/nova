@@ -23,7 +23,6 @@ from oslo_config import cfg
 from oslo_service import loopingcall
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import uuidutils
-import six
 from testtools import matchers
 from tooz import hashring as hash_ring
 
@@ -47,7 +46,6 @@ from nova.tests.unit import fake_instance
 from nova.tests.unit import matchers as nova_matchers
 from nova.tests.unit import utils
 from nova.tests.unit.virt.ironic import utils as ironic_utils
-from nova import utils as nova_utils
 from nova.virt import block_device as driver_block_device
 from nova.virt import configdrive
 from nova.virt import driver
@@ -2008,7 +2006,7 @@ class IronicDriverTestCase(test.NoDBTestCase):
         instance = fake_instance.fake_instance_obj(self.ctx,
                                                    node=node_uuid)
         network_info = utils.get_test_network_info()
-        vif_id = six.text_type(network_info[0]['id'])
+        vif_id = str(network_info[0]['id'])
 
         self.driver._plug_vifs(node, instance, network_info)
 
@@ -2133,7 +2131,7 @@ class IronicDriverTestCase(test.NoDBTestCase):
         instance = fake_instance.fake_instance_obj(self.ctx,
                                                    node=node_id)
         network_info = utils.get_test_network_info()
-        vif_id = six.text_type(network_info[0]['id'])
+        vif_id = str(network_info[0]['id'])
         self.driver.unplug_vifs(instance, network_info)
 
         # asserts
@@ -2182,20 +2180,15 @@ class IronicDriverTestCase(test.NoDBTestCase):
     @mock.patch.object(objects.Instance, 'save')
     def _test_rebuild(self, mock_save, mock_add_instance_info, mock_set_pstate,
                       mock_looping, mock_wait_active, preserve=False):
-        node_id = uuidutils.generate_uuid()
-        node = _get_cached_node(id=node_id, instance_id=self.instance_id,
-                                instance_type_id=5)
+        node_uuid = uuidutils.generate_uuid()
+        node = _get_cached_node(id=node_uuid, instance_id=self.instance_id)
         self.mock_conn.get_node.return_value = node
 
         image_meta = ironic_utils.get_test_image_meta()
-        flavor_id = 5
-        flavor = objects.Flavor(flavor_id=flavor_id, name='baremetal')
+        flavor = objects.Flavor(flavor_id=5, name='baremetal')
 
-        instance = fake_instance.fake_instance_obj(self.ctx,
-                                                   uuid=self.instance_uuid,
-                                                   node=node_id,
-                                                   instance_type_id=flavor_id)
-        instance.flavor = flavor
+        instance = fake_instance.fake_instance_obj(
+            self.ctx, uuid=self.instance_uuid, node=node_uuid, flavor=flavor)
 
         fake_looping_call = FakeLoopingCall()
         mock_looping.return_value = fake_looping_call
@@ -2212,9 +2205,8 @@ class IronicDriverTestCase(test.NoDBTestCase):
             node, instance,
             test.MatchType(objects.ImageMeta),
             flavor, preserve)
-        mock_set_pstate.assert_called_once_with(node_id,
-                                                ironic_states.REBUILD,
-                                                configdrive=mock.ANY)
+        mock_set_pstate.assert_called_once_with(
+            node_uuid, ironic_states.REBUILD, configdrive=mock.ANY)
         mock_looping.assert_called_once_with(mock_wait_active, instance)
         fake_looping_call.start.assert_called_once_with(
             interval=CONF.ironic.api_retry_interval)
@@ -2258,21 +2250,16 @@ class IronicDriverTestCase(test.NoDBTestCase):
                                               mock_configdrive):
         node_uuid = uuidutils.generate_uuid()
         node = _get_cached_node(
-                uuid=node_uuid, instance_uuid=self.instance_uuid,
-                instance_type_id=5)
+            uuid=node_uuid, instance_uuid=self.instance_uuid)
         mock_get.return_value = node
         mock_required_by.return_value = True
         mock_configdrive.side_effect = exception.NovaException()
 
         image_meta = ironic_utils.get_test_image_meta()
-        flavor_id = 5
-        flavor = objects.Flavor(flavor_id=flavor_id, name='baremetal')
+        flavor = objects.Flavor(flavor_id=5, name='baremetal')
 
-        instance = fake_instance.fake_instance_obj(self.ctx,
-                                                   uuid=self.instance_uuid,
-                                                   node=node_uuid,
-                                                   instance_type_id=flavor_id)
-        instance.flavor = flavor
+        instance = fake_instance.fake_instance_obj(
+            self.ctx, uuid=self.instance_uuid, node=node_uuid, flavor=flavor)
 
         self.assertRaises(exception.InstanceDeployFailure,
             self.driver.rebuild,
@@ -2293,20 +2280,15 @@ class IronicDriverTestCase(test.NoDBTestCase):
                               mock_required_by, mock_configdrive):
         node_uuid = uuidutils.generate_uuid()
         node = _get_cached_node(
-                uuid=node_uuid, instance_uuid=self.instance_uuid,
-                instance_type_id=5)
+            uuid=node_uuid, instance_uuid=self.instance_uuid)
         mock_get.return_value = node
         mock_required_by.return_value = False
 
         image_meta = ironic_utils.get_test_image_meta()
-        flavor_id = 5
-        flavor = objects.Flavor(flavor_id=flavor_id, name='baremetal')
+        flavor = objects.Flavor(flavor_id=5, name='baremetal')
 
-        instance = fake_instance.fake_instance_obj(self.ctx,
-                                                   uuid=self.instance_uuid,
-                                                   node=node_uuid,
-                                                   instance_type_id=flavor_id)
-        instance.flavor = flavor
+        instance = fake_instance.fake_instance_obj(
+            self.ctx, uuid=self.instance_uuid, node=node_uuid, flavor=flavor)
 
         exceptions = [
             exception.NovaException(),
@@ -2331,7 +2313,6 @@ class IronicDriverTestCase(test.NoDBTestCase):
                                                    host=hostname)
         node = ironic_utils.get_test_node(uuid=node_uuid,
                                           instance_uuid=self.instance_uuid,
-                                          instance_type_id=5,
                                           network_interface='flat')
         mock_get.return_value = node
         host_id = self.driver.network_binding_host_id(self.ctx, instance)
@@ -2612,388 +2593,6 @@ class IronicDriverSyncTestCase(IronicDriverTestCase):
         self.mock_conn = self.useFixture(
             fixtures.MockPatchObject(self.driver, '_ironic_connection')).mock
 
-    @mock.patch.object(ironic_driver.IronicDriver, '_get_node_list')
-    @mock.patch.object(objects.ServiceList, 'get_all_computes_by_hv_type')
-    @mock.patch.object(objects.InstanceList, 'get_uuids_by_host')
-    @mock.patch.object(objects.Instance, 'get_by_uuid')
-    @mock.patch.object(objects.Instance, 'save')
-    def test_pike_flavor_migration(self, mock_save, mock_get_by_uuid,
-            mock_get_uuids_by_host, mock_svc_by_hv, mock_get_node_list):
-        node1_uuid = uuidutils.generate_uuid()
-        node2_uuid = uuidutils.generate_uuid()
-        hostname = "ironic-compute"
-        fake_flavor1 = objects.Flavor()
-        fake_flavor1.extra_specs = {}
-        fake_flavor2 = objects.Flavor()
-        fake_flavor2.extra_specs = {}
-        inst1 = fake_instance.fake_instance_obj(self.ctx,
-                node=node1_uuid,
-                host=hostname,
-                flavor=fake_flavor1)
-        inst2 = fake_instance.fake_instance_obj(self.ctx,
-                node=node2_uuid,
-                host=hostname,
-                flavor=fake_flavor2)
-        node1 = _get_cached_node(
-                uuid=node1_uuid,
-                instance_uuid=inst1.uuid,
-                instance_type_id=1,
-                resource_class="first",
-                network_interface="flat")
-        node2 = _get_cached_node(
-                uuid=node2_uuid,
-                instance_uuid=inst2.uuid,
-                instance_type_id=2,
-                resource_class="second",
-                network_interface="flat")
-        inst_dict = {inst1.uuid: inst1, inst2.uuid: inst2}
-        mock_get_uuids_by_host.return_value = [inst1.uuid, inst2.uuid]
-        mock_svc_by_hv.return_value = []
-        self.driver.node_cache = {}
-        mock_get_node_list.return_value = [node1, node2]
-
-        def fake_inst_by_uuid(ctx, uuid, expected_attrs=None):
-            return inst_dict.get(uuid)
-
-        mock_get_by_uuid.side_effect = fake_inst_by_uuid
-
-        self.assertEqual({}, inst1.flavor.extra_specs)
-        self.assertEqual({}, inst2.flavor.extra_specs)
-
-        self.driver._refresh_cache()
-        self.assertEqual(2, mock_save.call_count)
-        expected_specs = {"resources:CUSTOM_FIRST": "1"}
-        self.assertEqual(expected_specs, inst1.flavor.extra_specs)
-        expected_specs = {"resources:CUSTOM_SECOND": "1"}
-        self.assertEqual(expected_specs, inst2.flavor.extra_specs)
-
-    @mock.patch.object(ironic_driver.IronicDriver, '_get_node_list')
-    @mock.patch.object(objects.ServiceList, 'get_all_computes_by_hv_type')
-    @mock.patch.object(objects.InstanceList, 'get_uuids_by_host')
-    @mock.patch.object(objects.Instance, 'get_by_uuid')
-    @mock.patch.object(objects.Instance, 'save')
-    def test_pike_flavor_migration_instance_migrated(self, mock_save,
-            mock_get_by_uuid, mock_get_uuids_by_host, mock_svc_by_hv,
-            mock_get_node_list):
-        node1_uuid = uuidutils.generate_uuid()
-        node2_uuid = uuidutils.generate_uuid()
-        hostname = "ironic-compute"
-        fake_flavor1 = objects.Flavor()
-        fake_flavor1.extra_specs = {"resources:CUSTOM_FIRST": "1"}
-        fake_flavor2 = objects.Flavor()
-        fake_flavor2.extra_specs = {}
-        inst1 = fake_instance.fake_instance_obj(self.ctx,
-                node=node1_uuid,
-                host=hostname,
-                flavor=fake_flavor1)
-        inst2 = fake_instance.fake_instance_obj(self.ctx,
-                node=node2_uuid,
-                host=hostname,
-                flavor=fake_flavor2)
-        node1 = _get_cached_node(
-                uuid=node1_uuid,
-                instance_uuid=inst1.uuid,
-                instance_type_id=1,
-                resource_class="first",
-                network_interface="flat")
-        node2 = _get_cached_node(
-                uuid=node2_uuid,
-                instance_uuid=inst2.uuid,
-                instance_type_id=2,
-                resource_class="second",
-                network_interface="flat")
-        inst_dict = {inst1.uuid: inst1, inst2.uuid: inst2}
-        mock_get_uuids_by_host.return_value = [inst1.uuid, inst2.uuid]
-        self.driver.node_cache = {}
-        mock_get_node_list.return_value = [node1, node2]
-        mock_svc_by_hv.return_value = []
-
-        def fake_inst_by_uuid(ctx, uuid, expected_attrs=None):
-            return inst_dict.get(uuid)
-
-        mock_get_by_uuid.side_effect = fake_inst_by_uuid
-
-        self.driver._refresh_cache()
-        # Since one instance already had its extra_specs updated with the
-        # custom resource_class, only the other one should be updated and
-        # saved.
-        self.assertEqual(1, mock_save.call_count)
-        expected_specs = {"resources:CUSTOM_FIRST": "1"}
-        self.assertEqual(expected_specs, inst1.flavor.extra_specs)
-        expected_specs = {"resources:CUSTOM_SECOND": "1"}
-        self.assertEqual(expected_specs, inst2.flavor.extra_specs)
-
-    @mock.patch.object(ironic_driver.LOG, 'warning')
-    @mock.patch.object(ironic_driver.IronicDriver, '_get_node_list')
-    @mock.patch.object(objects.ServiceList, 'get_all_computes_by_hv_type')
-    @mock.patch.object(objects.InstanceList, 'get_uuids_by_host')
-    @mock.patch.object(objects.Instance, 'get_by_uuid')
-    @mock.patch.object(objects.Instance, 'save')
-    def test_pike_flavor_migration_missing_rc(self, mock_save,
-            mock_get_by_uuid, mock_get_uuids_by_host, mock_svc_by_hv,
-            mock_get_node_list, mock_warning):
-        node1_uuid = uuidutils.generate_uuid()
-        node2_uuid = uuidutils.generate_uuid()
-        hostname = "ironic-compute"
-        fake_flavor1 = objects.Flavor()
-        fake_flavor1.extra_specs = {}
-        fake_flavor2 = objects.Flavor()
-        fake_flavor2.extra_specs = {}
-        inst1 = fake_instance.fake_instance_obj(self.ctx,
-                node=node1_uuid,
-                host=hostname,
-                flavor=fake_flavor1)
-        inst2 = fake_instance.fake_instance_obj(self.ctx,
-                node=node2_uuid,
-                host=hostname,
-                flavor=fake_flavor2)
-        node1 = _get_cached_node(
-                uuid=node1_uuid,
-                instance_uuid=inst1.uuid,
-                instance_type_id=1,
-                resource_class=None,
-                network_interface="flat")
-        node2 = _get_cached_node(
-                uuid=node2_uuid,
-                instance_uuid=inst2.uuid,
-                instance_type_id=2,
-                resource_class="second",
-                network_interface="flat")
-        inst_dict = {inst1.uuid: inst1, inst2.uuid: inst2}
-        mock_get_uuids_by_host.return_value = [inst1.uuid, inst2.uuid]
-        mock_svc_by_hv.return_value = []
-        self.driver.node_cache = {}
-        mock_get_node_list.return_value = [node1, node2]
-
-        def fake_inst_by_uuid(ctx, uuid, expected_attrs=None):
-            return inst_dict.get(uuid)
-
-        mock_get_by_uuid.side_effect = fake_inst_by_uuid
-
-        self.driver._refresh_cache()
-        # Since one instance was on a node with no resource class set,
-        # only the other one should be updated and saved.
-        self.assertEqual(1, mock_save.call_count)
-        expected_specs = {}
-        self.assertEqual(expected_specs, inst1.flavor.extra_specs)
-        expected_specs = {"resources:CUSTOM_SECOND": "1"}
-        self.assertEqual(expected_specs, inst2.flavor.extra_specs)
-        # Verify that the LOG.warning was called correctly
-        self.assertEqual(1, mock_warning.call_count)
-        self.assertIn("does not have its resource_class set.",
-                mock_warning.call_args[0][0])
-        self.assertEqual({"node": node1.uuid}, mock_warning.call_args[0][1])
-
-    @mock.patch.object(ironic_driver.IronicDriver, '_get_node_list')
-    @mock.patch.object(objects.ServiceList, 'get_all_computes_by_hv_type')
-    @mock.patch.object(objects.InstanceList, 'get_uuids_by_host')
-    @mock.patch.object(objects.Instance, 'get_by_uuid')
-    @mock.patch.object(objects.Instance, 'save')
-    def test_pike_flavor_migration_refresh_called_again(self, mock_save,
-            mock_get_by_uuid, mock_get_uuids_by_host, mock_svc_by_hv,
-            mock_get_node_list):
-        node1_uuid = uuidutils.generate_uuid()
-        node2_uuid = uuidutils.generate_uuid()
-        hostname = "ironic-compute"
-        fake_flavor1 = objects.Flavor()
-        fake_flavor1.extra_specs = {}
-        fake_flavor2 = objects.Flavor()
-        fake_flavor2.extra_specs = {}
-        inst1 = fake_instance.fake_instance_obj(self.ctx,
-                node=node1_uuid,
-                host=hostname,
-                flavor=fake_flavor1)
-        inst2 = fake_instance.fake_instance_obj(self.ctx,
-                node=node2_uuid,
-                host=hostname,
-                flavor=fake_flavor2)
-        node1 = _get_cached_node(
-                uuid=node1_uuid,
-                instance_uuid=inst1.uuid,
-                instance_type_id=1,
-                resource_class="first",
-                network_interface="flat")
-        node2 = _get_cached_node(
-                uuid=node2_uuid,
-                instance_uuid=inst2.uuid,
-                instance_type_id=2,
-                resource_class="second",
-                network_interface="flat")
-        inst_dict = {inst1.uuid: inst1, inst2.uuid: inst2}
-        mock_get_uuids_by_host.return_value = [inst1.uuid, inst2.uuid]
-        mock_svc_by_hv.return_value = []
-        self.driver.node_cache = {}
-        mock_get_node_list.return_value = [node1, node2]
-
-        def fake_inst_by_uuid(ctx, uuid, expected_attrs=None):
-            return inst_dict.get(uuid)
-
-        mock_get_by_uuid.side_effect = fake_inst_by_uuid
-
-        self.driver._refresh_cache()
-        self.assertEqual(2, mock_get_by_uuid.call_count)
-        # Refresh the cache again. The mock for getting an instance by uuid
-        # should not be called again.
-        mock_get_by_uuid.reset_mock()
-        self.driver._refresh_cache()
-        mock_get_by_uuid.assert_not_called()
-
-    @mock.patch.object(ironic_driver.IronicDriver, '_get_node_list')
-    @mock.patch.object(objects.ServiceList, 'get_all_computes_by_hv_type')
-    @mock.patch.object(objects.InstanceList, 'get_uuids_by_host')
-    @mock.patch.object(objects.Instance, 'get_by_uuid')
-    @mock.patch.object(objects.Instance, 'save')
-    def test_pike_flavor_migration_no_node_change(self, mock_save,
-            mock_get_by_uuid, mock_get_uuids_by_host, mock_svc_by_hv,
-            mock_get_node_list):
-        node1_uuid = uuidutils.generate_uuid()
-        node2_uuid = uuidutils.generate_uuid()
-        hostname = "ironic-compute"
-        fake_flavor1 = objects.Flavor()
-        fake_flavor1.extra_specs = {"resources:CUSTOM_FIRST": "1"}
-        fake_flavor2 = objects.Flavor()
-        fake_flavor2.extra_specs = {"resources:CUSTOM_SECOND": "1"}
-        inst1 = fake_instance.fake_instance_obj(self.ctx,
-                node=node1_uuid,
-                host=hostname,
-                flavor=fake_flavor1)
-        inst2 = fake_instance.fake_instance_obj(self.ctx,
-                node=node2_uuid,
-                host=hostname,
-                flavor=fake_flavor2)
-        node1 = _get_cached_node(
-                uuid=node1_uuid,
-                instance_uuid=inst1.uuid,
-                instance_type_id=1,
-                resource_class="first",
-                network_interface="flat")
-        node2 = _get_cached_node(
-                uuid=node2_uuid,
-                instance_uuid=inst2.uuid,
-                instance_type_id=2,
-                resource_class="second",
-                network_interface="flat")
-        inst_dict = {inst1.uuid: inst1, inst2.uuid: inst2}
-        mock_get_uuids_by_host.return_value = [inst1.uuid, inst2.uuid]
-        self.driver.node_cache = {node1_uuid: node1, node2_uuid: node2}
-        self.driver._migrated_instance_uuids = set([inst1.uuid, inst2.uuid])
-        mock_get_node_list.return_value = [node1, node2]
-        mock_svc_by_hv.return_value = []
-
-        def fake_inst_by_uuid(ctx, uuid, expected_attrs=None):
-            return inst_dict.get(uuid)
-
-        mock_get_by_uuid.side_effect = fake_inst_by_uuid
-
-        self.driver._refresh_cache()
-        # Since the nodes did not change in the call to _refresh_cache(), and
-        # their instance_uuids were in the cache, none of the mocks in the
-        # migration script should have been called.
-        self.assertFalse(mock_get_by_uuid.called)
-        self.assertFalse(mock_save.called)
-
-    @mock.patch.object(ironic_driver.IronicDriver, '_get_node_list')
-    @mock.patch.object(objects.ServiceList, 'get_all_computes_by_hv_type')
-    @mock.patch.object(objects.InstanceList, 'get_uuids_by_host')
-    @mock.patch.object(objects.Instance, 'get_by_uuid')
-    @mock.patch.object(objects.Instance, 'save')
-    def test_pike_flavor_migration_just_instance_change(self, mock_save,
-            mock_get_by_uuid, mock_get_uuids_by_host, mock_svc_by_hv,
-            mock_get_node_list):
-        node1_uuid = uuidutils.generate_uuid()
-        node2_uuid = uuidutils.generate_uuid()
-        node3_uuid = uuidutils.generate_uuid()
-        hostname = "ironic-compute"
-        fake_flavor1 = objects.Flavor()
-        fake_flavor1.extra_specs = {}
-        fake_flavor2 = objects.Flavor()
-        fake_flavor2.extra_specs = {}
-        fake_flavor3 = objects.Flavor()
-        fake_flavor3.extra_specs = {}
-        inst1 = fake_instance.fake_instance_obj(self.ctx,
-                node=node1_uuid,
-                host=hostname,
-                flavor=fake_flavor1)
-        inst2 = fake_instance.fake_instance_obj(self.ctx,
-                node=node2_uuid,
-                host=hostname,
-                flavor=fake_flavor2)
-        inst3 = fake_instance.fake_instance_obj(self.ctx,
-                node=node3_uuid,
-                host=hostname,
-                flavor=fake_flavor3)
-        node1 = _get_cached_node(
-                uuid=node1_uuid,
-                instance_uuid=inst1.uuid,
-                instance_type_id=1,
-                resource_class="first",
-                network_interface="flat")
-        node2 = _get_cached_node(
-                uuid=node2_uuid,
-                instance_uuid=inst2.uuid,
-                instance_type_id=2,
-                resource_class="second",
-                network_interface="flat")
-        inst_dict = {inst1.uuid: inst1, inst2.uuid: inst2, inst3.uuid: inst3}
-        mock_get_uuids_by_host.return_value = [inst1.uuid, inst2.uuid]
-        self.driver.node_cache = {node1_uuid: node1, node2_uuid: node2}
-        mock_get_node_list.return_value = [node1, node2]
-        mock_svc_by_hv.return_value = []
-
-        def fake_inst_by_uuid(ctx, uuid, expected_attrs=None):
-            return inst_dict.get(uuid)
-
-        mock_get_by_uuid.side_effect = fake_inst_by_uuid
-
-        self.driver._refresh_cache()
-        # Since this is a fresh driver, neither will be in the migration cache,
-        # so the migration mocks should have been called.
-        self.assertTrue(mock_get_by_uuid.called)
-        self.assertTrue(mock_save.called)
-
-        # Now call _refresh_cache() again.  Since neither the nodes nor their
-        # instances change, none of the mocks in the migration script should
-        # have been called.
-        mock_get_by_uuid.reset_mock()
-        mock_save.reset_mock()
-        self.driver._refresh_cache()
-        self.assertFalse(mock_get_by_uuid.called)
-        self.assertFalse(mock_save.called)
-
-        # Now change the node on node2 to inst3
-        node2.instance_uuid = inst3.uuid
-        mock_get_uuids_by_host.return_value = [inst1.uuid, inst3.uuid]
-        # Call _refresh_cache() again. Since the instance on node2 changed, the
-        # migration mocks should have been called.
-        mock_get_by_uuid.reset_mock()
-        mock_save.reset_mock()
-        self.driver._refresh_cache()
-        self.assertTrue(mock_get_by_uuid.called)
-        self.assertTrue(mock_save.called)
-
-    @mock.patch.object(nova_utils, 'normalize_rc_name')
-    @mock.patch.object(ironic_driver.IronicDriver, '_node_from_cache')
-    def test_pike_flavor_migration_empty_node(self, mock_node_from_cache,
-            mock_normalize):
-        mock_node_from_cache.return_value = None
-        self.driver._pike_flavor_migration([uuids.node])
-        mock_normalize.assert_not_called()
-
-    @mock.patch.object(nova_utils, 'normalize_rc_name')
-    @mock.patch.object(ironic_driver.IronicDriver, '_node_from_cache')
-    def test_pike_flavor_migration_already_migrated(self, mock_node_from_cache,
-            mock_normalize):
-        node1 = _get_cached_node(
-                uuid=uuids.node1,
-                instance_uuid=uuids.instance,
-                instance_type_id=1,
-                resource_class="first",
-                network_interface="flat")
-        mock_node_from_cache.return_value = node1
-        self.driver._migrated_instance_uuids = set([uuids.instance])
-        self.driver._pike_flavor_migration([uuids.node1])
-        mock_normalize.assert_not_called()
-
     @mock.patch.object(loopingcall, 'FixedIntervalLoopingCall')
     @mock.patch.object(FAKE_CLIENT.node, 'set_provision_state')
     def test_rescue(self, mock_sps, mock_looping):
@@ -3004,7 +2603,7 @@ class IronicDriverSyncTestCase(IronicDriverTestCase):
         instance = fake_instance.fake_instance_obj(self.ctx,
                                                    node=node.uuid)
 
-        self.driver.rescue(self.ctx, instance, None, None, 'xyz')
+        self.driver.rescue(self.ctx, instance, None, None, 'xyz', None)
         mock_sps.assert_called_once_with(node.uuid, 'rescue',
                                          rescue_password='xyz')
 
@@ -3021,7 +2620,7 @@ class IronicDriverSyncTestCase(IronicDriverTestCase):
 
         self.assertRaises(exception.InstanceRescueFailure,
                           self.driver.rescue,
-                          self.ctx, instance, None, None, 'xyz')
+                          self.ctx, instance, None, None, 'xyz', None)
 
     @mock.patch.object(ironic_driver.IronicDriver,
                        '_validate_instance_and_node')
@@ -3035,7 +2634,7 @@ class IronicDriverSyncTestCase(IronicDriverTestCase):
 
         self.assertRaises(exception.InstanceRescueFailure,
                           self.driver.rescue,
-                          self.ctx, instance, None, None, 'xyz')
+                          self.ctx, instance, None, None, 'xyz', None)
 
     @mock.patch.object(ironic_driver.IronicDriver,
                        '_validate_instance_and_node')
@@ -3051,7 +2650,7 @@ class IronicDriverSyncTestCase(IronicDriverTestCase):
 
         self.assertRaises(exception.InstanceRescueFailure,
                           self.driver.rescue,
-                          self.ctx, instance, None, None, 'xyz')
+                          self.ctx, instance, None, None, 'xyz', None)
 
     @mock.patch.object(loopingcall, 'FixedIntervalLoopingCall')
     @mock.patch.object(FAKE_CLIENT.node, 'set_provision_state')
@@ -3063,7 +2662,7 @@ class IronicDriverSyncTestCase(IronicDriverTestCase):
         instance = fake_instance.fake_instance_obj(self.ctx,
                                                    node=node.uuid)
 
-        self.driver.unrescue(instance, None)
+        self.driver.unrescue(self.ctx, instance)
         mock_sps.assert_called_once_with(node.uuid, 'unrescue')
 
     @mock.patch.object(loopingcall, 'FixedIntervalLoopingCall')
@@ -3078,8 +2677,7 @@ class IronicDriverSyncTestCase(IronicDriverTestCase):
         instance = fake_instance.fake_instance_obj(self.ctx,
                                                    node=node.uuid)
         self.assertRaises(exception.InstanceUnRescueFailure,
-                          self.driver.unrescue,
-                          instance, None)
+                          self.driver.unrescue, self.ctx, instance)
 
     @mock.patch.object(ironic_driver.IronicDriver,
                        '_validate_instance_and_node')
@@ -3092,8 +2690,7 @@ class IronicDriverSyncTestCase(IronicDriverTestCase):
             instance_id='fake')
 
         self.assertRaises(exception.InstanceUnRescueFailure,
-                          self.driver.unrescue,
-                          instance, None)
+                          self.driver.unrescue, self.ctx, instance)
 
     @mock.patch.object(ironic_driver.IronicDriver,
                        '_validate_instance_and_node')
@@ -3108,8 +2705,7 @@ class IronicDriverSyncTestCase(IronicDriverTestCase):
                                                    node=node.uuid)
 
         self.assertRaises(exception.InstanceUnRescueFailure,
-                          self.driver.unrescue,
-                          instance, None)
+                          self.driver.unrescue, self.ctx, instance)
 
     def test__can_send_version(self):
         self.assertIsNone(
@@ -3173,8 +2769,7 @@ class IronicDriverGenerateConfigDriveTestCase(test.NoDBTestCase):
         mock_instance_meta.assert_called_once_with(
             self.instance, content=None, extra_md={},
             network_info=self.network_info,
-            network_metadata=network_metadata_mock.return_value,
-            request_context=None)
+            network_metadata=network_metadata_mock.return_value)
 
     def test_generate_configdrive_fail(self, mock_cd_builder,
                                        mock_instance_meta):
@@ -3194,8 +2789,7 @@ class IronicDriverGenerateConfigDriveTestCase(test.NoDBTestCase):
         mock_instance_meta.assert_called_once_with(
             self.instance, content=None, extra_md={},
             network_info=self.network_info,
-            network_metadata=network_metadata_mock.return_value,
-            request_context=None)
+            network_metadata=network_metadata_mock.return_value)
 
     @mock.patch.object(FAKE_CLIENT.node, 'list_ports')
     @mock.patch.object(FAKE_CLIENT.portgroup, 'list')
@@ -3316,17 +2910,28 @@ class HashRingTestCase(test.NoDBTestCase):
         self.assertEqual(SENTINEL, self.driver.hash_ring)
         self.mock_is_up.assert_has_calls(is_up_calls)
 
+    def test__refresh_hash_ring_same_host_different_case(self):
+        # Test that we treat Host1 and host1 as the same host
+        # CONF.host is set to 'host1' in __test_refresh_hash_ring
+        services = ['Host1']
+        expected_hosts = {'host1'}
+        self.mock_is_up.return_value = True
+        self._test__refresh_hash_ring(services, expected_hosts)
+
     def test__refresh_hash_ring_one_compute(self):
         services = ['host1']
         expected_hosts = {'host1'}
         self.mock_is_up.return_value = True
         self._test__refresh_hash_ring(services, expected_hosts)
 
-    def test__refresh_hash_ring_many_computes(self):
+    @mock.patch('nova.virt.ironic.driver.LOG.debug')
+    def test__refresh_hash_ring_many_computes(self, mock_log_debug):
         services = ['host1', 'host2', 'host3']
         expected_hosts = {'host1', 'host2', 'host3'}
         self.mock_is_up.return_value = True
         self._test__refresh_hash_ring(services, expected_hosts)
+        expected_msg = 'Hash ring members are %s'
+        mock_log_debug.assert_called_once_with(expected_msg, set(services))
 
     def test__refresh_hash_ring_one_compute_new_compute(self):
         services = []
@@ -3433,6 +3038,9 @@ class NodeCacheTestCase(test.NoDBTestCase):
         mock_instances.return_value = instances
         mock_nodes.return_value = nodes
         mock_hosts.side_effect = hosts
+        parent_mock = mock.MagicMock()
+        parent_mock.attach_mock(mock_nodes, 'get_node_list')
+        parent_mock.attach_mock(mock_instances, 'get_uuids_by_host')
         if not can_send_146:
             mock_can_send.side_effect = (
                 exception.IronicAPIVersionNotAvailable(version='1.46'))
@@ -3445,11 +3053,40 @@ class NodeCacheTestCase(test.NoDBTestCase):
 
         self.driver._refresh_cache()
 
+        # assert if get_node_list() is called before get_uuids_by_host()
+        parent_mock.assert_has_calls(
+            [
+                mock.call.get_node_list(fields=ironic_driver._NODE_FIELDS,
+                                        **kwargs),
+                mock.call.get_uuids_by_host(mock.ANY, self.host)
+            ]
+        )
+
         mock_hash_ring.assert_called_once_with(mock.ANY)
         mock_instances.assert_called_once_with(mock.ANY, self.host)
         mock_nodes.assert_called_once_with(fields=ironic_driver._NODE_FIELDS,
                                            **kwargs)
         self.assertIsNotNone(self.driver.node_cache_time)
+
+    def test__refresh_cache_same_host_different_case(self):
+        # Test that we treat Host1 and host1 as the same host
+        self.host = 'Host1'
+        self.flags(host=self.host)
+        instances = []
+        nodes = [
+            _get_cached_node(
+                uuid=uuidutils.generate_uuid(), instance_uuid=None),
+            _get_cached_node(
+                uuid=uuidutils.generate_uuid(), instance_uuid=None),
+            _get_cached_node(
+                uuid=uuidutils.generate_uuid(), instance_uuid=None),
+        ]
+        hosts = ['host1', 'host1', 'host1']
+
+        self._test__refresh_cache(instances, nodes, hosts)
+
+        expected_cache = {n.uuid: n for n in nodes}
+        self.assertEqual(expected_cache, self.driver.node_cache)
 
     def test__refresh_cache(self):
         # normal operation, one compute service

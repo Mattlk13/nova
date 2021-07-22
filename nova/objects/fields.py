@@ -18,7 +18,6 @@ import re
 from cursive import signature_utils
 from oslo_serialization import jsonutils
 from oslo_versionedobjects import fields
-import six
 
 from nova import exception
 from nova.i18n import _
@@ -98,7 +97,7 @@ class ResourceClass(fields.StringPattern):
 
     @staticmethod
     def coerce(obj, attr, value):
-        if isinstance(value, six.string_types):
+        if isinstance(value, str):
             uppered = value.upper()
             if ResourceClass._REGEX.match(uppered):
                 return uppered
@@ -178,7 +177,7 @@ class Architecture(BaseNovaEnum):
         :returns: the canonicalized host architecture
         """
 
-        return cls.canonicalize(os.uname()[4])
+        return cls.canonicalize(os.uname().machine)
 
     @classmethod
     def is_valid(cls, name):
@@ -272,8 +271,9 @@ class CPUAllocationPolicy(BaseNovaEnum):
 
     DEDICATED = "dedicated"
     SHARED = "shared"
+    MIXED = "mixed"
 
-    ALL = (DEDICATED, SHARED)
+    ALL = (DEDICATED, SHARED, MIXED)
 
 
 class CPUThreadAllocationPolicy(BaseNovaEnum):
@@ -340,6 +340,8 @@ class DiskBus(BaseNovaEnum):
 
     # NOTE(aspiers): If you change this, don't forget to update the
     # docs and metadata for hw_*_bus in glance.
+    # NOTE(lyarwood): Also update the possible values in the api-ref for the
+    # block_device_mapping_v2.disk_bus parameter.
     FDC = "fdc"
     IDE = "ide"
     SATA = "sata"
@@ -379,8 +381,7 @@ class HVType(BaseNovaEnum):
     Provide the standard names for all known guest virtualization
     types. This is not to be confused with the Nova hypervisor driver
     types, since one driver may support multiple virtualization types
-    and one virtualization type (eg 'xen') may be supported by multiple
-    drivers ('XenAPI' or  'Libvirt-Xen').
+    and one virtualization type may be supported by multiple drivers.
     """
 
     BAREMETAL = 'baremetal'
@@ -464,6 +465,24 @@ class ImageSignatureKeyType(BaseNovaEnum):
     )
 
 
+class InputBus(BaseNovaEnum):
+
+    USB = 'usb'
+    VIRTIO = 'virtio'
+
+    ALL = (USB, VIRTIO)
+
+
+class MigrationType(BaseNovaEnum):
+
+    MIGRATION = 'migration'  # cold migration
+    RESIZE = 'resize'
+    LIVE_MIGRATION = 'live-migration'
+    EVACUATION = 'evacuation'
+
+    ALL = (MIGRATION, RESIZE, LIVE_MIGRATION, EVACUATION)
+
+
 class OSType(BaseNovaEnum):
 
     LINUX = "linux"
@@ -497,6 +516,21 @@ class RNGModel(BaseNovaEnum):
     VIRTIO = "virtio"
 
     ALL = (VIRTIO,)
+
+
+class TPMModel(BaseNovaEnum):
+
+    TIS = "tpm-tis"
+    CRB = "tpm-crb"
+
+    ALL = (TIS, CRB)
+
+
+class TPMVersion(BaseNovaEnum):
+    v1_2 = "1.2"
+    v2_0 = "2.0"
+
+    ALL = (v1_2, v2_0)
 
 
 class SCSIModel(BaseNovaEnum):
@@ -723,8 +757,12 @@ class PciDeviceType(BaseNovaEnum):
     STANDARD = "type-PCI"
     SRIOV_PF = "type-PF"
     SRIOV_VF = "type-VF"
+    # NOTE(sean-k-mooney): The DB field is Column(String(8), nullable=False)
+    # type-vdpa is 9 long...and as Jay notes above the prefix is silly so
+    # for the new vdpa value we drop the prefix to avoid a DB migration
+    VDPA = "vdpa"
 
-    ALL = (STANDARD, SRIOV_PF, SRIOV_VF)
+    ALL = (STANDARD, SRIOV_PF, SRIOV_VF, VDPA)
 
 
 class PCINUMAAffinityPolicy(BaseNovaEnum):
@@ -732,8 +770,9 @@ class PCINUMAAffinityPolicy(BaseNovaEnum):
     REQUIRED = "required"
     LEGACY = "legacy"
     PREFERRED = "preferred"
+    SOCKET = "socket"
 
-    ALL = (REQUIRED, LEGACY, PREFERRED)
+    ALL = (REQUIRED, LEGACY, PREFERRED, SOCKET)
 
 
 class DiskFormat(BaseNovaEnum):
@@ -750,6 +789,8 @@ class DiskFormat(BaseNovaEnum):
     ALL = (RBD, LVM, QCOW2, RAW, PLOOP, VHD, VMDK, VDI, ISO)
 
 
+# TODO(stephenfin): Remove the xenapi value when we bump the 'Diagnostics'
+# object (the only user of this enum) to 2.0
 class HypervisorDriver(BaseNovaEnum):
     LIBVIRT = "libvirt"
     XENAPI = "xenapi"
@@ -764,7 +805,7 @@ class PointerModelType(BaseNovaEnum):
 
     USBTABLET = "usbtablet"
 
-    ALL = (USBTABLET)
+    ALL = (USBTABLET,)
 
 
 class NotificationPriority(BaseNovaEnum):
@@ -1031,7 +1072,7 @@ class NetworkModel(FieldType):
     def coerce(obj, attr, value):
         if isinstance(value, network_model.NetworkInfo):
             return value
-        elif isinstance(value, six.string_types):
+        elif isinstance(value, str):
             # Hmm, do we need this?
             return network_model.NetworkInfo.hydrate(value)
         else:
@@ -1061,7 +1102,7 @@ class NetworkVIFModel(FieldType):
     def coerce(obj, attr, value):
         if isinstance(value, network_model.VIF):
             return value
-        elif isinstance(value, six.string_types):
+        elif isinstance(value, str):
             return NetworkVIFModel.from_primitive(obj, attr, value)
         else:
             raise ValueError(_('A nova.network.model.VIF object is required '
@@ -1207,12 +1248,28 @@ class ImageSignatureKeyTypeField(BaseEnumField):
     AUTO_TYPE = ImageSignatureKeyType()
 
 
+class InputBusField(BaseEnumField):
+    AUTO_TYPE = InputBus()
+
+
+class MigrationTypeField(BaseEnumField):
+    AUTO_TYPE = MigrationType()
+
+
 class OSTypeField(BaseEnumField):
     AUTO_TYPE = OSType()
 
 
 class RNGModelField(BaseEnumField):
     AUTO_TYPE = RNGModel()
+
+
+class TPMModelField(BaseEnumField):
+    AUTO_TYPE = TPMModel()
+
+
+class TPMVersionField(BaseEnumField):
+    AUTO_TYPE = TPMVersion()
 
 
 class SCSIModelField(BaseEnumField):

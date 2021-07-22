@@ -20,7 +20,6 @@ from oslo_messaging.rpc import dispatcher
 from oslo_serialization import jsonutils
 from oslo_service import periodic_task
 from oslo_utils import importutils
-import six
 
 import nova.conf
 import nova.context
@@ -135,8 +134,8 @@ class JsonPayloadSerializer(messaging.NoOpSerializer):
         if isinstance(obj, nova.context.RequestContext):
             # This matches RequestContextSerializer.serialize_context().
             return obj.to_dict()
-        # The default fallback in jsonutils.to_primitive() is six.text_type.
-        return six.text_type(obj)
+        # The default fallback in jsonutils.to_primitive() is str.
+        return str(obj)
 
     def serialize_entity(self, context, entity):
         return jsonutils.to_primitive(entity, convert_instances=True,
@@ -228,12 +227,11 @@ def get_server(target, endpoints, serializer=None):
                                     access_policy=access_policy)
 
 
-def get_notifier(service, host=None, publisher_id=None):
+def get_notifier(service, host=None):
     assert LEGACY_NOTIFIER is not None
-    if not publisher_id:
-        publisher_id = "%s.%s" % (service, host or CONF.host)
+    publisher_id = '%s.%s' % (service, host or CONF.host)
     return LegacyValidatingNotifier(
-            LEGACY_NOTIFIER.prepare(publisher_id=publisher_id))
+        LEGACY_NOTIFIER.prepare(publisher_id=publisher_id))
 
 
 def get_versioned_notifier(publisher_id):

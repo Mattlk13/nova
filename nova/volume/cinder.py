@@ -22,8 +22,10 @@ import collections
 import copy
 import functools
 import sys
+import urllib
 
 from cinderclient import api_versions as cinder_api_versions
+from cinderclient import apiclient as cinder_apiclient
 from cinderclient import client as cinder_client
 from cinderclient import exceptions as cinder_exception
 from keystoneauth1 import exceptions as keystone_exception
@@ -33,15 +35,12 @@ from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
 from oslo_utils import excutils
 from oslo_utils import strutils
-import six
-from six.moves import urllib
+import retrying
 
 from nova import availability_zones as az
 import nova.conf
 from nova import exception
 from nova.i18n import _
-from nova.i18n import _LE
-from nova.i18n import _LW
 from nova import service_auth
 
 
@@ -153,7 +152,7 @@ def _get_server_version(context, url):
                 break
     except cinder_exception.ClientException as e:
         LOG.warning("Error in server version query:%s\n"
-                    "Returning APIVersion 2.0", six.text_type(e.message))
+                    "Returning APIVersion 2.0", str(e.message))
     return (cinder_api_versions.APIVersion(min_version),
             cinder_api_versions.APIVersion(current_version))
 
@@ -480,7 +479,7 @@ def translate_mixed_exceptions(method):
 
 
 def _reraise(desired_exc):
-    six.reraise(type(desired_exc), desired_exc, sys.exc_info()[2])
+    raise desired_exc.with_traceback(sys.exc_info()[2])
 
 
 class API(object):
@@ -566,6 +565,9 @@ class API(object):
                                              mountpoint, mode=mode)
 
     @translate_volume_exception
+    @retrying.retry(stop_max_attempt_number=5,
+                    retry_on_exception=lambda e:
+                    type(e) == cinder_apiclient.exceptions.InternalServerError)
     def detach(self, context, volume_id, instance_uuid=None,
                attachment_id=None):
         client = cinderclient(context)
@@ -577,21 +579,21 @@ class API(object):
                     attachment_id = attachments.get(instance_uuid, {}).\
                             get('attachment_id')
                     if not attachment_id:
-                        LOG.warning(_LW("attachment_id couldn't be retrieved "
-                                        "for volume %(volume_id)s with "
-                                        "instance_uuid %(instance_id)s. The "
-                                        "volume has the 'multiattach' flag "
-                                        "enabled, without the attachment_id "
-                                        "Cinder most probably cannot perform "
-                                        "the detach."),
+                        LOG.warning("attachment_id couldn't be retrieved "
+                                    "for volume %(volume_id)s with "
+                                    "instance_uuid %(instance_id)s. The "
+                                    "volume has the 'multiattach' flag "
+                                    "enabled, without the attachment_id "
+                                    "Cinder most probably cannot perform "
+                                    "the detach.",
                                     {'volume_id': volume_id,
                                      'instance_id': instance_uuid})
                 else:
-                    LOG.warning(_LW("attachment_id couldn't be retrieved for "
-                                    "volume %(volume_id)s. The volume has the "
-                                    "'multiattach' flag enabled, without the "
-                                    "attachment_id Cinder most probably "
-                                    "cannot perform the detach."),
+                    LOG.warning("attachment_id couldn't be retrieved for "
+                                "volume %(volume_id)s. The volume has the "
+                                "'multiattach' flag enabled, without the "
+                                "attachment_id Cinder most probably "
+                                "cannot perform the detach.",
                                 {'volume_id': volume_id})
 
         client.volumes.detach(volume_id, attachment_id)
@@ -605,30 +607,32 @@ class API(object):
             return connection_info
         except cinder_exception.ClientException as ex:
             with excutils.save_and_reraise_exception():
-                LOG.error(_LE('Initialize connection failed for volume '
-                              '%(vol)s on host %(host)s. Error: %(msg)s '
-                              'Code: %(code)s. Attempting to terminate '
-                              'connection.'),
-                          {'vol': volume_id,
-                           'host': connector.get('host'),
-                           'msg': six.text_type(ex),
-                           'code': ex.code})
+                LOG.error(
+                    'Initialize connection failed for volume %(vol)s on host '
+                    '%(host)s. Error: %(msg)s Code: %(code)s. '
+                    'Attempting to terminate connection.',
+                    {'vol': volume_id,
+                     'host': connector.get('host'),
+                     'msg': str(ex),
+                     'code': ex.code})
                 try:
                     self.terminate_connection(context, volume_id, connector)
                 except Exception as exc:
-                    LOG.error(_LE('Connection between volume %(vol)s and host '
-                                  '%(host)s might have succeeded, but attempt '
-                                  'to terminate connection has failed. '
-                                  'Validate the connection and determine if '
-                                  'manual cleanup is needed. Error: %(msg)s '
-                                  'Code: %(code)s.'),
-                              {'vol': volume_id,
-                               'host': connector.get('host'),
-                               'msg': six.text_type(exc),
-                               'code': (
-                                exc.code if hasattr(exc, 'code') else None)})
+                    LOG.error(
+                        'Connection between volume %(vol)s and host %(host)s '
+                        'might have succeeded, but attempt to terminate '
+                        'connection has failed. Validate the connection and '
+                        'determine if manual cleanup is needed. '
+                        'Error: %(msg)s Code: %(code)s.',
+                        {'vol': volume_id,
+                        'host': connector.get('host'),
+                        'msg': str(exc),
+                        'code': exc.code if hasattr(exc, 'code') else None})
 
     @translate_volume_exception
+    @retrying.retry(stop_max_attempt_number=5,
+                    retry_on_exception=lambda e:
+                    type(e) == cinder_apiclient.exceptions.InternalServerError)
     def terminate_connection(self, context, volume_id, connector):
         return cinderclient(context).volumes.terminate_connection(volume_id,
                                                                   connector)
@@ -795,10 +799,10 @@ class API(object):
                 # NOTE: It is unnecessary to output BadRequest(400) error log,
                 # because operators don't need to debug such cases.
                 if getattr(ex, 'code', None) != 400:
-                    LOG.error(('Create attachment failed for volume '
-                               '%(volume_id)s. Error: %(msg)s Code: %(code)s'),
+                    LOG.error('Create attachment failed for volume '
+                              '%(volume_id)s. Error: %(msg)s Code: %(code)s',
                               {'volume_id': volume_id,
-                               'msg': six.text_type(ex),
+                               'msg': str(ex),
                                'code': getattr(ex, 'code', None)},
                               instance_uuid=instance_id)
 
@@ -821,10 +825,10 @@ class API(object):
             return translated_attach_ref
         except cinder_exception.ClientException as ex:
             with excutils.save_and_reraise_exception():
-                LOG.error(('Show attachment failed for attachment '
-                           '%(id)s. Error: %(msg)s Code: %(code)s'),
+                LOG.error('Show attachment failed for attachment '
+                          '%(id)s. Error: %(msg)s Code: %(code)s',
                           {'id': attachment_id,
-                           'msg': six.text_type(ex),
+                           'msg': str(ex),
                            'code': getattr(ex, 'code', None)})
 
     @translate_attachment_exception
@@ -868,13 +872,16 @@ class API(object):
             return translated_attach_ref
         except cinder_exception.ClientException as ex:
             with excutils.save_and_reraise_exception():
-                LOG.error(('Update attachment failed for attachment '
-                           '%(id)s. Error: %(msg)s Code: %(code)s'),
+                LOG.error('Update attachment failed for attachment '
+                          '%(id)s. Error: %(msg)s Code: %(code)s',
                           {'id': attachment_id,
-                           'msg': six.text_type(ex),
+                           'msg': str(ex),
                            'code': getattr(ex, 'code', None)})
 
     @translate_attachment_exception
+    @retrying.retry(stop_max_attempt_number=5,
+                    retry_on_exception=lambda e:
+                    type(e) == cinder_apiclient.exceptions.InternalServerError)
     def attachment_delete(self, context, attachment_id):
         try:
             cinderclient(
@@ -882,10 +889,10 @@ class API(object):
                     attachment_id)
         except cinder_exception.ClientException as ex:
             with excutils.save_and_reraise_exception():
-                LOG.error(('Delete attachment failed for attachment '
-                           '%(id)s. Error: %(msg)s Code: %(code)s'),
+                LOG.error('Delete attachment failed for attachment '
+                          '%(id)s. Error: %(msg)s Code: %(code)s',
                           {'id': attachment_id,
-                           'msg': six.text_type(ex),
+                           'msg': str(ex),
                            'code': getattr(ex, 'code', None)})
 
     @translate_attachment_exception
@@ -905,8 +912,8 @@ class API(object):
                     attachment_id)
         except cinder_exception.ClientException as ex:
             with excutils.save_and_reraise_exception():
-                LOG.error(('Complete attachment failed for attachment '
-                           '%(id)s. Error: %(msg)s Code: %(code)s'),
+                LOG.error('Complete attachment failed for attachment '
+                          '%(id)s. Error: %(msg)s Code: %(code)s',
                           {'id': attachment_id,
-                           'msg': six.text_type(ex),
+                           'msg': str(ex),
                            'code': getattr(ex, 'code', None)})

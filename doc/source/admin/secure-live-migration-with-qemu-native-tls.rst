@@ -40,7 +40,7 @@ Prerequisites
     nodes.  To simplify your PKI (Public Key Infrastructure) setup, use
     deployment tools that take care of handling all the certificate
     lifecycle management.  For example, refer to the "`TLS everywhere
-    <https://docs.openstack.org/tripleo-docs/latest/install/advanced_deployment/tls_everywhere.html>`__"
+    <https://docs.openstack.org/project-deploy-guide/tripleo-docs/latest/features/tls-everywhere.html>`__"
     guide from the TripleO project.
 
 (3) Password-less SSH setup for all relevant compute nodes.
@@ -120,16 +120,25 @@ Performing the migration
 
 (1) On all relevant compute nodes, enable the
     :oslo.config:option:`libvirt.live_migration_with_native_tls`
-    configuration attribute::
+    configuration attribute and set the
+    :oslo.config:option:`libvirt.live_migration_scheme`
+    configuration attribute to tls::
 
        [libvirt]
        live_migration_with_native_tls = true
+       live_migration_scheme = tls
 
     .. note::
         Setting both
         :oslo.config:option:`libvirt.live_migration_with_native_tls` and
         :oslo.config:option:`libvirt.live_migration_tunnelled` at the
         same time is invalid (and disallowed).
+
+    .. note::
+        Not setting
+        :oslo.config:option:`libvirt.live_migration_scheme` to ``tls``
+        will result in libvirt using the unencrypted TCP connection
+        without displaying any error or a warning in the logs.
 
     And restart the ``nova-compute`` service::
 

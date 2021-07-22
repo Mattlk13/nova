@@ -18,27 +18,51 @@ from oslo_policy import policy
 from nova.policies import base
 
 
-BASE_POLICY_NAME = 'os_compute_api:os-baremetal-nodes'
+ROOT_POLICY = 'os_compute_api:os-baremetal-nodes'
+BASE_POLICY_NAME = 'os_compute_api:os-baremetal-nodes:%s'
+
+DEPRECATED_REASON = """
+Nova API policies are introducing new default roles with scope_type
+capabilities. Old policies are deprecated and silently going to be ignored
+in nova 23.0.0 release.
+"""
+
+DEPRECATED_BAREMETAL_POLICY = policy.DeprecatedRule(
+    ROOT_POLICY,
+    base.RULE_ADMIN_API,
+    deprecated_reason=DEPRECATED_REASON,
+    deprecated_since='22.0.0'
+)
 
 
 baremetal_nodes_policies = [
     policy.DocumentedRuleDefault(
-        BASE_POLICY_NAME,
-        base.RULE_ADMIN_API,
-        """List and show details of bare metal nodes.
+        name=BASE_POLICY_NAME % 'list',
+        check_str=base.SYSTEM_READER,
+        description="""List and show details of bare metal nodes.
 
 These APIs are proxy calls to the Ironic service and are deprecated.
 """,
-        [
+        operations=[
             {
                 'method': 'GET',
                 'path': '/os-baremetal-nodes'
-            },
+            }
+        ],
+        scope_types=['system'],
+        deprecated_rule=DEPRECATED_BAREMETAL_POLICY),
+    policy.DocumentedRuleDefault(
+        name=BASE_POLICY_NAME % 'show',
+        check_str=base.SYSTEM_READER,
+        description="""Show action details for a server.""",
+        operations=[
             {
                 'method': 'GET',
                 'path': '/os-baremetal-nodes/{node_id}'
             }
-        ]),
+        ],
+        scope_types=['system'],
+        deprecated_rule=DEPRECATED_BAREMETAL_POLICY)
 ]
 
 

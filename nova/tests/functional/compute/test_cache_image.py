@@ -15,7 +15,7 @@ from oslo_utils.fixture import uuidsentinel as uuids
 from nova import context
 from nova import objects
 from nova import test
-from nova.tests.unit import fake_notifier
+from nova.tests import fixtures
 
 
 class ImageCacheTest(test.TestCase):
@@ -26,19 +26,19 @@ class ImageCacheTest(test.TestCase):
 
         self.flags(compute_driver='fake.FakeDriverWithCaching')
 
-        fake_notifier.stub_notifier(self)
-        self.addCleanup(fake_notifier.reset)
+        self.notifier = self.useFixture(fixtures.NotificationFixture(self))
+
         self.context = context.get_admin_context()
 
         self.conductor = self.start_service('conductor')
         self.compute1 = self.start_service('compute', host='compute1')
         self.compute2 = self.start_service('compute', host='compute2')
         self.compute3 = self.start_service('compute', host='compute3',
-                                           cell='cell2')
+                                           cell_name='cell2')
         self.compute4 = self.start_service('compute', host='compute4',
-                                           cell='cell2')
+                                           cell_name='cell2')
         self.compute5 = self.start_service('compute', host='compute5',
-                                           cell='cell2')
+                                           cell_name='cell2')
 
         cell2 = self.cell_mappings['cell2']
         with context.target_cell(self.context, cell2) as cctxt:
@@ -70,10 +70,10 @@ class ImageCacheTest(test.TestCase):
             mgr = getattr(self, host)
             self.assertEqual(set(), mgr.driver.cached_images)
 
-        fake_notifier.wait_for_versioned_notifications(
+        self.notifier.wait_for_versioned_notifications(
             'aggregate.cache_images.start')
 
-        progress = fake_notifier.wait_for_versioned_notifications(
+        progress = self.notifier.wait_for_versioned_notifications(
             'aggregate.cache_images.progress', n_events=4)
         self.assertEqual(4, len(progress), progress)
         for notification in progress:
@@ -89,7 +89,7 @@ class ImageCacheTest(test.TestCase):
             self.assertEqual(4, payload['total'])
             self.assertIn('conductor', notification['publisher_id'])
 
-        fake_notifier.wait_for_versioned_notifications(
+        self.notifier.wait_for_versioned_notifications(
             'aggregate.cache_images.end')
 
         logtext = self.stdlog.logger.output

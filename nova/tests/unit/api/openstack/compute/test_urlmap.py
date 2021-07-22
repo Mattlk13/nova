@@ -16,18 +16,14 @@
 from oslo_serialization import jsonutils
 
 from nova import test
+from nova.tests import fixtures
 from nova.tests.unit.api.openstack import fakes
-import nova.tests.unit.image.fake
 
 
 class UrlmapTest(test.NoDBTestCase):
     def setUp(self):
         super(UrlmapTest, self).setUp()
-        nova.tests.unit.image.fake.stub_out_image_service(self)
-
-    def tearDown(self):
-        super(UrlmapTest, self).tearDown()
-        nova.tests.unit.image.fake.FakeImageService_reset()
+        self.useFixture(fixtures.GlanceFixture(self))
 
     def test_path_version_v2(self):
         # Test URL path specifying v2 returns v2 content.
@@ -114,3 +110,25 @@ class UrlmapTest(test.NoDBTestCase):
         self.assertEqual("application/json", res.content_type)
         body = jsonutils.loads(res.body)
         self.assertEqual('v2.1', body['version']['id'])
+
+    def test_script_name_path_info(self):
+        """Ensure URLMap preserves SCRIPT_NAME and PATH_INFO correctly."""
+        data = (
+            ('', '', ''),
+            ('/', '', '/'),
+            ('/v2', '/v2', ''),
+            ('/v2/', '/v2', '/'),
+            ('/v2.1', '/v2.1', ''),
+            ('/v2.1/', '/v2.1', '/'),
+            ('/v2/foo', '/v2', '/foo'),
+            ('/v2.1/foo', '/v2.1', '/foo'),
+            ('/bar/baz', '', '/bar/baz')
+        )
+        app = fakes.wsgi_app_v21()
+        for url, exp_script_name, exp_path_info in data:
+            req = fakes.HTTPRequest.blank(url)
+            req.get_response(app)
+            # The app uses /v2 as the base URL :(
+            exp_script_name = '/v2' + exp_script_name
+            self.assertEqual(exp_script_name, req.environ['SCRIPT_NAME'])
+            self.assertEqual(exp_path_info, req.environ['PATH_INFO'])

@@ -27,12 +27,9 @@ from nova.compute import api as compute
 from nova import exception
 from nova.i18n import _
 from nova.network import neutron
-from nova import objects
 from nova.policies import migrate_server as ms_policies
 
 LOG = logging.getLogger(__name__)
-
-MIN_COMPUTE_MOVE_BANDWIDTH = 39
 
 
 class MigrateServerController(wsgi.Controller):
@@ -48,37 +45,29 @@ class MigrateServerController(wsgi.Controller):
     def _migrate(self, req, id, body):
         """Permit admins to migrate a server to a new host."""
         context = req.environ['nova.context']
-        context.can(ms_policies.POLICY_ROOT % 'migrate')
+
+        instance = common.get_instance(self.compute_api, context, id,
+                                       expected_attrs=['flavor', 'services'])
+        context.can(ms_policies.POLICY_ROOT % 'migrate',
+                    target={'project_id': instance.project_id})
 
         host_name = None
         if (api_version_request.is_supported(req, min_version='2.56') and
             body['migrate'] is not None):
             host_name = body['migrate'].get('host')
 
-        instance = common.get_instance(self.compute_api, context, id,
-                                       expected_attrs=['flavor', 'services'])
-
-        if common.instance_has_port_with_resource_request(
-                instance.uuid, self.network_api):
-            # TODO(gibi): Remove when nova only supports compute newer than
-            # Train
-            source_service = objects.Service.get_by_host_and_binary(
-                context, instance.host, 'nova-compute')
-            if source_service.version < MIN_COMPUTE_MOVE_BANDWIDTH:
-                msg = _("The migrate action on a server with ports having "
-                        "resource requests, like a port with a QoS "
-                        "minimum bandwidth policy, is not yet supported "
-                        "on the source compute")
-                raise exc.HTTPConflict(explanation=msg)
-
         try:
             self.compute_api.resize(req.environ['nova.context'], instance,
                                     host_name=host_name)
-        except (exception.TooManyInstances, exception.QuotaError) as e:
+        except (exception.TooManyInstances, exception.QuotaError,
+                exception.ForbiddenWithAccelerators) as e:
             raise exc.HTTPForbidden(explanation=e.format_message())
-        except (exception.InstanceIsLocked,
-                exception.InstanceNotReady,
-                exception.ServiceUnavailable) as e:
+        except (
+            exception.InstanceIsLocked,
+            exception.InstanceNotReady,
+            exception.ServiceUnavailable,
+            exception.OperationNotSupportedForVDPAInterface,
+        ) as e:
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
@@ -90,7 +79,7 @@ class MigrateServerController(wsgi.Controller):
             raise exc.HTTPBadRequest(explanation=e.format_message())
 
     @wsgi.response(202)
-    @wsgi.expected_errors((400, 404, 409))
+    @wsgi.expected_errors((400, 403, 404, 409))
     @wsgi.action('os-migrateLive')
     @validation.schema(migrate_server.migrate_live, "2.0", "2.24")
     @validation.schema(migrate_server.migrate_live_v2_25, "2.25", "2.29")
@@ -99,7 +88,15 @@ class MigrateServerController(wsgi.Controller):
     def _migrate_live(self, req, id, body):
         """Permit admins to (live) migrate a server to a new host."""
         context = req.environ["nova.context"]
-        context.can(ms_policies.POLICY_ROOT % 'migrate_live')
+
+        # NOTE(stephenfin): we need 'numa_topology' because of the
+        # 'LiveMigrationTask._check_instance_has_no_numa' check in the
+        # conductor
+        instance = common.get_instance(self.compute_api, context, id,
+                                       expected_attrs=['numa_topology'])
+
+        context.can(ms_policies.POLICY_ROOT % 'migrate_live',
+                    target={'project_id': instance.project_id})
 
         host = body["os-migrateLive"]["host"]
         block_migration = body["os-migrateLive"]["block_migration"]
@@ -122,12 +119,6 @@ class MigrateServerController(wsgi.Controller):
             disk_over_commit = strutils.bool_from_string(disk_over_commit,
                                                          strict=True)
 
-        # NOTE(stephenfin): we need 'numa_topology' because of the
-        # 'LiveMigrationTask._check_instance_has_no_numa' check in the
-        # conductor
-        instance = common.get_instance(self.compute_api, context, id,
-                                       expected_attrs=['numa_topology'])
-
         try:
             self.compute_api.live_migrate(context, instance, block_migration,
                                           disk_over_commit, host, force,
@@ -149,7 +140,11 @@ class MigrateServerController(wsgi.Controller):
                               "'%(ex)s'", {'ex': ex})
             else:
                 raise exc.HTTPBadRequest(explanation=ex.format_message())
-        except exception.OperationNotSupportedForSEV as e:
+        except (
+            exception.OperationNotSupportedForSEV,
+            exception.OperationNotSupportedForVTPM,
+            exception.OperationNotSupportedForVDPAInterface,
+        ) as e:
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceIsLocked as e:
             raise exc.HTTPConflict(explanation=e.format_message())
@@ -158,6 +153,8 @@ class MigrateServerController(wsgi.Controller):
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'os-migrateLive', id)
+        except exception.ForbiddenWithAccelerators as e:
+            raise exc.HTTPForbidden(explanation=e.format_message())
 
     def _get_force_param_for_live_migration(self, body, host):
         force = body["os-migrateLive"].get("force", False)

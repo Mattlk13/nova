@@ -11,7 +11,6 @@
 #    under the License.
 
 import mock
-import six
 
 from nova import context
 from nova import objects
@@ -20,12 +19,9 @@ from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional.api import client as api_client
 from nova.tests.functional import fixtures as func_fixtures
 from nova.tests.functional import integrated_helpers
-from nova.tests.functional import test_servers
-from nova.tests.unit.image import fake as fake_image
-from nova.tests.unit import policy_fixture
 
 
-class BootFromVolumeTest(test_servers.ServersTestBase):
+class BootFromVolumeTest(integrated_helpers._IntegratedTestBase):
 
     def _get_hypervisor_stats(self):
         response = self.admin_api.api_get('/os-hypervisors/statistics')
@@ -54,7 +50,6 @@ class BootFromVolumeTest(test_servers.ServersTestBase):
         self.flags(allow_resize_to_same_host=True)
         super(BootFromVolumeTest, self).setUp()
         self.admin_api = self.api_fixture.admin_api
-        self.useFixture(nova_fixtures.CinderFixture(self))
 
     def test_boot_from_volume_larger_than_local_gb(self):
         # Verify no local disk is being used currently
@@ -163,7 +158,7 @@ class BootFromVolumeTest(test_servers.ServersTestBase):
                                {'server': server})
         self.assertEqual(400, ex.response.status_code)
         self.assertIn('You specified more local devices than the limit allows',
-                      six.text_type(ex))
+                      str(ex))
 
 
 class BootFromVolumeLargeRequestTest(test.TestCase,
@@ -171,12 +166,11 @@ class BootFromVolumeLargeRequestTest(test.TestCase,
 
     def setUp(self):
         super(BootFromVolumeLargeRequestTest, self).setUp()
-        self.useFixture(policy_fixture.RealPolicyFixture())
+        self.useFixture(nova_fixtures.RealPolicyFixture())
         self.useFixture(nova_fixtures.NeutronFixture(self))
+        self.glance = self.useFixture(nova_fixtures.GlanceFixture(self))
         self.useFixture(nova_fixtures.CinderFixture(self))
         self.useFixture(func_fixtures.PlacementFixture())
-        self.image_service = fake_image.stub_out_image_service(self)
-        self.addCleanup(fake_image.FakeImageService_reset)
 
         self.api = self.useFixture(nova_fixtures.OSAPIFixture(
             api_version='v2.1')).admin_api
@@ -218,7 +212,7 @@ class BootFromVolumeLargeRequestTest(test.TestCase,
         # Wrap the image service get method to check how many times it was
         # called.
         with mock.patch('nova.image.glance.API.get',
-                        wraps=self.image_service.show) as mock_image_get:
+                        wraps=self.glance.show) as mock_image_get:
             self.api.post_server({'server': server})
             # Assert that there was caching of the GET /v2/images/{image_id}
             # calls. The expected total in this case is 3: one for validating

@@ -31,7 +31,7 @@ LOG = logging.getLogger(__name__)
 
 
 # NOTE(danms): This is the global service version counter
-SERVICE_VERSION = 48
+SERVICE_VERSION = 56
 
 
 # NOTE(danms): This is our SERVICE_VERSION history. The idea is that any
@@ -178,7 +178,37 @@ SERVICE_VERSION_HISTORY = (
     {'compute_rpc': '5.10'},
     # Version 48: Drivers report COMPUTE_SAME_HOST_COLD_MIGRATE trait.
     {'compute_rpc': '5.10'},
+    # Version 49: Compute now support server move operations with qos ports
+    {'compute_rpc': '5.10'},
+    # Version 50: Compute RPC v5.11:
+    # Add accel_uuids (accelerator requests) param to build_and_run_instance
+    {'compute_rpc': '5.11'},
+    # Version 51: Add support for live migration with vpmem
+    {'compute_rpc': '5.11'},
+    # Version 52: Add support for the 'mixed' CPU allocation policy
+    {'compute_rpc': '5.11'},
+    # Version 53: Compute RPC v5.12:
+    # Add accel_uuids (accelerator requests) param to rebuild_instance
+    {'compute_rpc': '5.12'},
+    # Version 54: Compute RPC v5.13:
+    # Add accel_uuids (accelerator requests) param to shelve_instance and
+    # shelve_offload_instance and unshelve_instance
+    {'compute_rpc': '5.13'},
+    # Version 55: Compute RPC v5.13:
+    # Add support for qos interface attach
+    {'compute_rpc': '5.13'},
+    # Version 56: Compute RPC v6.0:
+    {'compute_rpc': '6.0'},
 )
+
+# This is used to raise an error at service startup if older than N-1 computes
+# are detected. Update this at the beginning of every release cycle to point to
+# the smallest service version that was added in N-1.
+OLDEST_SUPPORTED_SERVICE_VERSION = 'Wallaby'
+SERVICE_VERSION_ALIASES = {
+    'Victoria': 52,
+    'Wallaby': 54,
+}
 
 
 # TODO(berrange): Remove NovaObjectDictCompat

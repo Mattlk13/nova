@@ -12,7 +12,6 @@
 
 import os_resource_classes as orc
 import os_traits
-import six
 
 from nova import context as nova_context
 from nova import exception
@@ -56,7 +55,7 @@ class TestServicesAPI(integrated_helpers.ProviderUsageBaseTestCase):
 
         # Make sure there is a resource provider for that compute node based
         # on the uuid.
-        resp = self.placement_api.get('/resource_providers/%s' % rp_uuid)
+        resp = self.placement.get('/resource_providers/%s' % rp_uuid)
         self.assertEqual(200, resp.status)
 
         # Make sure the resource provider has inventory.
@@ -83,7 +82,7 @@ class TestServicesAPI(integrated_helpers.ProviderUsageBaseTestCase):
                                self.admin_api.api_delete,
                                '/os-services/%s' % service['id'])
         self.assertIn('Unable to delete compute service that is hosting '
-                      'instances.', six.text_type(ex))
+                      'instances.', str(ex))
         self.assertEqual(409, ex.response.status_code)
 
         # Now delete the instance and wait for it to be gone.
@@ -114,7 +113,7 @@ class TestServicesAPI(integrated_helpers.ProviderUsageBaseTestCase):
         # And finally, the resource provider should also be gone. The API
         # will perform a cascading delete of the resource provider inventory
         # and allocation information.
-        resp = self.placement_api.get('/resource_providers/%s' % rp_uuid)
+        resp = self.placement.get('/resource_providers/%s' % rp_uuid)
         self.assertEqual(404, resp.status)
 
     def test_evacuate_then_delete_compute_service(self):
@@ -136,19 +135,16 @@ class TestServicesAPI(integrated_helpers.ProviderUsageBaseTestCase):
         rp_uuid = self._get_provider_uuid_by_host(service['host'])
         # Make sure there is a resource provider for that compute node based
         # on the uuid.
-        resp = self.placement_api.get('/resource_providers/%s' % rp_uuid)
+        resp = self.placement.get('/resource_providers/%s' % rp_uuid)
         self.assertEqual(200, resp.status)
         # Down the compute service for host1 so we can evacuate from it.
         self.admin_api.put_service(service['id'], {'forced_down': True})
         host1.stop()
         # Start another host and trigger the server evacuate to that host.
         self._start_compute('host2')
-        self.admin_api.post_server_action(server['id'], {'evacuate': {}})
         # The host does not change until after the status is changed to ACTIVE
         # so wait for both parameters.
-        self._wait_for_server_parameter(server, {
-            'status': 'ACTIVE',
-            'OS-EXT-SRV-ATTR:host': 'host2'})
+        self._evacuate_server(server, expected_host='host2')
         # Delete the compute service for host1 and check the related
         # placement resources for that host.
         self.admin_api.api_delete('/os-services/%s' % service['id'])
@@ -159,7 +155,7 @@ class TestServicesAPI(integrated_helpers.ProviderUsageBaseTestCase):
         # FIXME(mriedem): This is bug 1829479 where the compute service is
         # deleted but the resource provider is not because there are still
         # allocations against the provider from the evacuated server.
-        resp = self.placement_api.get('/resource_providers/%s' % rp_uuid)
+        resp = self.placement.get('/resource_providers/%s' % rp_uuid)
         self.assertEqual(200, resp.status)
         self.assertFlavorMatchesUsage(rp_uuid, flavor)
         # Try to restart the host1 compute service to create a new resource
@@ -201,11 +197,11 @@ class TestServicesAPI(integrated_helpers.ProviderUsageBaseTestCase):
                                '/os-services/%s' % service['id'])
         self.assertEqual(409, ex.response.status_code)
         self.assertIn('Unable to delete compute service that has in-progress '
-                      'migrations', six.text_type(ex))
+                      'migrations', str(ex))
         self.assertIn('There are 1 in-progress migrations involving the host',
                       self.stdlog.logger.output)
         # The provider is still around because we did not delete the service.
-        resp = self.placement_api.get('/resource_providers/%s' % host1_rp_uuid)
+        resp = self.placement.get('/resource_providers/%s' % host1_rp_uuid)
         self.assertEqual(200, resp.status)
         self.assertFlavorMatchesUsage(host1_rp_uuid, flavor)
         # Now try to confirm the migration.
@@ -214,7 +210,7 @@ class TestServicesAPI(integrated_helpers.ProviderUsageBaseTestCase):
         # server is on host2.
         self.admin_api.api_delete('/os-services/%s' % service['id'])
         # The host1 resource provider should be gone.
-        resp = self.placement_api.get('/resource_providers/%s' % host1_rp_uuid)
+        resp = self.placement.get('/resource_providers/%s' % host1_rp_uuid)
         self.assertEqual(404, resp.status)
 
     def test_resize_revert_after_deleted_source_compute(self):
@@ -246,11 +242,11 @@ class TestServicesAPI(integrated_helpers.ProviderUsageBaseTestCase):
                                '/os-services/%s' % service['id'])
         self.assertEqual(409, ex.response.status_code)
         self.assertIn('Unable to delete compute service that has in-progress '
-                      'migrations', six.text_type(ex))
+                      'migrations', str(ex))
         self.assertIn('There are 1 in-progress migrations involving the host',
                       self.stdlog.logger.output)
         # The provider is still around because we did not delete the service.
-        resp = self.placement_api.get('/resource_providers/%s' % host1_rp_uuid)
+        resp = self.placement.get('/resource_providers/%s' % host1_rp_uuid)
         self.assertEqual(200, resp.status)
         self.assertFlavorMatchesUsage(host1_rp_uuid, flavor1)
         # Now revert the resize.
@@ -264,7 +260,7 @@ class TestServicesAPI(integrated_helpers.ProviderUsageBaseTestCase):
             binary='nova-compute', host='host2')[0]
         self.admin_api.api_delete('/os-services/%s' % service2['id'])
         # The host2 resource provider should be gone.
-        resp = self.placement_api.get('/resource_providers/%s' % host2_rp_uuid)
+        resp = self.placement.get('/resource_providers/%s' % host2_rp_uuid)
         self.assertEqual(404, resp.status)
 
 

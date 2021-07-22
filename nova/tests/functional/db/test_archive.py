@@ -16,8 +16,8 @@ import datetime
 import re
 
 from dateutil import parser as dateutil_parser
+from oslo_utils import fixture as osloutils_fixture
 from oslo_utils import timeutils
-from sqlalchemy.dialects import sqlite
 from sqlalchemy import func
 from sqlalchemy import MetaData
 from sqlalchemy import select
@@ -25,30 +25,21 @@ from sqlalchemy import select
 from nova import context
 from nova.db import api as db
 from nova.db.sqlalchemy import api as sqlalchemy_api
-from nova.tests.functional import test_servers
+from nova import objects
+from nova.tests.functional import integrated_helpers
+from nova import utils as nova_utils
 
 
-class TestDatabaseArchive(test_servers.ServersTestBase):
+class TestDatabaseArchive(integrated_helpers._IntegratedTestBase):
     """Tests DB API for archiving (soft) deleted records"""
 
     def setUp(self):
+        # Disable filters (namely the ComputeFilter) because we'll manipulate
+        # time.
+        self.flags(
+            enabled_filters=['AllHostsFilter'], group='filter_scheduler')
         super(TestDatabaseArchive, self).setUp()
-        # TODO(mriedem): pull this out so we can re-use it in
-        # test_archive_deleted_rows_fk_constraint
-        # SQLite doesn't enforce foreign key constraints without a pragma.
-        engine = sqlalchemy_api.get_engine()
-        dialect = engine.url.get_dialect()
-        if dialect == sqlite.dialect:
-            # We're seeing issues with foreign key support in SQLite 3.6.20
-            # SQLAlchemy doesn't support it at all with < SQLite 3.6.19
-            # It works fine in SQLite 3.7.
-            # So return early to skip this test if running SQLite < 3.7
-            import sqlite3
-            tup = sqlite3.sqlite_version_info
-            if tup[0] < 3 or (tup[0] == 3 and tup[1] < 7):
-                self.skipTest(
-                    'sqlite version too old for reliable SQLA foreign_keys')
-            engine.connect().execute("PRAGMA foreign_keys = ON")
+        self.enforce_fk_constraints()
 
     def test_archive_deleted_rows(self):
         # Boots a server, deletes it, and then tries to archive it.
@@ -114,6 +105,19 @@ class TestDatabaseArchive(test_servers.ServersTestBase):
         # Verify we have some system_metadata since we'll check that later.
         self.assertTrue(len(instance.system_metadata),
                         'No system_metadata for instance: %s' % server_id)
+        # Create a pci_devices record to simulate an instance that had a PCI
+        # device allocated at the time it was deleted. There is a window of
+        # time between deletion of the instance record and freeing of the PCI
+        # device in nova-compute's _complete_deletion method during RT update.
+        db.pci_device_update(admin_context, 1, 'fake-address',
+                             {'compute_node_id': 1,
+                              'address': 'fake-address',
+                              'vendor_id': 'fake',
+                              'product_id': 'fake',
+                              'dev_type': 'fake',
+                              'label': 'fake',
+                              'status': 'allocated',
+                              'instance_uuid': instance.uuid})
         # Now try and archive the soft deleted records.
         results, deleted_instance_uuids, archived = \
             db.archive_deleted_rows(max_rows=100)
@@ -128,6 +132,49 @@ class TestDatabaseArchive(test_servers.ServersTestBase):
         self.assertIn('instance_actions', results)
         self.assertIn('instance_actions_events', results)
         self.assertEqual(sum(results.values()), archived)
+        # Verify that the pci_devices record has not been dropped
+        self.assertNotIn('pci_devices', results)
+
+    def test_archive_deleted_rows_incomplete(self):
+        """This tests a scenario where archive_deleted_rows is run with
+        --max_rows and does not run to completion.
+
+        That is, the archive is stopped before all archivable records have been
+        archived. Specifically, the problematic state is when a single instance
+        becomes partially archived (example: 'instance_extra' record for one
+        instance has been archived while its 'instances' record remains). Any
+        access of the instance (example: listing deleted instances) that
+        triggers the retrieval of a dependent record that has been archived
+        away, results in undefined behavior that may raise an error.
+
+        We will force the system into a state where a single deleted instance
+        is partially archived. We want to verify that we can, for example,
+        successfully do a GET /servers/detail at any point between partial
+        archive_deleted_rows runs without errors.
+        """
+        # Boots a server, deletes it, and then tries to archive it.
+        server = self._create_server()
+        server_id = server['id']
+        # Assert that there are instance_actions. instance_actions are
+        # interesting since we don't soft delete them but they have a foreign
+        # key back to the instances table.
+        actions = self.api.get_instance_actions(server_id)
+        self.assertTrue(len(actions),
+                        'No instance actions for server: %s' % server_id)
+        self._delete_server(server)
+        # Archive deleted records iteratively, 1 row at a time, and try to do a
+        # GET /servers/detail between each run. All should succeed.
+        exceptions = []
+        while True:
+            _, _, archived = db.archive_deleted_rows(max_rows=1)
+            try:
+                # Need to use the admin API to list deleted servers.
+                self.admin_api.get_servers(search_opts={'deleted': True})
+            except Exception as ex:
+                exceptions.append(ex)
+            if archived == 0:
+                break
+        self.assertFalse(exceptions)
 
     def _get_table_counts(self):
         engine = sqlalchemy_api.get_engine()
@@ -143,10 +190,32 @@ class TestDatabaseArchive(test_servers.ServersTestBase):
         return results
 
     def test_archive_then_purge_all(self):
+        # Enable the generation of task_log records by the instance usage audit
+        # nova-compute periodic task.
+        self.flags(instance_usage_audit=True)
+        compute = self.computes['compute']
+
         server = self._create_server()
         server_id = server['id']
+
+        admin_context = context.get_admin_context()
+        future = timeutils.utcnow() + datetime.timedelta(days=30)
+
+        with osloutils_fixture.TimeFixture(future):
+            # task_log records are generated by the _instance_usage_audit
+            # periodic task.
+            compute.manager._instance_usage_audit(admin_context)
+            # Audit period defaults to 1 month, the last audit period will
+            # be the previous calendar month.
+            begin, end = nova_utils.last_completed_audit_period()
+            # Verify that we have 1 task_log record per audit period.
+            task_logs = objects.TaskLogList.get_all(
+                admin_context, 'instance_usage_audit', begin, end)
+            self.assertEqual(1, len(task_logs))
+
         self._delete_server(server)
-        results, deleted_ids, archived = db.archive_deleted_rows(max_rows=1000)
+        results, deleted_ids, archived = db.archive_deleted_rows(
+            max_rows=1000, task_log=True)
         self.assertEqual([server_id], deleted_ids)
 
         lines = []
@@ -154,7 +223,6 @@ class TestDatabaseArchive(test_servers.ServersTestBase):
         def status(msg):
             lines.append(msg)
 
-        admin_context = context.get_admin_context()
         deleted = sqlalchemy_api.purge_shadow_tables(admin_context,
                                                      None, status_fn=status)
         self.assertNotEqual(0, deleted)
@@ -163,41 +231,69 @@ class TestDatabaseArchive(test_servers.ServersTestBase):
         for line in lines:
             self.assertIsNotNone(re.match(r'Deleted [1-9][0-9]* rows from .*',
                                           line))
+        # Ensure we purged task_log records.
+        self.assertIn('shadow_task_log', str(lines))
 
         results = self._get_table_counts()
         # No table should have any rows
         self.assertFalse(any(results.values()))
 
     def test_archive_then_purge_by_date(self):
-        server = self._create_server()
+        # Enable the generation of task_log records by the instance usage audit
+        # nova-compute periodic task.
+        self.flags(instance_usage_audit=True)
+        compute = self.computes['compute']
+
+        # Simulate a server that was created 30 days ago, needed to test the
+        # task_log coverage. The task_log audit period defaults to 1 month, so
+        # for a server to appear in the task_log, it must have been active
+        # during the previous calendar month.
+        month_ago = timeutils.utcnow() - datetime.timedelta(days=30)
+        with osloutils_fixture.TimeFixture(month_ago):
+            server = self._create_server()
+
         server_id = server['id']
+        admin_context = context.get_admin_context()
+
+        # task_log records are generated by the _instance_usage_audit
+        # periodic task.
+        compute.manager._instance_usage_audit(admin_context)
+        # Audit period defaults to 1 month, the last audit period will
+        # be the previous calendar month.
+        begin, end = nova_utils.last_completed_audit_period()
+        # Verify that we have 1 task_log record per audit period.
+        task_logs = objects.TaskLogList.get_all(
+            admin_context, 'instance_usage_audit', begin, end)
+        self.assertEqual(1, len(task_logs))
+
+        # Delete the server and archive deleted rows.
         self._delete_server(server)
-        results, deleted_ids, archived = db.archive_deleted_rows(max_rows=1000)
+        results, deleted_ids, archived = db.archive_deleted_rows(
+            max_rows=1000, task_log=True)
         self.assertEqual([server_id], deleted_ids)
         self.assertEqual(sum(results.values()), archived)
 
         pre_purge_results = self._get_table_counts()
 
-        past = timeutils.utcnow() - datetime.timedelta(hours=1)
-        admin_context = context.get_admin_context()
-        deleted = sqlalchemy_api.purge_shadow_tables(admin_context,
-                                                     past)
         # Make sure we didn't delete anything if the marker is before
         # we started
+        past = timeutils.utcnow() - datetime.timedelta(days=31)
+        deleted = sqlalchemy_api.purge_shadow_tables(admin_context,
+                                                     past)
         self.assertEqual(0, deleted)
 
-        results = self._get_table_counts()
         # Nothing should be changed if we didn't purge anything
+        results = self._get_table_counts()
         self.assertEqual(pre_purge_results, results)
 
-        future = timeutils.utcnow() + datetime.timedelta(hours=1)
-        deleted = sqlalchemy_api.purge_shadow_tables(admin_context, future)
         # Make sure we deleted things when the marker is after
         # we started
+        future = timeutils.utcnow() + datetime.timedelta(hours=1)
+        deleted = sqlalchemy_api.purge_shadow_tables(admin_context, future)
         self.assertNotEqual(0, deleted)
 
-        results = self._get_table_counts()
         # There should be no rows in any table if we purged everything
+        results = self._get_table_counts()
         self.assertFalse(any(results.values()))
 
     def test_purge_with_real_date(self):

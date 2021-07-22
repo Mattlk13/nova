@@ -20,7 +20,6 @@ from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import uuidutils
-import six
 import webob
 
 from nova.api.openstack.compute import security_groups as secgroups_v21
@@ -34,7 +33,6 @@ from nova import objects
 from nova.objects import instance as instance_obj
 from nova import test
 from nova.tests.unit.api.openstack import fakes
-
 
 CONF = cfg.CONF
 FAKE_UUID1 = 'a47ae74e-ab08-447f-8eee-ffd43fc46c16'
@@ -122,11 +120,11 @@ class MockClient(object):
 
     def create_security_group(self, body=None):
         s = body.get('security_group')
-        if not isinstance(s.get('name', ''), six.string_types):
+        if not isinstance(s.get('name', ''), str):
             msg = ('BadRequest: Invalid input for name. Reason: '
                    'None is not a valid string.')
             raise n_exc.BadRequest(message=msg)
-        if not isinstance(s.get('description.', ''), six.string_types):
+        if not isinstance(s.get('description.', ''), str):
             msg = ('BadRequest: Invalid input for description. Reason: '
                    'None is not a valid string.')
             raise n_exc.BadRequest(message=msg)
@@ -395,13 +393,15 @@ class TestSecurityGroupsV21(test.TestCase):
         self.fake_id = '11111111-1111-1111-1111-111111111111'
 
         self.req = fakes.HTTPRequest.blank('')
+        project_id = self.req.environ['nova.context'].project_id
         self.admin_req = fakes.HTTPRequest.blank('', use_admin_context=True)
         self.stub_out('nova.compute.api.API.get',
                       fakes.fake_compute_get(
                           **{'power_state': 0x01,
                              'host': "localhost",
                              'uuid': UUID_SERVER,
-                             'name': 'asdf'}))
+                             'name': 'asdf',
+                             'project_id': project_id}))
 
         self.original_client = neutron_api.get_client
         neutron_api.get_client = get_client
@@ -638,7 +638,7 @@ class TestSecurityGroupsV21(test.TestCase):
         neutron = neutron_api.API()
         with mock.patch.object(nova.db.api, 'instance_get_by_uuid',
                                return_value=db_inst):
-            neutron.allocate_for_instance(_context, instance, False, None,
+            neutron.allocate_for_instance(_context, instance, None,
                                           security_groups=[sg['id']])
 
         req = fakes.HTTPRequest.blank(
@@ -1574,84 +1574,6 @@ class SecurityGroupsOutputTest(test.TestCase):
         res = self._make_request(url)
 
         self.assertEqual(res.status_int, 404)
-
-
-class PolicyEnforcementV21(test.NoDBTestCase):
-
-    def setUp(self):
-        super(PolicyEnforcementV21, self).setUp()
-        self.req = fakes.HTTPRequest.blank('')
-        self.rule_name = "os_compute_api:os-security-groups"
-        self.rule = {self.rule_name: "project:non_fake"}
-
-    def _common_policy_check(self, func, *arg, **kwarg):
-        self.policy.set_rules(self.rule)
-        exc = self.assertRaises(
-            exception.PolicyNotAuthorized, func, *arg, **kwarg)
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % self.rule_name,
-            exc.format_message())
-
-
-class SecurityGroupPolicyEnforcementV21(PolicyEnforcementV21):
-
-    def setUp(self):
-        super(SecurityGroupPolicyEnforcementV21, self).setUp()
-        self.controller = secgroups_v21.SecurityGroupController()
-
-    def test_create_policy_failed(self):
-        self._common_policy_check(self.controller.create, self.req, {})
-
-    def test_show_policy_failed(self):
-        self._common_policy_check(self.controller.show, self.req, FAKE_UUID1)
-
-    def test_delete_policy_failed(self):
-        self._common_policy_check(self.controller.delete, self.req, FAKE_UUID1)
-
-    def test_index_policy_failed(self):
-        self._common_policy_check(self.controller.index, self.req)
-
-    def test_update_policy_failed(self):
-        self._common_policy_check(
-            self.controller.update, self.req, FAKE_UUID1, {})
-
-
-class ServerSecurityGroupPolicyEnforcementV21(PolicyEnforcementV21):
-
-    def setUp(self):
-        super(ServerSecurityGroupPolicyEnforcementV21, self).setUp()
-        self.controller = secgroups_v21.ServerSecurityGroupController()
-
-    def test_index_policy_failed(self):
-        self._common_policy_check(self.controller.index, self.req, FAKE_UUID1)
-
-
-class SecurityGroupRulesPolicyEnforcementV21(PolicyEnforcementV21):
-
-    def setUp(self):
-        super(SecurityGroupRulesPolicyEnforcementV21, self).setUp()
-        self.controller = secgroups_v21.SecurityGroupRulesController()
-
-    def test_create_policy_failed(self):
-        self._common_policy_check(self.controller.create, self.req, {})
-
-    def test_delete_policy_failed(self):
-        self._common_policy_check(self.controller.delete, self.req, FAKE_UUID1)
-
-
-class SecurityGroupActionPolicyEnforcementV21(PolicyEnforcementV21):
-
-    def setUp(self):
-        super(SecurityGroupActionPolicyEnforcementV21, self).setUp()
-        self.controller = secgroups_v21.SecurityGroupActionController()
-
-    def test_add_security_group_policy_failed(self):
-        self._common_policy_check(
-            self.controller._addSecurityGroup, self.req, FAKE_UUID1, {})
-
-    def test_remove_security_group_policy_failed(self):
-        self._common_policy_check(
-            self.controller._removeSecurityGroup, self.req, FAKE_UUID1, {})
 
 
 class TestSecurityGroupsDeprecation(test.NoDBTestCase):

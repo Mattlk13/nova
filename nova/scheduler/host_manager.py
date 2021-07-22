@@ -29,7 +29,6 @@ except ImportError:
 import iso8601
 from oslo_log import log as logging
 from oslo_utils import timeutils
-import six
 
 import nova.conf
 from nova import context as context_module
@@ -228,6 +227,7 @@ class HostState(object):
         self.numa_topology = objects.NUMATopology.obj_from_db_obj(
             compute.numa_topology) if compute.numa_topology else None
         self.pci_stats = pci_stats.PciDeviceStats(
+            self.numa_topology,
             stats=compute.pci_device_pools)
 
         # All virt drivers report host_ip
@@ -600,7 +600,7 @@ class HostManager(object):
                     return name_to_cls_map.values()
                 else:
                     return []
-            hosts = six.itervalues(name_to_cls_map)
+            hosts = name_to_cls_map.values()
 
         return self.filter_handler.get_filtered_objects(self.enabled_filters,
                 hosts, spec_obj, index)

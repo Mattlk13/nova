@@ -10,8 +10,6 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import six
-
 from nova.policies import base as base_policies
 from nova.policies import servers as servers_policies
 from nova import test
@@ -19,8 +17,6 @@ from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional.api import client as api_client
 from nova.tests.functional import fixtures as func_fixtures
 from nova.tests.functional import integrated_helpers
-from nova.tests.unit.image import fake as fake_image
-from nova.tests.unit import policy_fixture
 
 
 class ServersPreSchedulingTestCase(test.TestCase,
@@ -43,9 +39,9 @@ class ServersPreSchedulingTestCase(test.TestCase,
 
     def setUp(self):
         super(ServersPreSchedulingTestCase, self).setUp()
-        fake_image.stub_out_image_service(self)
-        self.useFixture(policy_fixture.RealPolicyFixture())
+        self.useFixture(nova_fixtures.RealPolicyFixture())
         self.useFixture(nova_fixtures.NoopConductorFixture())
+        self.glance = self.useFixture(nova_fixtures.GlanceFixture(self))
         self.useFixture(nova_fixtures.NeutronFixture(self))
         self.useFixture(func_fixtures.PlacementFixture())
         api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
@@ -58,7 +54,7 @@ class ServersPreSchedulingTestCase(test.TestCase,
 
     def test_instance_from_buildrequest(self):
         self.useFixture(nova_fixtures.AllServicesCurrent())
-        image_ref = fake_image.get_valid_image_id()
+        image_ref = self.glance.auto_disk_config_enabled_image['id']
         body = {
             'server': {
                 'name': 'foo',
@@ -89,7 +85,7 @@ class ServersPreSchedulingTestCase(test.TestCase,
         self.assertEqual('BUILD', server['status'])
 
     def test_instance_from_buildrequest_old_service(self):
-        image_ref = fake_image.get_valid_image_id()
+        image_ref = self.glance.auto_disk_config_enabled_image['id']
         body = {
             'server': {
                 'name': 'foo',
@@ -120,7 +116,7 @@ class ServersPreSchedulingTestCase(test.TestCase,
 
     def test_delete_instance_from_buildrequest(self):
         self.useFixture(nova_fixtures.AllServicesCurrent())
-        image_ref = fake_image.get_valid_image_id()
+        image_ref = self.glance.auto_disk_config_enabled_image['id']
         body = {
             'server': {
                 'name': 'foo',
@@ -137,7 +133,7 @@ class ServersPreSchedulingTestCase(test.TestCase,
         self.assertEqual(404, get_resp.status)
 
     def test_delete_instance_from_buildrequest_old_service(self):
-        image_ref = fake_image.get_valid_image_id()
+        image_ref = self.glance.auto_disk_config_enabled_image['id']
         body = {
             'server': {
                 'name': 'foo',
@@ -154,7 +150,7 @@ class ServersPreSchedulingTestCase(test.TestCase,
         self.assertEqual(404, get_resp.status)
 
     def _test_instance_list_from_buildrequests(self):
-        image_ref = fake_image.get_valid_image_id()
+        image_ref = self.glance.auto_disk_config_enabled_image['id']
         body = {
             'server': {
                 'name': 'foo',
@@ -198,7 +194,7 @@ class ServersPreSchedulingTestCase(test.TestCase,
         used to test the various tags filters working in the BuildRequestList.
         """
         self.useFixture(nova_fixtures.AllServicesCurrent())
-        image_ref = fake_image.get_valid_image_id()
+        image_ref = self.glance.auto_disk_config_enabled_image['id']
         body = {
             'server': {
                 'name': 'foo',
@@ -270,8 +266,8 @@ class ServersPreSchedulingTestCase(test.TestCase,
             }
         })
 
-        # Since _IntegratedTestBase uses the CastAsCall fixture, when we
-        # get the server back we know all of the volume stuff should be done.
+        # Since _IntegratedTestBase uses the CastAsCallFixture, when we get the
+        # server back we know all of the volume stuff should be done.
         self.assertIn(volume_id,
                       cinder.volume_ids_for_instance(server['id']))
 
@@ -297,7 +293,7 @@ class ServersPreSchedulingTestCase(test.TestCase,
         body = {
             'server': {
                 'name': 'test_instance_list_build_request_marker_ip_filter',
-                'imageRef': fake_image.get_valid_image_id(),
+                'imageRef': self.glance.auto_disk_config_enabled_image['id'],
                 'flavorRef': '1',
                 'networks': 'none'
             }
@@ -324,11 +320,10 @@ class EnforceVolumeBackedForZeroDiskFlavorTestCase(
 
     def setUp(self):
         super(EnforceVolumeBackedForZeroDiskFlavorTestCase, self).setUp()
-        fake_image.stub_out_image_service(self)
-        self.addCleanup(fake_image.FakeImageService_reset)
+        self.glance = self.useFixture(nova_fixtures.GlanceFixture(self))
         self.useFixture(nova_fixtures.NeutronFixture(self))
         self.policy_fixture = (
-            self.useFixture(policy_fixture.RealPolicyFixture()))
+            self.useFixture(nova_fixtures.RealPolicyFixture()))
         api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
             api_version='v2.1'))
 
@@ -354,12 +349,12 @@ class EnforceVolumeBackedForZeroDiskFlavorTestCase(
             servers_policies.ZERO_DISK_FLAVOR: base_policies.RULE_ADMIN_API},
             overwrite=False)
         server_req = self._build_server(
-            image_uuid=fake_image.AUTO_DISK_CONFIG_ENABLED_IMAGE_UUID,
+            image_uuid=self.glance.auto_disk_config_enabled_image['id'],
             flavor_id=self.zero_disk_flavor['id'])
         ex = self.assertRaises(api_client.OpenStackApiException,
                                self.api.post_server, {'server': server_req})
         self.assertIn('Only volume-backed servers are allowed for flavors '
-                      'with zero disk.', six.text_type(ex))
+                      'with zero disk.', str(ex))
         self.assertEqual(403, ex.response.status_code)
 
     def test_create_volume_backed_server_with_zero_disk_allowed(self):
@@ -417,7 +412,7 @@ class ResizeCheckInstanceHostTestCase(
         ex = self.assertRaises(api_client.OpenStackApiException,
                                self.api.post_server_action, server['id'], req)
         self.assertEqual(409, ex.response.status_code)
-        self.assertIn('Service is unavailable at this time', six.text_type(ex))
+        self.assertIn('Service is unavailable at this time', str(ex))
         # Now bring the source compute service up but disable it. The operation
         # should be allowed in this case since the service is up.
         self.api.put_service(source_service['id'],
@@ -439,8 +434,7 @@ class ResizeCheckInstanceHostTestCase(
         self.assertEqual(409, ex.response.status_code)
         # This error comes from check_instance_state which is processed before
         # check_instance_host.
-        self.assertIn('while it is in vm_state shelved_offloaded',
-                      six.text_type(ex))
+        self.assertIn('while it is in vm_state shelved_offloaded', str(ex))
 
     def test_cold_migrate_source_compute_validation(self):
         self.test_resize_source_compute_validation(resize=False)

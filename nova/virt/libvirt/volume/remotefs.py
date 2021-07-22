@@ -20,10 +20,8 @@ from oslo_concurrency import processutils
 from oslo_log import log as logging
 from oslo_utils import fileutils
 from oslo_utils import importutils
-import six
 
 import nova.conf
-from nova.i18n import _
 import nova.privsep.fs
 from nova import utils
 
@@ -46,7 +44,7 @@ def mount_share(mount_path, export_path,
     try:
         nova.privsep.fs.mount(export_type, export_path, mount_path, options)
     except processutils.ProcessExecutionError as exc:
-        if 'Device or resource busy' in six.text_type(exc):
+        if 'Device or resource busy' in str(exc):
             LOG.warning("%s is already mounted", export_path)
         else:
             raise
@@ -61,10 +59,10 @@ def unmount_share(mount_path, export_path):
     try:
         nova.privsep.fs.umount(mount_path)
     except processutils.ProcessExecutionError as exc:
-        if 'target is busy' in six.text_type(exc):
+        if 'target is busy' in str(exc):
             LOG.debug("The share %s is still in use.", export_path)
         else:
-            LOG.exception(_("Couldn't unmount the share %s"), export_path)
+            LOG.exception("Couldn't unmount the share %s", export_path)
 
 
 class RemoteFilesystem(object):
@@ -108,8 +106,7 @@ class RemoteFilesystem(object):
                               compression=compression)
 
 
-@six.add_metaclass(abc.ABCMeta)
-class RemoteFilesystemDriver(object):
+class RemoteFilesystemDriver(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def create_file(self, host, dst_path, on_execute, on_completion):
         """Create file on the remote system.
@@ -191,10 +188,13 @@ class SshDriver(RemoteFilesystemDriver):
                           on_execute=on_execute, on_completion=on_completion)
 
     def copy_file(self, src, dst, on_execute, on_completion, compression):
+        args = ['scp']
+        if compression:
+            args.append('-C')
         # As far as ploop disks are in fact directories we add '-r' argument
-        processutils.execute('scp', '-r', src, dst,
-                             on_execute=on_execute,
-                             on_completion=on_completion)
+        args.extend(['-r', src, dst])
+        processutils.execute(
+            *args, on_execute=on_execute, on_completion=on_completion)
 
 
 class RsyncDriver(RemoteFilesystemDriver):

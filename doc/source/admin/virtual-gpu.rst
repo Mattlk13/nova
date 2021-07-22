@@ -2,6 +2,11 @@
 Attaching virtual GPU devices to guests
 =======================================
 
+.. important::
+
+   The functionality described below is only supported by the libvirt/KVM
+   driver.
+
 The virtual GPU feature in Nova allows a deployment to provide specific GPU
 types for instances using physical GPUs that can provide virtual devices.
 
@@ -10,11 +15,11 @@ Graphics Processing Unit (pGPU) can be virtualized as multiple virtual Graphics
 Processing Units (vGPUs) if the hypervisor supports the hardware driver and has
 the capability to create guests using those virtual devices.
 
-This feature is highly dependent on the hypervisor, its version and the
-physical devices present on the host. In addition, the vendor's vGPU driver software
+This feature is highly dependent on the version of libvirt and the physical
+devices present on the host. In addition, the vendor's vGPU driver software
 must be installed and configured on the host at the same time.
 
-Hypervisor-specific caveats are mentioned in the `Caveats`_ section.
+Caveats are mentioned in the `Caveats`_ section.
 
 To enable virtual GPUs, follow the steps below:
 
@@ -35,14 +40,32 @@ Enable GPU types (Compute)
       [devices]
       enabled_vgpu_types = nvidia-35
 
-   .. note::
+   If you want to support more than a single GPU type, you need to provide a
+   separate configuration section for each device. For example:
 
-         As of the Queens release, Nova only supports a single type. If more
-         than one vGPU type is specified (as a comma-separated list), only the
-         first one will be used.
+   .. code-block:: ini
+
+      [devices]
+      enabled_vgpu_types = nvidia-35, nvidia-36
+
+      [vgpu_nvidia-35]
+      device_addresses = 0000:84:00.0,0000:85:00.0
+
+      [vgpu_nvidia-36]
+      device_addresses = 0000:86:00.0
+
+   where you have to define which physical GPUs are supported per GPU type.
+
+   If the same PCI address is provided for two different types, nova-compute
+   will refuse to start and issue a specific error in the logs.
 
    To know which specific type(s) to mention, please refer to `How to discover
    a GPU type`_.
+
+   .. versionchanged:: 21.0.0
+
+      Supporting multiple GPU types is only supported by the Ussuri release and
+      later versions.
 
 #. Restart the ``nova-compute`` service.
 
@@ -68,13 +91,14 @@ Configure a flavor to request one virtual GPU:
 
 .. note::
 
-       As of the Queens release, all hypervisors that support virtual GPUs
-       only accept a single virtual GPU per instance.
+    As of the Queens release, all hypervisors that support virtual GPUs
+    only accept a single virtual GPU per instance.
 
 The enabled vGPU types on the compute hosts are not exposed to API users.
 Flavors configured for vGPU support can be tied to host aggregates as a means
 to properly schedule those flavors onto the compute hosts that support them.
 See :doc:`/admin/aggregates` for more information.
+
 
 Create instances with virtual GPU devices
 -----------------------------------------
@@ -96,92 +120,36 @@ provided by compute nodes.
 How to discover a GPU type
 --------------------------
 
-Depending on your hypervisor:
+Virtual GPUs are seen as mediated devices. Physical PCI devices (the graphic
+card here) supporting virtual GPUs propose mediated device (mdev) types. Since
+mediated devices are supported by the Linux kernel through sysfs files after
+installing the vendor's virtual GPUs driver software, you can see the required
+properties as follows:
 
-- For libvirt, virtual GPUs are seen as mediated devices. Physical PCI devices
-  (the graphic card here) supporting virtual GPUs propose mediated device
-  (mdev) types. Since mediated devices are supported by the Linux kernel
-  through sysfs files after installing the vendor's virtual GPUs driver
-  software, you can see the required properties as follows:
+.. code-block:: console
 
-  .. code-block:: console
+    $ ls /sys/class/mdev_bus/*/mdev_supported_types
+    /sys/class/mdev_bus/0000:84:00.0/mdev_supported_types:
+    nvidia-35  nvidia-36  nvidia-37  nvidia-38  nvidia-39  nvidia-40  nvidia-41  nvidia-42  nvidia-43  nvidia-44  nvidia-45
 
-     $ ls /sys/class/mdev_bus/*/mdev_supported_types
-     /sys/class/mdev_bus/0000:84:00.0/mdev_supported_types:
-     nvidia-35  nvidia-36  nvidia-37  nvidia-38  nvidia-39  nvidia-40  nvidia-41  nvidia-42  nvidia-43  nvidia-44  nvidia-45
+    /sys/class/mdev_bus/0000:85:00.0/mdev_supported_types:
+    nvidia-35  nvidia-36  nvidia-37  nvidia-38  nvidia-39  nvidia-40  nvidia-41  nvidia-42  nvidia-43  nvidia-44  nvidia-45
 
-     /sys/class/mdev_bus/0000:85:00.0/mdev_supported_types:
-     nvidia-35  nvidia-36  nvidia-37  nvidia-38  nvidia-39  nvidia-40  nvidia-41  nvidia-42  nvidia-43  nvidia-44  nvidia-45
+    /sys/class/mdev_bus/0000:86:00.0/mdev_supported_types:
+    nvidia-35  nvidia-36  nvidia-37  nvidia-38  nvidia-39  nvidia-40  nvidia-41  nvidia-42  nvidia-43  nvidia-44  nvidia-45
 
-     /sys/class/mdev_bus/0000:86:00.0/mdev_supported_types:
-     nvidia-35  nvidia-36  nvidia-37  nvidia-38  nvidia-39  nvidia-40  nvidia-41  nvidia-42  nvidia-43  nvidia-44  nvidia-45
+    /sys/class/mdev_bus/0000:87:00.0/mdev_supported_types:
+    nvidia-35  nvidia-36  nvidia-37  nvidia-38  nvidia-39  nvidia-40  nvidia-41  nvidia-42  nvidia-43  nvidia-44  nvidia-45
 
-     /sys/class/mdev_bus/0000:87:00.0/mdev_supported_types:
-     nvidia-35  nvidia-36  nvidia-37  nvidia-38  nvidia-39  nvidia-40  nvidia-41  nvidia-42  nvidia-43  nvidia-44  nvidia-45
-
-
-- For XenServer, virtual GPU types are created by XenServer at startup
-  depending on the available hardware and config files present in dom0.
-  You can run the command of ``xe vgpu-type-list`` from dom0 to get the
-  available vGPU types. The value for the field of ``model-name ( RO):``
-  is the vGPU type's name which can be used to set the nova config option
-  ``[devices]/enabled_vgpu_types``. See the following example:
-
-  .. code-block:: console
-
-    [root@trailblazer-2 ~]# xe vgpu-type-list
-    uuid ( RO)              : 78d2d963-41d6-4130-8842-aedbc559709f
-           vendor-name ( RO): NVIDIA Corporation
-            model-name ( RO): GRID M60-8Q
-             max-heads ( RO): 4
-        max-resolution ( RO): 4096x2160
-
-
-    uuid ( RO)              : a1bb1692-8ce3-4577-a611-6b4b8f35a5c9
-           vendor-name ( RO): NVIDIA Corporation
-            model-name ( RO): GRID M60-0Q
-             max-heads ( RO): 2
-        max-resolution ( RO): 2560x1600
-
-
-    uuid ( RO)              : 69d03200-49eb-4002-b661-824aec4fd26f
-           vendor-name ( RO): NVIDIA Corporation
-            model-name ( RO): GRID M60-2A
-             max-heads ( RO): 1
-        max-resolution ( RO): 1280x1024
-
-
-    uuid ( RO)              : c58b1007-8b47-4336-95aa-981a5634d03d
-           vendor-name ( RO): NVIDIA Corporation
-            model-name ( RO): GRID M60-4Q
-             max-heads ( RO): 4
-        max-resolution ( RO): 4096x2160
-
-
-    uuid ( RO)              : 292a2b20-887f-4a13-b310-98a75c53b61f
-           vendor-name ( RO): NVIDIA Corporation
-            model-name ( RO): GRID M60-2Q
-             max-heads ( RO): 4
-        max-resolution ( RO): 4096x2160
-
-
-    uuid ( RO)              : d377db6b-a068-4a98-92a8-f94bd8d6cc5d
-           vendor-name ( RO): NVIDIA Corporation
-            model-name ( RO): GRID M60-0B
-             max-heads ( RO): 2
-        max-resolution ( RO): 2560x1600
-
-    ...
 
 Checking allocations and inventories for virtual GPUs
 -----------------------------------------------------
 
 .. note::
 
-   The information below is only valid from the 19.0.0 Stein release and only
-   for the libvirt driver. Before this release or when using the Xen driver,
-   inventories and allocations related to a ``VGPU`` resource class are still
-   on the root resource provider related to the compute node.
+   The information below is only valid from the 19.0.0 Stein release.  Before
+   this release, inventories and allocations related to a ``VGPU`` resource
+   class are still on the root resource provider related to the compute node.
    If upgrading from Rocky and using the libvirt driver, ``VGPU`` inventory and
    allocations are moved to child resource providers that represent actual
    physical GPUs.
@@ -269,6 +237,59 @@ OpenStackClient. For details on specific commands, see its documentation.
    physical GPU having the PCI ID ``0000:85:00.0``.
 
 
+(Optional) Provide custom traits for multiple GPU types
+-------------------------------------------------------
+
+Since operators want to support different GPU types per compute, it would be
+nice to have flavors asking for a specific GPU type. This is now possible
+using custom traits by decorating child Resource Providers that correspond
+to physical GPUs.
+
+.. note::
+
+   Possible improvements in a future release could consist of providing
+   automatic tagging of Resource Providers with standard traits corresponding
+   to versioned mapping of public GPU types. For the moment, this has to be
+   done manually.
+
+#. Get the list of resource providers
+
+   See `Checking allocations and inventories for virtual GPUs`_ first for getting
+   the list of Resource Providers that support a ``VGPU`` resource class.
+
+#. Define custom traits that will correspond for each to a GPU type
+
+   .. code-block:: console
+
+      $ openstack --os-placement-api-version 1.6 trait create CUSTOM_NVIDIA_11
+
+   In this example, we ask to create a custom trait named ``CUSTOM_NVIDIA_11``.
+
+#. Add the corresponding trait to the Resource Provider matching the GPU
+
+   .. code-block:: console
+
+      $ openstack --os-placement-api-version 1.6 resource provider trait set \
+          --trait CUSTOM_NVIDIA_11 e2f8607b-0683-4141-a8af-f5e20682e28c
+
+   In this case, the trait ``CUSTOM_NVIDIA_11`` will be added to the Resource
+   Provider with the UUID ``e2f8607b-0683-4141-a8af-f5e20682e28c`` that
+   corresponds to the PCI address ``0000:85:00:0`` as shown above.
+
+#. Amend the flavor to add a requested trait
+
+   .. code-block:: console
+
+      $ openstack flavor set --property trait:CUSTOM_NVIDIA_11=required vgpu_1
+
+   In this example, we add the ``CUSTOM_NVIDIA_11`` trait as a required
+   information for the ``vgpu_1`` flavor we created earlier.
+
+   This will allow the Placement service to only return the Resource Providers
+   matching this trait so only the GPUs that were decorated with will be checked
+   for this flavor.
+
+
 Caveats
 -------
 
@@ -276,8 +297,6 @@ Caveats
 
    This information is correct as of the 17.0.0 Queens release. Where
    improvements have been made or issues fixed, they are noted per item.
-
-For libvirt:
 
 * Suspending a guest that has vGPUs doesn't yet work because of a libvirt
   limitation (it can't hot-unplug mediated devices from a guest). Workarounds
@@ -292,9 +311,17 @@ For libvirt:
   vGPU resources). The proposed workaround is to rebuild the instance after
   resizing it. The rebuild operation allocates vGPUS to the instance.
 
+  .. versionchanged:: 21.0.0
+
+     This has been resolved in the Ussuri release. See `bug 1778563`_.
+
 * Cold migrating an instance to another host will have the same problem as
   resize. If you want to migrate an instance, make sure to rebuild it after the
   migration.
+
+  .. versionchanged:: 21.0.0
+
+     This has been resolved in the Ussuri release. See `bug 1778563`_.
 
 * Rescue images do not use vGPUs. An instance being rescued does not keep its
   vGPUs during rescue. During that time, another instance can receive those
@@ -302,29 +329,32 @@ For libvirt:
   instance immediately after rescue. However, rebuilding the rescued instance
   only helps if there are other free vGPUs on the host.
 
-  .. note:: This has been resolved in the Rocky release [#]_.
+  .. versionchanged:: 18.0.0
 
-For XenServer:
+     This has been resolved in the Rocky release. See `bug 1762688`_.
 
-* Suspend and live migration with vGPUs attached depends on support from the
-  underlying XenServer version. Please see XenServer release notes for up to
-  date information on when a hypervisor supporting live migration and
-  suspend/resume with vGPUs is available. If a suspend or live migrate operation
-  is attempted with a XenServer version that does not support that operation, an
-  internal exception will occur that will cause nova setting the instance to
-  be in ERROR status. You can use the command of
-  ``openstack server set --state active <server>`` to set it back to ACTIVE.
+For nested vGPUs:
 
-* Resizing an instance with a new flavor that has vGPU resources doesn't
-  allocate those vGPUs to the instance (the instance is created without
-  vGPU resources). The proposed workaround is to rebuild the instance after
-  resizing it. The rebuild operation allocates vGPUS to the instance.
+.. note::
 
-* Cold migrating an instance to another host will have the same problem as
-  resize. If you want to migrate an instance, make sure to rebuild it after the
-  migration.
+   This information is correct as of the 21.0.0 Ussuri release. Where
+   improvements have been made or issues fixed, they are noted per item.
 
-.. [#] https://bugs.launchpad.net/nova/+bug/1762688
+* If creating servers with a flavor asking for vGPUs and the user wants
+  multi-create (i.e. say --max 2) then the scheduler could be returning
+  a NoValidHosts exception even if each physical GPU can support at least
+  one specific instance, if the total wanted capacity is not supported by
+  only one physical GPU.
+  (See `bug 1874664 <https://bugs.launchpad.net/nova/+bug/1874664>`_.)
+
+  For example, creating servers with a flavor asking for vGPUs, if two
+  children RPs have 4 vGPU inventories each:
+
+    - You can ask for a flavor with 2 vGPU with --max 2.
+    - But you can't ask for a flavor with 4 vGPU and --max 2.
+
+.. _bug 1778563: https://bugs.launchpad.net/nova/+bug/1778563
+.. _bug 1762688: https://bugs.launchpad.net/nova/+bug/1762688
 
 .. Links
 .. _Intel GVT-g: https://01.org/igvt-g

@@ -19,7 +19,6 @@ import os
 
 import fixtures
 import mock
-from six.moves import builtins
 
 from nova import exception
 from nova.pci import utils
@@ -95,8 +94,7 @@ class GetFunctionByIfnameTestCase(test.NoDBTestCase):
     @mock.patch.object(os, 'readlink')
     def test_virtual_function(self, mock_readlink, *args):
         mock_readlink.return_value = '../../../0000.00.00.1'
-        with mock.patch.object(
-            builtins, 'open', side_effect=IOError()):
+        with mock.patch('builtins.open', side_effect=IOError()):
             address, physical_function = utils.get_function_by_ifname('eth0')
             self.assertEqual(address, '0000.00.00.1')
             self.assertFalse(physical_function)
@@ -129,14 +127,12 @@ class IsPhysicalFunctionTestCase(test.NoDBTestCase):
 
     @mock.patch('os.path.isdir', return_value=True)
     def test_virtual_function(self, *args):
-        with mock.patch.object(
-            builtins, 'open', side_effect=IOError()):
+        with mock.patch('builtins.open', side_effect=IOError()):
             self.assertFalse(utils.is_physical_function(*self.pci_args))
 
     @mock.patch('os.path.isdir', return_value=True)
     def test_physical_function(self, *args):
-        with mock.patch.object(
-            builtins, 'open', mock.mock_open(read_data='4')):
+        with mock.patch('builtins.open', mock.mock_open(read_data='4')):
             self.assertTrue(utils.is_physical_function(*self.pci_args))
 
     @mock.patch('os.path.isdir', return_value=False)
@@ -255,57 +251,3 @@ class GetVfNumByPciAddressTestCase(test.NoDBTestCase):
             utils.get_vf_num_by_pci_address,
             self.pci_address
         )
-
-    @mock.patch.object(os, 'readlink')
-    @mock.patch.object(glob, 'iglob')
-    def test_exception(self, mock_iglob, mock_readlink):
-        mock_iglob.return_value = self.paths
-        mock_readlink.side_effect = OSError('No such file or directory')
-        self.assertRaises(
-            exception.PciDeviceNotFoundById,
-            utils.get_vf_num_by_pci_address,
-            self.pci_address
-        )
-
-
-class GetNetNameByVfPciAddressTestCase(test.NoDBTestCase):
-
-    def setUp(self):
-        super(GetNetNameByVfPciAddressTestCase, self).setUp()
-        self._get_mac = mock.patch.object(utils, 'get_mac_by_pci_address')
-        self.mock_get_mac = self._get_mac.start()
-        self._get_ifname = mock.patch.object(
-            utils, 'get_ifname_by_pci_address')
-        self.mock_get_ifname = self._get_ifname.start()
-        self.addCleanup(self._get_mac.stop)
-        self.addCleanup(self._get_ifname.stop)
-
-        self.mac = 'ca:fe:ca:fe:ca:fe'
-        self.if_name = 'enp7s0f0'
-        self.pci_address = '0000:07:02.1'
-
-    def test_correct_behaviour(self):
-        ref_net_name = 'net_enp7s0f0_ca_fe_ca_fe_ca_fe'
-        self.mock_get_mac.return_value = self.mac
-        self.mock_get_ifname.return_value = self.if_name
-        net_name = utils.get_net_name_by_vf_pci_address(self.pci_address)
-        self.assertEqual(ref_net_name, net_name)
-        self.mock_get_mac.assert_called_once_with(self.pci_address)
-        self.mock_get_ifname.assert_called_once_with(self.pci_address)
-
-    def test_wrong_mac(self):
-        self.mock_get_mac.side_effect = (
-            exception.PciDeviceNotFoundById(self.pci_address))
-        net_name = utils.get_net_name_by_vf_pci_address(self.pci_address)
-        self.assertIsNone(net_name)
-        self.mock_get_mac.assert_called_once_with(self.pci_address)
-        self.mock_get_ifname.assert_not_called()
-
-    def test_wrong_ifname(self):
-        self.mock_get_mac.return_value = self.mac
-        self.mock_get_ifname.side_effect = (
-            exception.PciDeviceNotFoundById(self.pci_address))
-        net_name = utils.get_net_name_by_vf_pci_address(self.pci_address)
-        self.assertIsNone(net_name)
-        self.mock_get_mac.assert_called_once_with(self.pci_address)
-        self.mock_get_ifname.assert_called_once_with(self.pci_address)

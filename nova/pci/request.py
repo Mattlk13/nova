@@ -38,12 +38,14 @@
     product_id is "0442" or "0443".
     """
 
+import typing as ty
+
 import jsonschema
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
-import six
 
 import nova.conf
+from nova import context as ctx
 from nova import exception
 from nova.i18n import _
 from nova.network import model as network_model
@@ -51,18 +53,20 @@ from nova import objects
 from nova.objects import fields as obj_fields
 from nova.pci import utils
 
-LOG = logging.getLogger(__name__)
+Alias = ty.Dict[str, ty.Tuple[str, ty.List[ty.Dict[str, str]]]]
+
 PCI_NET_TAG = 'physical_network'
 PCI_TRUSTED_TAG = 'trusted'
 PCI_DEVICE_TYPE_TAG = 'dev_type'
 
 DEVICE_TYPE_FOR_VNIC_TYPE = {
-    network_model.VNIC_TYPE_DIRECT_PHYSICAL: obj_fields.PciDeviceType.SRIOV_PF
+    network_model.VNIC_TYPE_DIRECT_PHYSICAL: obj_fields.PciDeviceType.SRIOV_PF,
+    network_model.VNIC_TYPE_VDPA: obj_fields.PciDeviceType.VDPA,
 }
 
 CONF = nova.conf.CONF
+LOG = logging.getLogger(__name__)
 
-_ALIAS_CAP_TYPE = ['pci']
 _ALIAS_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -76,7 +80,7 @@ _ALIAS_SCHEMA = {
         # should probably be removed.
         "capability_type": {
             "type": "string",
-            "enum": _ALIAS_CAP_TYPE,
+            "enum": ['pci'],
         },
         "product_id": {
             "type": "string",
@@ -88,7 +92,13 @@ _ALIAS_SCHEMA = {
         },
         "device_type": {
             "type": "string",
-            "enum": list(obj_fields.PciDeviceType.ALL),
+            # NOTE(sean-k-mooney): vDPA devices cannot currently be used with
+            # alias-based PCI passthrough so we exclude it here
+            "enum": [
+                obj_fields.PciDeviceType.STANDARD,
+                obj_fields.PciDeviceType.SRIOV_PF,
+                obj_fields.PciDeviceType.SRIOV_VF,
+            ],
         },
         "numa_policy": {
             "type": "string",
@@ -99,18 +109,19 @@ _ALIAS_SCHEMA = {
 }
 
 
-def _get_alias_from_config():
+def _get_alias_from_config() -> Alias:
     """Parse and validate PCI aliases from the nova config.
 
     :returns: A dictionary where the keys are device names and the values are
-        tuples of form ``(specs, numa_policy)``. ``specs`` is a list of PCI
-        device specs, while ``numa_policy`` describes the required NUMA
-        affinity of the device(s).
+        tuples of form ``(numa_policy, specs)``. ``numa_policy`` describes the
+        required NUMA affinity of the device(s), while ``specs`` is a list of
+        PCI device specs.
     :raises: exception.PciInvalidAlias if two aliases with the same name have
         different device types or different NUMA policies.
     """
     jaliases = CONF.pci.alias
-    aliases = {}  # map alias name to alias spec list
+    # map alias name to alias spec list
+    aliases: Alias = {}
     try:
         for jsonspecs in jaliases:
             spec = jsonutils.loads(jsonspecs)
@@ -143,22 +154,23 @@ def _get_alias_from_config():
     except jsonschema.exceptions.ValidationError as exc:
         raise exception.PciInvalidAlias(reason=exc.message)
     except Exception as exc:
-        raise exception.PciInvalidAlias(reason=six.text_type(exc))
+        raise exception.PciInvalidAlias(reason=str(exc))
 
     return aliases
 
 
-def _translate_alias_to_requests(alias_spec, affinity_policy=None):
+def _translate_alias_to_requests(
+    alias_spec: str, affinity_policy: str = None,
+) -> ty.List['objects.InstancePCIRequest']:
     """Generate complete pci requests from pci aliases in extra_spec."""
     pci_aliases = _get_alias_from_config()
 
-    pci_requests = []
+    pci_requests: ty.List[objects.InstancePCIRequest] = []
     for name, count in [spec.split(':') for spec in alias_spec.split(',')]:
         name = name.strip()
         if name not in pci_aliases:
             raise exception.PciRequestAliasNotDefined(alias=name)
 
-        count = int(count)
         numa_policy, spec = pci_aliases[name]
         policy = affinity_policy or numa_policy
 
@@ -167,14 +179,18 @@ def _translate_alias_to_requests(alias_spec, affinity_policy=None):
         # handling for InstancePCIRequests created from the flavor. So it is
         # left empty.
         pci_requests.append(objects.InstancePCIRequest(
-            count=count,
+            count=int(count),
             spec=spec,
             alias_name=name,
             numa_policy=policy))
     return pci_requests
 
 
-def get_instance_pci_request_from_vif(context, instance, vif):
+def get_instance_pci_request_from_vif(
+    context: ctx.RequestContext,
+    instance: 'objects.Instance',
+    vif: network_model.VIF,
+) -> ty.Optional['objects.InstancePCIRequest']:
     """Given an Instance, return the PCI request associated
     to the PCI device related to the given VIF (if any) on the
     compute node the instance is currently running.
@@ -228,7 +244,9 @@ def get_instance_pci_request_from_vif(context, instance, vif):
         node_id=cn_id)
 
 
-def get_pci_requests_from_flavor(flavor, affinity_policy=None):
+def get_pci_requests_from_flavor(
+    flavor: 'objects.Flavor', affinity_policy: str = None,
+) -> 'objects.InstancePCIRequests':
     """Validate and return PCI requests.
 
     The ``pci_passthrough:alias`` extra spec describes the flavor's PCI
@@ -274,7 +292,7 @@ def get_pci_requests_from_flavor(flavor, affinity_policy=None):
     :raises: exception.PciInvalidAlias if the configuration contains invalid
         aliases.
     """
-    pci_requests = []
+    pci_requests: ty.List[objects.InstancePCIRequest] = []
     if ('extra_specs' in flavor and
             'pci_passthrough:alias' in flavor['extra_specs']):
         pci_requests = _translate_alias_to_requests(

@@ -104,7 +104,7 @@ Related options:
 """),
     cfg.StrOpt('virt_type',
                default='kvm',
-               choices=('kvm', 'lxc', 'qemu', 'uml', 'xen', 'parallels'),
+               choices=('kvm', 'lxc', 'qemu', 'parallels'),
                help="""
 Describes the virtualization type (or so called domain type) libvirt should
 use.
@@ -128,7 +128,8 @@ If set, Nova will use this URI to connect to libvirt.
 
 Possible values:
 
-* An URI like ``qemu:///system`` or ``xen+ssh://oirase/`` for example.
+* An URI like ``qemu:///system``.
+
   This is only necessary if the URI differs to the commonly known URIs
   for the chosen virtualization type.
 
@@ -191,13 +192,12 @@ Related options:
                default=-2,
                min=-2,
                help="""
-Determines the way how the file system is chosen to inject data into it.
+Determines how the file system is chosen to inject data into it.
 
-*libguestfs* will be used a first solution to inject data. If that's not
-available on the host, the image will be locally mounted on the host as a
-fallback solution. If libguestfs is not able to determine the root partition
-(because there are more or less than one root partition) or cannot mount the
-file system it will result in an error and the instance won't be boot.
+*libguestfs* is used to inject data. If libguestfs is not able to determine
+the root partition (because there are more or less than one root partition) or
+cannot mount the file system it will result in an error and the instance won't
+boot.
 
 Possible values:
 
@@ -214,34 +214,14 @@ Related options:
   on value greater or equal to -1 for ``inject_partition``.
 * ``inject_password``: If this option allows the injection of an admin password
   it depends on value greater or equal to -1 for ``inject_partition``.
-* ``guestfs`` You can enable the debug log level of libguestfs with this
-  config option. A more verbose output will help in debugging issues.
+* ``[guestfs]/debug`` You can enable the debug log level of libguestfs with
+  this config option. A more verbose output will help in debugging issues.
 * ``virt_type``: If you use ``lxc`` as virt_type it will be treated as a
   single partition image
 """),
-    cfg.BoolOpt('use_usb_tablet',
-                default=True,
-                deprecated_for_removal=True,
-                deprecated_reason="This option is being replaced by the "
-                                  "'pointer_model' option.",
-                deprecated_since='14.0.0',
-                help="""
-Enable a mouse cursor within a graphical VNC or SPICE sessions.
-
-This will only be taken into account if the VM is fully virtualized and VNC
-and/or SPICE is enabled. If the node doesn't support a graphical framebuffer,
-then it is valid to set this to False.
-
-Related options:
-
-* ``[vnc]enabled``: If VNC is enabled, ``use_usb_tablet`` will have an effect.
-* ``[spice]enabled`` + ``[spice].agent_enabled``: If SPICE is enabled and the
-  spice agent is disabled, the config value of ``use_usb_tablet`` will have
-  an effect.
-"""),
     cfg.StrOpt('live_migration_scheme',
                help="""
-URI scheme used for live migration.
+URI scheme for live migration used by the source of live migration traffic.
 
 Override the default libvirt live migration scheme (which is dependent on
 virt_type). If this option is set to None, nova will automatically choose a
@@ -255,9 +235,13 @@ Related options:
 * ``live_migration_uri``: If ``live_migration_uri`` value is not None, the
   scheme used for live migration is taken from ``live_migration_uri`` instead.
 """),
-    cfg.HostAddressOpt('live_migration_inbound_addr',
+    cfg.HostDomainOpt('live_migration_inbound_addr',
                        help="""
-Target used for live migration traffic.
+IP address used as the live migration address for this host.
+
+This option indicates the IP address which should be used as the target for
+live migration traffic when migrating to this hypervisor. This metadata is then
+used by the source of the live migration traffic to construct a migration URI.
 
 If this option is set to None, the hostname of the migration target compute
 node will be used.
@@ -266,11 +250,6 @@ This option is useful in environments where the live-migration traffic can
 impact the network plane significantly. A separate network for live-migration
 traffic can then use this config option and avoids the impact on the
 management network.
-
-Related options:
-
-* ``live_migration_tunnelled``: The live_migration_inbound_addr value is
-  ignored if tunneling is enabled.
 """),
     cfg.StrOpt('live_migration_uri',
                deprecated_for_removal=True,
@@ -281,11 +260,11 @@ allow to change live migration scheme and target URI: ``live_migration_scheme``
 and ``live_migration_inbound_addr`` respectively.
 """,
                help="""
-Live migration target URI to use.
+Live migration target URI used by the source of live migration traffic.
 
 Override the default libvirt live migration target URI (which is dependent
 on virt_type). Any included "%s" is replaced with the migration target
-hostname.
+hostname, or `live_migration_inbound_addr` if set.
 
 If this option is set to None (which is the default), Nova will automatically
 generate the `live_migration_uri` value based on only 4 supported `virt_type`
@@ -293,7 +272,6 @@ in following list:
 
 * 'kvm': 'qemu+tcp://%s/system'
 * 'qemu': 'qemu+tcp://%s/system'
-* 'xen': 'xenmigr://%s/system'
 * 'parallels': 'parallels+tcp://%s/system'
 
 Related options:
@@ -307,6 +285,15 @@ Related options:
 """),
     cfg.BoolOpt('live_migration_tunnelled',
                 default=False,
+                deprecated_for_removal=True,
+                deprecated_since='23.0.0',
+                deprecated_reason="""
+The "tunnelled live migration" has two inherent limitations: it cannot
+handle live migration of disks in a non-shared storage setup; and it has
+a huge performance cost.  Both these problems are solved by
+``live_migration_with_native_tls`` (requires a pre-configured TLS
+environment), which is the recommended approach for securing all live
+migration streams.""",
                 help="""
 Enable tunnelled migration.
 
@@ -320,11 +307,6 @@ encryption support in the hypervisor. Enabling this option will definitely
 impact performance massively.
 
 Note that this option is NOT compatible with use of block migration.
-
-Related options:
-
-* ``live_migration_inbound_addr``: The live_migration_inbound_addr value is
-  ignored if tunneling is enabled.
 """),
     cfg.IntOpt('live_migration_bandwidth',
                default=0,
@@ -558,9 +540,8 @@ richer that the previous CPU model.
 
 Possible values:
 
-* The named CPU models listed in ``/usr/share/libvirt/cpu_map.xml`` for
-  libvirt prior to version 4.7.0 or ``/usr/share/libvirt/cpu_map/*.xml``
-  for version 4.7.0 and higher.
+* The named CPU models can be found via ``virsh cpu-models ARCH``, where
+  ARCH is your host architecture.
 
 Related options:
 
@@ -580,53 +561,60 @@ Related options:
         ),
         default=[],
         help="""
-This allows specifying granular CPU feature flags when configuring CPU
-models.  For example, to explicitly specify the ``pcid``
-(Process-Context ID, an Intel processor feature -- which is now required
-to address the guest performance degradation as a result of applying the
-"Meltdown" CVE fixes to certain Intel CPU models) flag to the
-"IvyBridge" virtual CPU model::
+Enable or disable guest CPU flags.
+
+To explicitly enable or disable CPU flags, use the ``+flag`` or
+``-flag`` notation -- the ``+`` sign will enable the CPU flag for the
+guest, while a ``-`` sign will disable it.  If neither ``+`` nor ``-``
+is specified, the flag will be enabled, which is the default behaviour.
+For example, if you specify the following (assuming the said CPU model
+and features are supported by the host hardware and software)::
 
     [libvirt]
     cpu_mode = custom
-    cpu_models = IvyBridge
-    cpu_model_extra_flags = pcid
+    cpu_models = Cascadelake-Server
+    cpu_model_extra_flags = -hle, -rtm, +ssbd, mtrr
 
-To specify multiple CPU flags (e.g. the Intel ``VMX`` to expose the
-virtualization extensions to the guest, or ``pdpe1gb`` to configure 1GB
-huge pages for CPU models that do not provide it)::
+Nova will disable the ``hle`` and ``rtm`` flags for the guest; and it
+will enable ``ssbd`` and ``mttr`` (because it was specified with neither
+``+`` nor ``-`` prefix).
+
+The CPU flags are case-insensitive.  In the following example, the
+``pdpe1gb`` flag will be disabled for the guest; ``vmx`` and ``pcid``
+flags will be enabled::
 
     [libvirt]
     cpu_mode = custom
     cpu_models = Haswell-noTSX-IBRS
-    cpu_model_extra_flags = PCID, VMX, pdpe1gb
+    cpu_model_extra_flags = -PDPE1GB, +VMX, pcid
 
-As it can be noticed from above, the ``cpu_model_extra_flags`` config
-attribute is case insensitive.  And specifying extra flags is valid in
-combination with all the three possible values for ``cpu_mode``:
-``custom`` (this also requires an explicit ``cpu_models`` to be
-specified), ``host-model``, or ``host-passthrough``.  A valid example
-for allowing extra CPU flags even for ``host-passthrough`` mode is that
-sometimes QEMU may disable certain CPU features -- e.g. Intel's
-"invtsc", Invariable Time Stamp Counter, CPU flag.  And if you need to
-expose that CPU flag to the Nova instance, the you need to explicitly
-ask for it.
+Specifying extra CPU flags is valid in combination with all the three
+possible values of ``cpu_mode`` config attribute: ``custom`` (this also
+requires an explicit CPU model to be specified via the ``cpu_models``
+config attribute), ``host-model``, or ``host-passthrough``.
+
+There can be scenarios where you may need to configure extra CPU flags
+even for ``host-passthrough`` CPU mode, because sometimes QEMU may
+disable certain CPU features.  An example of this is Intel's "invtsc"
+(Invariable Time Stamp Counter) CPU flag -- if you need to expose this
+flag to a Nova instance, you need to explicitly enable it.
 
 The possible values for ``cpu_model_extra_flags`` depends on the CPU
-model in use. Refer to ``/usr/share/libvirt/cpu_map.xml`` for libvirt
-prior to version 4.7.0 or ``/usr/share/libvirt/cpu_map/*.xml`` thereafter
-for possible CPU feature flags for a given CPU model.
+model in use.  Refer to `/usr/share/libvirt/cpu_map/*.xml`` for possible
+CPU feature flags for a given CPU model.
 
-Note that when using this config attribute to set the 'PCID' CPU flag
-with the ``custom`` CPU mode, not all virtual (i.e. libvirt / QEMU) CPU
-models need it:
+A special note on a particular CPU flag: ``pcid`` (an Intel processor
+feature that alleviates guest performance degradation as a result of
+applying the 'Meltdown' CVE fixes).  When configuring this flag with the
+``custom`` CPU mode, not all CPU models (as defined by QEMU and libvirt)
+need it:
 
-* The only virtual CPU models that include the 'PCID' capability are
+* The only virtual CPU models that include the ``pcid`` capability are
   Intel "Haswell", "Broadwell", and "Skylake" variants.
 
 * The libvirt / QEMU CPU models "Nehalem", "Westmere", "SandyBridge",
-  and "IvyBridge" will _not_ expose the 'PCID' capability by default,
-  even if the host CPUs by the same name include it.  I.e.  'PCID' needs
+  and "IvyBridge" will _not_ expose the ``pcid`` capability by default,
+  even if the host CPUs by the same name include it.  I.e. 'PCID' needs
   to be explicitly specified when using the said virtual CPU models.
 
 The libvirt driver's default CPU mode, ``host-model``, will do the right
@@ -647,9 +635,6 @@ Related options:
                default='$instances_path/snapshots',
                help='Location where libvirt driver will store snapshots '
                     'before uploading them to image service'),
-    cfg.StrOpt('xen_hvmloader_path',
-               default='/usr/lib/xen/boot/hvmloader',
-               help='Location where the Xen hvmloader is kept'),
     cfg.ListOpt('disk_cachemodes',
                 default=[],
                 help="""
@@ -783,15 +768,13 @@ restricting flavors via host aggregates.
     cfg.ListOpt('enabled_perf_events',
                default=[],
                help= """
+Performance events to monitor and collect statistics for.
+
 This will allow you to specify a list of events to monitor low-level
-performance of guests, and collect related statsitics via the libvirt
-driver, which in turn uses the Linux kernel's `perf` infrastructure.
+performance of guests, and collect related statistics via the libvirt
+driver, which in turn uses the Linux kernel's ``perf`` infrastructure.
 With this config attribute set, Nova will generate libvirt guest XML to
-monitor the specified events.  For more information, refer to the
-"Performance monitoring events" section here:
-https://libvirt.org/formatdomain.html#elementsPerf.  And here:
-https://libvirt.org/html/libvirt-libvirt-domain.html -- look for
-``VIR_PERF_PARAM_*``
+monitor the specified events.
 
 For example, to monitor the count of CPU cycles (total/elapsed) and the
 count of cache misses, enable them as follows::
@@ -800,12 +783,11 @@ count of cache misses, enable them as follows::
     enabled_perf_events = cpu_clock, cache_misses
 
 Possible values: A string list.  The list of supported events can be
-found here: https://libvirt.org/formatdomain.html#elementsPerf.
+found `here`__. Note that Intel CMT events - ``cmt``, ``mbmbt`` and
+``mbml`` - are unsupported by recent Linux kernel versions (4.14+) and will be
+ignored by nova.
 
-Note that support for Intel CMT events (`cmt`, `mbmbt`, `mbml`) is
-deprecated, and will be removed in the "Stein" release.  That's because
-the upstream Linux kernel (from 4.14 onwards) has deleted support for
-Intel CMT, because it is broken by design.
+__ https://libvirt.org/formatdomain.html#elementsPerf.
 """),
     cfg.IntOpt('num_pcie_ports',
                default=0,
@@ -894,6 +876,30 @@ Related options:
   :oslo.config:option:`libvirt.hw_machine_type`; see
   :ref:`deploying-sev-capable-infrastructure` for more on this.
 """),
+    cfg.IntOpt('device_detach_attempts',
+               default=8,
+               min=1,
+               help="""
+Maximum number of attempts the driver tries to detach a device in libvirt.
+
+Related options:
+
+* :oslo.config:option:`libvirt.device_detach_timeout`
+
+"""),
+    cfg.IntOpt('device_detach_timeout',
+               default=20,
+               min=1,
+               help="""
+Maximum number of seconds the driver waits for the success or the failure
+event from libvirt for a given device detach attempt before it re-trigger the
+detach.
+
+Related options:
+
+* :oslo.config:option:`libvirt.device_detach_attempts`
+
+"""),
 ]
 
 libvirt_imagebackend_opts = [
@@ -940,6 +946,50 @@ Create sparse logical volumes (with virtualsize) if this flag is set to True.
     cfg.StrOpt('images_rbd_ceph_conf',
                default='',  # default determined by librados
                help='Path to the ceph configuration file to use'),
+    cfg.StrOpt('images_rbd_glance_store_name',
+               default='',
+               help="""
+The name of the Glance store that represents the rbd cluster in use by
+this node. If set, this will allow Nova to request that Glance copy an
+image from an existing non-local store into the one named by this option
+before booting so that proper Copy-on-Write behavior is maintained.
+
+Related options:
+
+* images_type - must be set to ``rbd``
+* images_rbd_glance_copy_poll_interval - controls the status poll frequency
+* images_rbd_glance_copy_timeout - controls the overall copy timeout
+"""),
+    cfg.IntOpt('images_rbd_glance_copy_poll_interval',
+               default=15,
+               help="""
+The interval in seconds with which to poll Glance after asking for it
+to copy an image to the local rbd store. This affects how often we ask
+Glance to report on copy completion, and thus should be short enough that
+we notice quickly, but not too aggressive that we generate undue load on
+the Glance server.
+
+Related options:
+
+* images_type - must be set to ``rbd``
+* images_rbd_glance_store_name - must be set to a store name
+"""),
+    cfg.IntOpt('images_rbd_glance_copy_timeout',
+               default=600,
+               help="""
+The overall maximum time we will wait for Glance to complete an image
+copy to our local rbd store. This should be long enough to allow large
+images to be copied over the network link between our local store and the
+one where images typically reside. The downside of setting this too long
+is just to catch the case where the image copy is stalled or proceeding too
+slowly to be useful. Actual errors will be reported by Glance and noticed
+according to the poll interval.
+
+Related options:
+* images_type - must be set to ``rbd``
+* images_rbd_glance_store_name - must be set to a store name
+* images_rbd_glance_copy_poll_interval - controls the failure time-to-notice
+"""),
     cfg.StrOpt('hw_disk_discard',
                choices=('ignore', 'unmap'),
                help="""
@@ -1049,11 +1099,12 @@ libvirt_volume_iscsi_opts = [
 The iSCSI transport iface to use to connect to target in case offload support
 is desired.
 
-Default format is of the form <transport_name>.<hwaddress> where
-<transport_name> is one of (be2iscsi, bnx2i, cxgb3i, cxgb4i, qla4xxx, ocs) and
-<hwaddress> is the MAC address of the interface and can be generated via the
-iscsiadm -m iface command. Do not confuse the iscsi_iface parameter to be
-provided here with the actual transport name.
+Default format is of the form ``<transport_name>.<hwaddress>``, where
+``<transport_name>`` is one of (``be2iscsi``, ``bnx2i``, ``cxgb3i``,
+``cxgb4i``, ``qla4xxx``, ``ocs``, ``tcp``) and ``<hwaddress>`` is the MAC
+address of the interface and can be generated via the ``iscsiadm -m iface``
+command. Do not confuse the ``iscsi_iface`` parameter to be provided here with
+the actual transport name.
 """)
 # iser is also supported, but use LibvirtISERVolumeDriver
 # instead
@@ -1095,6 +1146,27 @@ The libvirt UUID of the secret for the rbd_user volumes.
                default=5,
                help="""
 The RADOS client timeout in seconds when initially connecting to the cluster.
+"""),
+    cfg.IntOpt('rbd_destroy_volume_retry_interval',
+               default=5,
+               min=0,
+               help="""
+Number of seconds to wait between each consecutive retry to destroy a
+RBD volume.
+
+Related options:
+
+* [libvirt]/images_type = 'rbd'
+"""),
+    cfg.IntOpt('rbd_destroy_volume_retries',
+               default=12,
+               min=0,
+               help="""
+Number of retries to destroy a RBD volume.
+
+Related options:
+
+* [libvirt]/images_type = 'rbd'
 """),
 ]
 
@@ -1362,6 +1434,49 @@ For example::
 ]
 
 
+libvirt_vtpm_opts = [
+    cfg.BoolOpt('swtpm_enabled',
+        default=False,
+        help="""
+Enable emulated TPM (Trusted Platform Module) in guests.
+"""),
+    cfg.StrOpt('swtpm_user',
+        default='tss',
+        help="""
+User that swtpm binary runs as.
+
+When using emulated TPM, the ``swtpm`` binary will run to emulate a TPM
+device. The user this binary runs as depends on libvirt configuration, with
+``tss`` being the default.
+
+In order to support cold migration and resize, nova needs to know what user
+the swtpm binary is running as in order to ensure that files get the proper
+ownership after being moved between nodes.
+
+Related options:
+
+* ``swtpm_group`` must also be set.
+"""),
+    cfg.StrOpt('swtpm_group',
+        default='tss',
+        help="""
+Group that swtpm binary runs as.
+
+When using emulated TPM, the ``swtpm`` binary will run to emulate a TPM
+device. The user this binary runs as depends on libvirt configuration, with
+``tss`` being the default.
+
+In order to support cold migration and resize, nova needs to know what group
+the swtpm binary is running as in order to ensure that files get the proper
+ownership after being moved between nodes.
+
+Related options:
+
+* ``swtpm_user`` must also be set.
+"""),
+]
+
+
 ALL_OPTS = list(itertools.chain(
     libvirt_general_opts,
     libvirt_imagebackend_opts,
@@ -1381,6 +1496,7 @@ ALL_OPTS = list(itertools.chain(
     libvirt_virtio_queue_sizes,
     libvirt_volume_nvmeof_opts,
     libvirt_pmem_opts,
+    libvirt_vtpm_opts,
 ))
 
 

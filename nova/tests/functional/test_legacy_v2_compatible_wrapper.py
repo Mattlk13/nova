@@ -14,19 +14,31 @@
 #    under the License.
 
 from nova.api import openstack
-from nova.api.openstack import compute
 from nova.api.openstack import wsgi
 from nova.tests.functional.api import client
-from nova.tests.functional import test_servers
+from nova.tests.functional import integrated_helpers
 
 
-class LegacyV2CompatibleTestBase(test_servers.ServersTestBase):
+class LegacyV2CompatibleTestBase(integrated_helpers._IntegratedTestBase):
     api_major_version = 'v2'
 
     def setUp(self):
         super(LegacyV2CompatibleTestBase, self).setUp()
-        self._check_api_endpoint('/v2', [compute.APIRouterV21,
-                                         openstack.LegacyV2CompatibleWrapper])
+        self._check_api_endpoint()
+
+    def _check_api_endpoint(self):
+        app = self.api_fixture.app().get((None, '/v2'))
+
+        while getattr(app, 'application', False):
+            if isinstance(
+                app.application, openstack.LegacyV2CompatibleWrapper,
+            ):
+                break
+            app = app.application
+        else:
+            raise Exception(
+                'The LegacyV2CompatibleWrapper middleware is not configured.'
+            )
 
     def test_request_with_microversion_headers(self):
         self.api.microversion = '2.100'

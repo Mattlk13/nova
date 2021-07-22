@@ -13,10 +13,10 @@
 #    under the License.
 
 import mock
-from oslo_policy import policy as oslo_policy
+
+import ddt
 from oslo_serialization import jsonutils
-from oslo_utils.fixture import uuidsentinel
-import six
+from oslo_utils.fixture import uuidsentinel as uuids
 import webob
 
 from nova.api.openstack import api_version_request
@@ -24,44 +24,55 @@ from nova.api.openstack.compute import shelve as shelve_v21
 from nova.compute import task_states
 from nova.compute import vm_states
 from nova import exception
-from nova import policy
 from nova import test
 from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit import fake_instance
 
 
-class ShelvePolicyTestV21(test.NoDBTestCase):
+@ddt.ddt
+class ShelveControllerTest(test.NoDBTestCase):
     plugin = shelve_v21
 
     def setUp(self):
-        super(ShelvePolicyTestV21, self).setUp()
+        super().setUp()
         self.controller = self.plugin.ShelveController()
         self.req = fakes.HTTPRequest.blank('')
 
+    @ddt.data(
+        exception.InstanceIsLocked(instance_uuid=uuids.instance),
+        exception.OperationNotSupportedForVTPM(
+            instance_uuid=uuids.instance, operation='foo'),
+        exception.OperationNotSupportedForVDPAInterface(
+            instance_uuid=uuids.instance, operation='foo'),
+        exception.UnexpectedTaskStateError(
+            instance_uuid=uuids.instance, expected=None,
+            actual=task_states.SHELVING),
+    )
+    @mock.patch('nova.compute.api.API.shelve')
     @mock.patch('nova.api.openstack.common.get_instance')
-    def test_shelve_locked_server(self, get_instance_mock):
-        get_instance_mock.return_value = (
+    def test_shelve__http_conflict_error(
+        self, exc, mock_get_instance, mock_shelve,
+    ):
+        mock_get_instance.return_value = (
             fake_instance.fake_instance_obj(self.req.environ['nova.context']))
-        self.stub_out('nova.compute.api.API.shelve',
-                      fakes.fake_actions_to_locked_server)
-        self.assertRaises(webob.exc.HTTPConflict, self.controller._shelve,
-                          self.req, uuidsentinel.fake, {})
+        mock_shelve.side_effect = exc
 
+        self.assertRaises(
+            webob.exc.HTTPConflict, self.controller._shelve,
+            self.req, uuids.fake, {})
+
+    @mock.patch('nova.compute.api.API.shelve')
     @mock.patch('nova.api.openstack.common.get_instance')
-    @mock.patch('nova.objects.instance.Instance.save')
-    def test_shelve_task_state_race(self, mock_save, get_instance_mock):
-        instance = fake_instance.fake_instance_obj(
-            self.req.environ['nova.context'],
-            vm_state=vm_states.ACTIVE, task_state=None)
-        instance.launched_at = instance.created_at
-        get_instance_mock.return_value = instance
-        mock_save.side_effect = exception.UnexpectedTaskStateError(
-            instance_uuid=instance.uuid, expected=None,
-            actual=task_states.SHELVING)
-        ex = self.assertRaises(webob.exc.HTTPConflict, self.controller._shelve,
-                          self.req, uuidsentinel.fake, body={'shelve': {}})
-        self.assertIn('Conflict updating instance', six.text_type(ex))
-        mock_save.assert_called_once_with(expected_task_state=[None])
+    def test_shelve_raise_http_forbidden(
+        self, mock_get_instance, mock_shelve,
+    ):
+        mock_get_instance.return_value = (
+            fake_instance.fake_instance_obj(self.req.environ['nova.context']))
+        mock_shelve.side_effect = exception.ForbiddenWithAccelerators
+
+        self.assertRaises(
+            webob.exc.HTTPForbidden, self.controller._shelve,
+            self.req, uuids.fake, {})
 
     @mock.patch('nova.api.openstack.common.get_instance')
     def test_unshelve_locked_server(self, get_instance_mock):
@@ -70,7 +81,7 @@ class ShelvePolicyTestV21(test.NoDBTestCase):
         self.stub_out('nova.compute.api.API.unshelve',
                       fakes.fake_actions_to_locked_server)
         self.assertRaises(webob.exc.HTTPConflict, self.controller._unshelve,
-                          self.req, uuidsentinel.fake, body={'unshelve': {}})
+                          self.req, uuids.fake, body={'unshelve': {}})
 
     @mock.patch('nova.api.openstack.common.get_instance')
     def test_shelve_offload_locked_server(self, get_instance_mock):
@@ -80,124 +91,7 @@ class ShelvePolicyTestV21(test.NoDBTestCase):
                       fakes.fake_actions_to_locked_server)
         self.assertRaises(webob.exc.HTTPConflict,
                           self.controller._shelve_offload,
-                          self.req, uuidsentinel.fake, {})
-
-
-class ShelvePolicyEnforcementV21(test.NoDBTestCase):
-
-    def setUp(self):
-        super(ShelvePolicyEnforcementV21, self).setUp()
-        self.controller = shelve_v21.ShelveController()
-        self.req = fakes.HTTPRequest.blank('')
-
-    @mock.patch('nova.api.openstack.common.get_instance')
-    def test_shelve_restricted_by_role(self, get_instance_mock):
-        get_instance_mock.return_value = (
-            fake_instance.fake_instance_obj(self.req.environ['nova.context']))
-        rules = {'os_compute_api:os-shelve:shelve': 'role:admin'}
-        policy.set_rules(oslo_policy.Rules.from_dict(rules))
-
-        self.assertRaises(exception.Forbidden, self.controller._shelve,
-                self.req, uuidsentinel.fake, {})
-
-    @mock.patch('nova.api.openstack.common.get_instance')
-    def test_shelve_policy_failed_with_other_project(self, get_instance_mock):
-        get_instance_mock.return_value = (
-            fake_instance.fake_instance_obj(self.req.environ['nova.context']))
-        rule_name = "os_compute_api:os-shelve:shelve"
-        self.policy.set_rules({rule_name: "project_id:%(project_id)s"})
-        # Change the project_id in request context.
-        self.req.environ['nova.context'].project_id = 'other-project'
-        exc = self.assertRaises(
-            exception.PolicyNotAuthorized,
-            self.controller._shelve, self.req, fakes.FAKE_UUID,
-            body={'shelve': {}})
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % rule_name,
-            exc.format_message())
-
-    @mock.patch('nova.compute.api.API.shelve')
-    @mock.patch('nova.api.openstack.common.get_instance')
-    def test_shelve_overridden_policy_pass_with_same_project(self,
-                                                             get_instance_mock,
-                                                             shelve_mock):
-        instance = fake_instance.fake_instance_obj(
-            self.req.environ['nova.context'],
-            project_id=self.req.environ['nova.context'].project_id)
-        get_instance_mock.return_value = instance
-        rule_name = "os_compute_api:os-shelve:shelve"
-        self.policy.set_rules({rule_name: "project_id:%(project_id)s"})
-        self.controller._shelve(self.req, fakes.FAKE_UUID, body={'shelve': {}})
-        shelve_mock.assert_called_once_with(self.req.environ['nova.context'],
-                                          instance)
-
-    @mock.patch('nova.api.openstack.common.get_instance')
-    def test_shelve_overridden_policy_failed_with_other_user_in_same_project(
-        self, get_instance_mock):
-        get_instance_mock.return_value = (
-            fake_instance.fake_instance_obj(self.req.environ['nova.context']))
-        rule_name = "os_compute_api:os-shelve:shelve"
-        self.policy.set_rules({rule_name: "user_id:%(user_id)s"})
-        # Change the user_id in request context.
-        self.req.environ['nova.context'].user_id = 'other-user'
-        exc = self.assertRaises(exception.PolicyNotAuthorized,
-                                self.controller._shelve, self.req,
-                                fakes.FAKE_UUID, body={'shelve': {}})
-        self.assertEqual(
-                      "Policy doesn't allow %s to be performed." % rule_name,
-                      exc.format_message())
-
-    @mock.patch('nova.compute.api.API.shelve')
-    @mock.patch('nova.api.openstack.common.get_instance')
-    def test_shelve_overridden_policy_pass_with_same_user(self,
-                                                        get_instance_mock,
-                                                        shelve_mock):
-        instance = fake_instance.fake_instance_obj(
-            self.req.environ['nova.context'],
-            user_id=self.req.environ['nova.context'].user_id)
-        get_instance_mock.return_value = instance
-        rule_name = "os_compute_api:os-shelve:shelve"
-        self.policy.set_rules({rule_name: "user_id:%(user_id)s"})
-        self.controller._shelve(self.req, fakes.FAKE_UUID, body={'shelve': {}})
-        shelve_mock.assert_called_once_with(self.req.environ['nova.context'],
-                                          instance)
-
-    def test_shelve_offload_restricted_by_role(self):
-        rules = {'os_compute_api:os-shelve:shelve_offload': 'role:admin'}
-        policy.set_rules(oslo_policy.Rules.from_dict(rules))
-
-        self.assertRaises(exception.Forbidden,
-                self.controller._shelve_offload, self.req,
-                uuidsentinel.fake, {})
-
-    def test_shelve_offload_policy_failed(self):
-        rule_name = "os_compute_api:os-shelve:shelve_offload"
-        self.policy.set_rules({rule_name: "project:non_fake"})
-        exc = self.assertRaises(
-            exception.PolicyNotAuthorized,
-            self.controller._shelve_offload, self.req, fakes.FAKE_UUID,
-            body={'shelve_offload': {}})
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % rule_name,
-            exc.format_message())
-
-    def test_unshelve_restricted_by_role(self):
-        rules = {'os_compute_api:os-shelve:unshelve': 'role:admin'}
-        policy.set_rules(oslo_policy.Rules.from_dict(rules))
-
-        self.assertRaises(exception.Forbidden, self.controller._unshelve,
-                self.req, uuidsentinel.fake, body={'unshelve': {}})
-
-    def test_unshelve_policy_failed(self):
-        rule_name = "os_compute_api:os-shelve:unshelve"
-        self.policy.set_rules({rule_name: "project:non_fake"})
-        exc = self.assertRaises(
-            exception.PolicyNotAuthorized,
-            self.controller._unshelve, self.req, fakes.FAKE_UUID,
-            body={'unshelve': {}})
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % rule_name,
-            exc.format_message())
+                          self.req, uuids.fake, {})
 
 
 class UnshelveServerControllerTestV277(test.NoDBTestCase):
@@ -214,10 +108,6 @@ class UnshelveServerControllerTestV277(test.NoDBTestCase):
         self.req = fakes.HTTPRequest.blank(
                 '/%s/servers/a/action' % fakes.FAKE_PROJECT_ID,
                 use_admin_context=True, version=self.wsgi_api_version)
-        # These tests don't care about ports with QoS bandwidth resources.
-        self.stub_out('nova.api.openstack.common.'
-                      'instance_has_port_with_resource_request',
-                      lambda *a, **kw: False)
 
     def fake_get_instance(self):
         ctxt = self.req.environ['nova.context']
@@ -275,8 +165,7 @@ class UnshelveServerControllerTestV277(test.NoDBTestCase):
                                 self.controller._unshelve,
                                 self.req, fakes.FAKE_UUID,
                                 body=body)
-        self.assertIn("\'availability_zone\' is a required property",
-                      six.text_type(exc))
+        self.assertIn("\'availability_zone\' is a required property", str(exc))
 
     def test_invalid_az_name_with_int(self):
         body = {
@@ -311,5 +200,4 @@ class UnshelveServerControllerTestV277(test.NoDBTestCase):
             exception.ValidationError,
             self.controller._unshelve, self.req,
             fakes.FAKE_UUID, body=body)
-        self.assertIn("Additional properties are not allowed",
-                      six.text_type(exc))
+        self.assertIn("Additional properties are not allowed", str(exc))

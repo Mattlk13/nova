@@ -57,11 +57,11 @@ class HackingTestCase(test.NoDBTestCase):
 
         self.assertEqual(expect, checks.import_no_virt_driver_import_deps(
             "from nova.virt.libvirt import utils as libvirt_utils",
-            "./nova/virt/xenapi/driver.py"))
+            "./nova/virt/hyperv/driver.py"))
 
         self.assertEqual(expect, checks.import_no_virt_driver_import_deps(
             "import nova.virt.libvirt.utils as libvirt_utils",
-            "./nova/virt/xenapi/driver.py"))
+            "./nova/virt/hyperv/driver.py"))
 
         self.assertIsNone(checks.import_no_virt_driver_import_deps(
             "from nova.virt.libvirt import utils as libvirt_utils",
@@ -71,7 +71,7 @@ class HackingTestCase(test.NoDBTestCase):
         self.assertIsInstance(checks.import_no_virt_driver_config_deps(
             "CONF.import_opt('volume_drivers', "
             "'nova.virt.libvirt.driver', group='libvirt')",
-            "./nova/virt/xenapi/driver.py"), tuple)
+            "./nova/virt/hyperv/driver.py"), tuple)
 
         self.assertIsNone(checks.import_no_virt_driver_config_deps(
             "CONF.import_opt('volume_drivers', "
@@ -173,15 +173,15 @@ class HackingTestCase(test.NoDBTestCase):
         self.assertEqual(len(list(checks.assert_true_or_false_with_in(
             "self.assertFalse(some in list1 and some2 in list2)"))), 0)
 
-    def test_no_translate_debug_logs(self):
-        self.assertEqual(len(list(checks.no_translate_debug_logs(
+    def test_no_translate_logs(self):
+        self.assertEqual(len(list(checks.no_translate_logs(
             "LOG.debug(_('foo'))", "nova/scheduler/foo.py"))), 1)
 
-        self.assertEqual(len(list(checks.no_translate_debug_logs(
+        self.assertEqual(len(list(checks.no_translate_logs(
             "LOG.debug('foo')", "nova/scheduler/foo.py"))), 0)
 
-        self.assertEqual(len(list(checks.no_translate_debug_logs(
-            "LOG.info(_('foo'))", "nova/scheduler/foo.py"))), 0)
+        self.assertEqual(len(list(checks.no_translate_logs(
+            "LOG.info(_('foo'))", "nova/scheduler/foo.py"))), 1)
 
     def test_no_setting_conf_directly_in_tests(self):
         self.assertEqual(len(list(checks.no_setting_conf_directly_in_tests(
@@ -216,22 +216,16 @@ class HackingTestCase(test.NoDBTestCase):
 
     def test_check_explicit_underscore_import(self):
         self.assertEqual(len(list(checks.check_explicit_underscore_import(
-            "LOG.info(_('My info message'))",
-            "cinder/tests/other_files.py"))), 1)
-        self.assertEqual(len(list(checks.check_explicit_underscore_import(
             "msg = _('My message')",
             "cinder/tests/other_files.py"))), 1)
         self.assertEqual(len(list(checks.check_explicit_underscore_import(
             "from cinder.i18n import _",
             "cinder/tests/other_files.py"))), 0)
         self.assertEqual(len(list(checks.check_explicit_underscore_import(
-            "LOG.info(_('My info message'))",
-            "cinder/tests/other_files.py"))), 0)
-        self.assertEqual(len(list(checks.check_explicit_underscore_import(
             "msg = _('My message')",
             "cinder/tests/other_files.py"))), 0)
         self.assertEqual(len(list(checks.check_explicit_underscore_import(
-            "from cinder.i18n import _, _LW",
+            "from cinder.i18n import _",
             "cinder/tests/other_files2.py"))), 0)
         self.assertEqual(len(list(checks.check_explicit_underscore_import(
             "msg = _('My message')",
@@ -252,17 +246,20 @@ class HackingTestCase(test.NoDBTestCase):
         for method in ('dump', 'dumps', 'load', 'loads'):
             self.assertEqual(
                 __get_msg(method),
-                list(checks.use_jsonutils("json.%s(" % method,
-                                     "./nova/virt/xenapi/driver.py")))
-            self.assertEqual(0,
-                len(list(checks.use_jsonutils("json.%s(" % method,
-                                     "./plugins/xenserver/script.py"))))
-            self.assertEqual(0,
-                len(list(checks.use_jsonutils("jsonx.%s(" % method,
-                                     "./nova/virt/xenapi/driver.py"))))
-        self.assertEqual(0,
-            len(list(checks.use_jsonutils("json.dumb",
-                                 "./nova/virt/xenapi/driver.py"))))
+                list(checks.use_jsonutils(
+                    "json.%s(" % method, "./nova/virt/libvirt/driver.py")),
+            )
+            self.assertEqual(
+                0,
+                len(list(checks.use_jsonutils(
+                    "jsonx.%s(" % method, "./nova/virt/libvirt/driver.py"))),
+            )
+
+        self.assertEqual(
+            0,
+            len(list(checks.use_jsonutils(
+                "json.dumb", "./nova/virt/libvirt/driver.py"))),
+        )
 
     # We are patching pycodestyle so that only the check under test is actually
     # installed.
@@ -290,71 +287,6 @@ class HackingTestCase(test.NoDBTestCase):
 
     def _assert_has_no_errors(self, code, checker, filename=None):
         self._assert_has_errors(code, checker, filename=filename)
-
-    def test_str_unicode_exception(self):
-
-        checker = checks.CheckForStrUnicodeExc
-        code = """
-               def f(a, b):
-                   try:
-                       p = str(a) + str(b)
-                   except ValueError as e:
-                       p = str(e)
-                   return p
-               """
-        errors = [(5, 16, 'N325')]
-        self._assert_has_errors(code, checker, expected_errors=errors)
-
-        code = """
-               def f(a, b):
-                   try:
-                       p = unicode(a) + str(b)
-                   except ValueError as e:
-                       p = e
-                   return p
-               """
-        self._assert_has_no_errors(code, checker)
-
-        code = """
-               def f(a, b):
-                   try:
-                       p = str(a) + str(b)
-                   except ValueError as e:
-                       p = unicode(e)
-                   return p
-               """
-        errors = [(5, 20, 'N325')]
-        self._assert_has_errors(code, checker, expected_errors=errors)
-
-        code = """
-               def f(a, b):
-                   try:
-                       p = str(a) + str(b)
-                   except ValueError as e:
-                       try:
-                           p  = unicode(a) + unicode(b)
-                       except ValueError as ve:
-                           p = str(e) + str(ve)
-                       p = e
-                   return p
-               """
-        errors = [(8, 20, 'N325'), (8, 29, 'N325')]
-        self._assert_has_errors(code, checker, expected_errors=errors)
-
-        code = """
-               def f(a, b):
-                   try:
-                       p = str(a) + str(b)
-                   except ValueError as e:
-                       try:
-                           p  = unicode(a) + unicode(b)
-                       except ValueError as ve:
-                           p = str(e) + unicode(ve)
-                       p = str(e)
-                   return p
-               """
-        errors = [(8, 20, 'N325'), (8, 33, 'N325'), (9, 16, 'N325')]
-        self._assert_has_errors(code, checker, expected_errors=errors)
 
     def test_api_version_decorator_check(self):
         code = """
@@ -403,23 +335,14 @@ class HackingTestCase(test.NoDBTestCase):
 
 
                _ = fake_tran
-               _LI = _
-               _LW = _
-               _LE = _
-               _LC = _
 
 
                def f(a, b):
                    msg = _('test') + 'add me'
-                   msg = _LI('test') + 'add me'
-                   msg = _LW('test') + 'add me'
-                   msg = _LE('test') + 'add me'
-                   msg = _LC('test') + 'add me'
                    msg = 'add to me' + _('test')
                    return msg
                """
-        errors = [(13, 10, 'N326'), (14, 10, 'N326'), (15, 10, 'N326'),
-                  (16, 10, 'N326'), (17, 10, 'N326'), (18, 24, 'N326')]
+        errors = [(9, 10, 'N326'), (10, 24, 'N326')]
         self._assert_has_errors(code, checker, expected_errors=errors)
 
         code = """
@@ -586,27 +509,6 @@ class HackingTestCase(test.NoDBTestCase):
         code = "'This is the then best comment'\n"
         self._assert_has_no_errors(code, checks.check_doubled_words)
 
-    def test_dict_iteritems(self):
-        self.assertEqual(1, len(list(checks.check_python3_no_iteritems(
-            "obj.iteritems()"))))
-
-        self.assertEqual(0, len(list(checks.check_python3_no_iteritems(
-            "six.iteritems(ob))"))))
-
-    def test_dict_iterkeys(self):
-        self.assertEqual(1, len(list(checks.check_python3_no_iterkeys(
-            "obj.iterkeys()"))))
-
-        self.assertEqual(0, len(list(checks.check_python3_no_iterkeys(
-            "six.iterkeys(ob))"))))
-
-    def test_dict_itervalues(self):
-        self.assertEqual(1, len(list(checks.check_python3_no_itervalues(
-            "obj.itervalues()"))))
-
-        self.assertEqual(0, len(list(checks.check_python3_no_itervalues(
-            "six.itervalues(ob))"))))
-
     def test_no_os_popen(self):
         code = """
                import os
@@ -700,31 +602,23 @@ class HackingTestCase(test.NoDBTestCase):
         """
         self._assert_has_no_errors(code, checks.check_policy_enforce)
 
-    def test_check_python3_xrange(self):
-        func = checks.check_python3_xrange
-        self.assertEqual(1, len(list(func('for i in xrange(10)'))))
-        self.assertEqual(1, len(list(func('for i in xrange    (10)'))))
-        self.assertEqual(0, len(list(func('for i in range(10)'))))
-        self.assertEqual(0, len(list(func('for i in six.moves.range(10)'))))
-
     def test_log_context(self):
         code = """
-                  LOG.info(_LI("Rebooting instance"),
-                            context=context, instance=instance)
+                  LOG.info("Rebooting instance",
+                           context=context, instance=instance)
                """
         errors = [(1, 0, 'N353')]
         self._assert_has_errors(code, checks.check_context_log,
                                 expected_errors=errors)
         code = """
-                  LOG.info(_LI("Rebooting instance"),
-                            context=admin_context, instance=instance)
+                  LOG.info("Rebooting instance",
+                           context=admin_context, instance=instance)
                """
         errors = [(1, 0, 'N353')]
         self._assert_has_errors(code, checks.check_context_log,
                                 expected_errors=errors)
         code = """
-                  LOG.info(_LI("Rebooting instance"),
-                            instance=instance)
+                  LOG.info("Rebooting instance", instance=instance)
                """
         self._assert_has_no_errors(code, checks.check_context_log)
 
@@ -1003,7 +897,7 @@ class HackingTestCase(test.NoDBTestCase):
             expected_errors=errors, filename="nova/tests/unit/test_context.py")
         # Check no errors in other than 'nova/tests' directory.
         self._assert_has_no_errors(
-            code, checks.nonexistent_assertion_methods_and_attributes,
+            code, checks.useless_assertion,
             filename="nova/compute/api.py")
         code = """
                    self.assertIsNone(None_test_var, "Fails")
@@ -1014,4 +908,28 @@ class HackingTestCase(test.NoDBTestCase):
                """
         self._assert_has_no_errors(
             code, checks.useless_assertion,
+            filename="nova/tests/unit/test_context.py")
+
+    def test_check_assert_has_calls(self):
+        code = """
+                   mock_method.assert_has_calls = [mock.call(1)]
+                   mock_method2.assert_has_calls = [
+                       mock.call(1), mock.call(2)]
+               """
+        errors = [(x + 1, 0, 'N366') for x in range(2)]
+        # Check errors in 'nova/tests' directory.
+        self._assert_has_errors(
+            code, checks.check_assert_has_calls,
+            expected_errors=errors, filename="nova/tests/unit/test_context.py")
+        # Check no errors in other than 'nova/tests' directory.
+        self._assert_has_no_errors(
+            code, checks.check_assert_has_calls,
+            filename="nova/compute/api.py")
+        code = """
+                   mock_method.assert_has_calls([mock.call(1)])
+                   mock_method2.assert_has_calls([
+                       mock.call(1), mock.call(2)])
+               """
+        self._assert_has_no_errors(
+            code, checks.check_assert_has_calls,
             filename="nova/tests/unit/test_context.py")

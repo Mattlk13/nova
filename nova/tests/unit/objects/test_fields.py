@@ -12,6 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
 import datetime
 import os
 
@@ -19,7 +20,6 @@ import iso8601
 import mock
 from oslo_serialization import jsonutils
 from oslo_versionedobjects import exception as ovo_exc
-import six
 
 from nova import exception
 from nova.network import model as network_model
@@ -27,6 +27,10 @@ from nova.objects import fields
 from nova import test
 from nova.tests.unit import fake_instance
 from nova import utils
+
+os_uname = collections.namedtuple(
+    'uname_result', ['sysname', 'nodename', 'release', 'version', 'machine'],
+)
 
 
 class FakeFieldType(fields.FieldType):
@@ -120,8 +124,6 @@ class TestString(TestField):
         super(TestString, self).setUp()
         self.field = fields.StringField()
         self.coerce_good_values = [('foo', 'foo'), (1, '1'), (True, 'True')]
-        if six.PY2:
-            self.coerce_good_values.append((int(1), '1'))
         self.coerce_bad_values = [None]
         self.to_primitive_values = self.coerce_good_values[0:1]
         self.from_primitive_values = self.coerce_good_values[0:1]
@@ -161,8 +163,6 @@ class TestEnum(TestField):
         self.field = fields.EnumField(
             valid_values=['foo', 'bar', 1, 1, True])
         self.coerce_good_values = [('foo', 'foo'), (1, '1'), (True, 'True')]
-        if six.PY2:
-            self.coerce_good_values.append((int(1), '1'))
         self.coerce_bad_values = ['boo', 2, False]
         self.to_primitive_values = self.coerce_good_values[0:1]
         self.from_primitive_values = self.coerce_good_values[0:1]
@@ -192,7 +192,7 @@ class TestEnum(TestField):
 class TestArchitecture(TestField):
     @mock.patch.object(os, 'uname')
     def test_host(self, mock_uname):
-        mock_uname.return_value = (
+        mock_uname.return_value = os_uname(
             'Linux',
             'localhost.localdomain',
             '3.14.8-200.fc20.x86_64',

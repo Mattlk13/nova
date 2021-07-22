@@ -16,11 +16,10 @@
 from oslo_log import log as logging
 import oslo_messaging as messaging
 from oslo_utils import timeutils
-import six
 
 import nova.conf
 from nova import exception
-from nova.i18n import _, _LI, _LW, _LE
+from nova.i18n import _
 from nova.servicegroup import api
 from nova.servicegroup.drivers import base
 
@@ -61,7 +60,7 @@ class DbDriver(base.Driver):
         """
         last_heartbeat = (service_ref.get('last_seen_up') or
             service_ref['created_at'])
-        if isinstance(last_heartbeat, six.string_types):
+        if isinstance(last_heartbeat, str):
             # NOTE(russellb) If this service_ref came in over rpc via
             # conductor, then the timestamp will be a string and needs to be
             # converted back to a datetime.
@@ -95,15 +94,16 @@ class DbDriver(base.Driver):
             # TODO(termie): make this pattern be more elegant.
             if getattr(service, 'model_disconnected', False):
                 service.model_disconnected = False
-                LOG.info(
-                    _LI('Recovered from being unable to report status.'))
+                LOG.info('Recovered from being unable to report status.')
         except messaging.MessagingTimeout:
             # NOTE(johngarbutt) during upgrade we will see messaging timeouts
             # as nova-conductor is restarted, so only log this error once.
             if not getattr(service, 'model_disconnected', False):
                 service.model_disconnected = True
-                LOG.warning(_LW('Lost connection to nova-conductor '
-                             'for reporting service status.'))
+                LOG.warning(
+                    'Lost connection to nova-conductor for reporting service '
+                    'status.'
+                )
         except exception.ServiceNotFound:
             # The service may have been deleted via the API but the actual
             # process is still running. Provide a useful error message rather
@@ -119,7 +119,6 @@ class DbDriver(base.Driver):
             # exceptions here, but otherwise it would become possible for
             # the state reporting thread to stop abruptly, and thus leave
             # the service unusable until it's restarted.
-            LOG.exception(
-                _LE('Unexpected error while reporting service status'))
+            LOG.exception('Unexpected error while reporting service status')
             # trigger the recovery log message, if this error goes away
             service.model_disconnected = True

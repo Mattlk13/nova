@@ -25,8 +25,8 @@ import netifaces
 from oslo_log import log
 from oslo_serialization import jsonutils
 from oslo_utils import excutils
-import six
 
+from nova.accelerator import cyborg
 from nova import block_device
 from nova.compute import power_state
 from nova.compute import task_states
@@ -52,7 +52,6 @@ from nova.objects import fields
 from nova import rpc
 from nova import safe_utils
 from nova import utils
-from nova.virt import driver
 
 CONF = nova.conf.CONF
 LOG = log.getLogger(__name__)
@@ -68,6 +67,13 @@ NON_INHERITABLE_IMAGE_PROPERTIES = frozenset([
     'img_signature_hash_method',
     'img_signature_key_type',
     'img_signature_certificate_uuid'])
+
+# Properties starting with these namespaces are reserved for internal
+# use by other services. It does not make sense (and may cause a request
+# fail) if we include them in a snapshot.
+NON_INHERITABLE_IMAGE_NAMESPACES = frozenset([
+    'os_glance',
+])
 
 
 def exception_to_dict(fault, message=None):
@@ -131,7 +137,7 @@ def _get_fault_details(exc_info, error_code):
         # exceptions (see exception_to_dict).
         details = ''.join(traceback.format_exception(
             exc_info[0], exc_info[1], exc_info[2]))
-    return six.text_type(details)
+    return str(details)
 
 
 def add_instance_fault_from_exc(context, instance, fault, exc_info=None,
@@ -228,10 +234,6 @@ def get_next_device_name(instance, device_name_list,
     except (TypeError, AttributeError, ValueError):
         raise exception.InvalidDevicePath(path=root_device_name)
 
-    # NOTE(vish): remove this when xenapi is setting default_root_device
-    if driver.is_xenapi():
-        prefix = '/dev/xvd'
-
     if req_prefix != prefix:
         LOG.debug("Using %(prefix)s instead of %(req_prefix)s",
                   {'prefix': prefix, 'req_prefix': req_prefix})
@@ -240,16 +242,6 @@ def get_next_device_name(instance, device_name_list,
     for device_path in device_name_list:
         letter = block_device.get_device_letter(device_path)
         used_letters.add(letter)
-
-    # NOTE(vish): remove this when xenapi is properly setting
-    #             default_ephemeral_device and default_swap_device
-    if driver.is_xenapi():
-        flavor = instance.get_flavor()
-        if flavor.ephemeral_gb:
-            used_letters.add('b')
-
-        if flavor.swap:
-            used_letters.add('c')
 
     check_max_disk_devices_to_attach(len(used_letters) + 1)
 
@@ -370,9 +362,6 @@ def notify_usage_exists(notifier, context, instance_ref, host,
 
     audit_start, audit_end = notifications.audit_period_bounds(current_period)
 
-    bw = notifications.bandwidth_usage(context, instance_ref, audit_start,
-            ignore_missing_network_data)
-
     if system_metadata is None:
         system_metadata = utils.instance_sys_meta(instance_ref)
 
@@ -381,7 +370,7 @@ def notify_usage_exists(notifier, context, instance_ref, host,
 
     extra_info = dict(audit_period_beginning=str(audit_start),
                       audit_period_ending=str(audit_end),
-                      bandwidth=bw, image_meta=image_meta)
+                      bandwidth={}, image_meta=image_meta)
 
     if extra_usage_info:
         extra_info.update(extra_usage_info)
@@ -393,17 +382,11 @@ def notify_usage_exists(notifier, context, instance_ref, host,
             audit_period_beginning=audit_start,
             audit_period_ending=audit_end)
 
-    bandwidth = [instance_notification.BandwidthPayload(
-                    network_name=label,
-                    in_bytes=b['bw_in'],
-                    out_bytes=b['bw_out'])
-                 for label, b in bw.items()]
-
     payload = instance_notification.InstanceExistsPayload(
         context=context,
         instance=instance_ref,
         audit_period=audit_period,
-        bandwidth=bandwidth)
+        bandwidth=[])
 
     notification = instance_notification.InstanceExistsNotification(
         context=context,
@@ -451,14 +434,15 @@ def notify_about_instance_usage(notifier, context, instance, event_suffix,
     method(context, 'compute.instance.%s' % event_suffix, usage_info)
 
 
-def _get_fault_and_priority_from_exc_and_tb(exception, tb):
+def _get_fault_and_priority_from_exception(exception: Exception):
     fault = None
     priority = fields.NotificationPriority.INFO
 
-    if exception:
-        priority = fields.NotificationPriority.ERROR
-        fault = notification_exception.ExceptionPayload.from_exc_and_traceback(
-            exception, tb)
+    if not exception:
+        return fault, priority
+
+    fault = notification_exception.ExceptionPayload.from_exception(exception)
+    priority = fields.NotificationPriority.ERROR
 
     return fault, priority
 
@@ -466,7 +450,7 @@ def _get_fault_and_priority_from_exc_and_tb(exception, tb):
 @rpc.if_notifications_enabled
 def notify_about_instance_action(context, instance, host, action, phase=None,
                                  source=fields.NotificationSource.COMPUTE,
-                                 exception=None, bdms=None, tb=None):
+                                 exception=None, bdms=None):
     """Send versioned notification about the action made on the instance
     :param instance: the instance which the action performed on
     :param host: the host emitting the notification
@@ -475,10 +459,9 @@ def notify_about_instance_action(context, instance, host, action, phase=None,
     :param source: the source of the notification
     :param exception: the thrown exception (used in error notifications)
     :param bdms: BlockDeviceMappingList object for the instance. If it is not
-                provided then we will load it from the db if so configured
-    :param tb: the traceback (used in error notifications)
+        provided then we will load it from the db if so configured
     """
-    fault, priority = _get_fault_and_priority_from_exc_and_tb(exception, tb)
+    fault, priority = _get_fault_and_priority_from_exception(exception)
     payload = instance_notification.InstanceActionPayload(
             context=context,
             instance=instance,
@@ -499,7 +482,7 @@ def notify_about_instance_action(context, instance, host, action, phase=None,
 
 @rpc.if_notifications_enabled
 def notify_about_instance_create(context, instance, host, phase=None,
-                                 exception=None, bdms=None, tb=None):
+                                 exception=None, bdms=None):
     """Send versioned notification about instance creation
 
     :param context: the request context
@@ -509,9 +492,8 @@ def notify_about_instance_create(context, instance, host, phase=None,
     :param exception: the thrown exception (used in error notifications)
     :param bdms: BlockDeviceMappingList object for the instance. If it is not
                 provided then we will load it from the db if so configured
-    :param tb: the traceback (used in error notifications)
     """
-    fault, priority = _get_fault_and_priority_from_exc_and_tb(exception, tb)
+    fault, priority = _get_fault_and_priority_from_exception(exception)
     payload = instance_notification.InstanceCreatePayload(
         context=context,
         instance=instance,
@@ -557,7 +539,7 @@ def notify_about_scheduler_action(context, request_spec, action, phase=None,
 
 @rpc.if_notifications_enabled
 def notify_about_volume_attach_detach(context, instance, host, action, phase,
-                                      volume_id=None, exception=None, tb=None):
+                                      volume_id=None, exception=None):
     """Send versioned notification about the action made on the instance
     :param instance: the instance which the action performed on
     :param host: the host emitting the notification
@@ -565,9 +547,8 @@ def notify_about_volume_attach_detach(context, instance, host, action, phase,
     :param phase: the phase of the action
     :param volume_id: id of the volume will be attached
     :param exception: the thrown exception (used in error notifications)
-    :param tb: the traceback (used in error notifications)
     """
-    fault, priority = _get_fault_and_priority_from_exc_and_tb(exception, tb)
+    fault, priority = _get_fault_and_priority_from_exception(exception)
     payload = instance_notification.InstanceActionVolumePayload(
             context=context,
             instance=instance,
@@ -589,7 +570,7 @@ def notify_about_volume_attach_detach(context, instance, host, action, phase,
 @rpc.if_notifications_enabled
 def notify_about_instance_rescue_action(context, instance, host,
                                         rescue_image_ref, phase=None,
-                                        exception=None, tb=None):
+                                        exception=None):
     """Send versioned notification about the action made on the instance
 
     :param instance: the instance which the action performed on
@@ -597,9 +578,8 @@ def notify_about_instance_rescue_action(context, instance, host,
     :param rescue_image_ref: the rescue image ref
     :param phase: the phase of the action
     :param exception: the thrown exception (used in error notifications)
-    :param tb: the traceback (used in error notifications)
     """
-    fault, priority = _get_fault_and_priority_from_exc_and_tb(exception, tb)
+    fault, priority = _get_fault_and_priority_from_exception(exception)
     payload = instance_notification.InstanceActionRescuePayload(
             context=context,
             instance=instance,
@@ -643,8 +623,7 @@ def notify_about_keypair_action(context, keypair, action, phase):
 
 @rpc.if_notifications_enabled
 def notify_about_volume_swap(context, instance, host, phase,
-                             old_volume_id, new_volume_id, exception=None,
-                             tb=None):
+                             old_volume_id, new_volume_id, exception=None):
     """Send versioned notification about the volume swap action
        on the instance
 
@@ -655,9 +634,8 @@ def notify_about_volume_swap(context, instance, host, phase,
     :param old_volume_id: the ID of the volume that is copied from and detached
     :param new_volume_id: the ID of the volume that is copied to and attached
     :param exception: an exception
-    :param tb: the traceback (used in error notifications)
     """
-    fault, priority = _get_fault_and_priority_from_exc_and_tb(exception, tb)
+    fault, priority = _get_fault_and_priority_from_exception(exception)
     payload = instance_notification.InstanceActionVolumeSwapPayload(
         context=context,
         instance=instance,
@@ -876,7 +854,7 @@ def notify_about_instance_rebuild(context, instance, host,
                                   action=fields.NotificationAction.REBUILD,
                                   phase=None,
                                   source=fields.NotificationSource.COMPUTE,
-                                  exception=None, bdms=None, tb=None):
+                                  exception=None, bdms=None):
     """Send versioned notification about instance rebuild
 
     :param instance: the instance which the action performed on
@@ -887,9 +865,8 @@ def notify_about_instance_rebuild(context, instance, host,
     :param exception: the thrown exception (used in error notifications)
     :param bdms: BlockDeviceMappingList object for the instance. If it is not
                 provided then we will load it from the db if so configured
-    :param tb: the traceback (used in error notifications)
     """
-    fault, priority = _get_fault_and_priority_from_exc_and_tb(exception, tb)
+    fault, priority = _get_fault_and_priority_from_exception(exception)
     payload = instance_notification.InstanceActionRebuildPayload(
             context=context,
             instance=instance,
@@ -937,15 +914,14 @@ def notify_about_metrics_update(context, host, host_ip, nodename,
 
 
 @rpc.if_notifications_enabled
-def notify_about_libvirt_connect_error(context, ip, exception, tb):
+def notify_about_libvirt_connect_error(context, ip, exception):
     """Send a versioned notification about libvirt connect error.
 
     :param context: the request context
     :param ip: the IP address of the host
     :param exception: the thrown exception
-    :param tb: the traceback
     """
-    fault, _ = _get_fault_and_priority_from_exc_and_tb(exception, tb)
+    fault, _ = _get_fault_and_priority_from_exception(exception)
     payload = libvirt_notification.LibvirtErrorPayload(ip=ip, reason=fault)
     notification = libvirt_notification.LibvirtErrorNotification(
         priority=fields.NotificationPriority.ERROR,
@@ -983,7 +959,7 @@ def notify_about_volume_usage(context, vol_usage, host):
 
 @rpc.if_notifications_enabled
 def notify_about_compute_task_error(context, action, instance_uuid,
-                                    request_spec, state, exception, tb):
+                                    request_spec, state, exception):
     """Send a versioned notification about compute task error.
 
     :param context: the request context
@@ -1000,7 +976,7 @@ def notify_about_compute_task_error(context, action, instance_uuid,
         request_spec = objects.RequestSpec.from_primitives(
             context, request_spec, {})
 
-    fault, _ = _get_fault_and_priority_from_exc_and_tb(exception, tb)
+    fault, _ = _get_fault_and_priority_from_exception(exception)
     payload = task_notification.ComputeTaskPayload(
         instance_uuid=instance_uuid, request_spec=request_spec, state=state,
         reason=fault)
@@ -1107,16 +1083,26 @@ def get_headroom(quotas, usages, deltas):
     return headroom
 
 
-def check_num_instances_quota(context, instance_type, min_count,
-                              max_count, project_id=None, user_id=None,
-                              orig_num_req=None):
+def check_num_instances_quota(
+    context, flavor, min_count, max_count, project_id=None, user_id=None,
+    orig_num_req=None,
+):
     """Enforce quota limits on number of instances created."""
-    # project_id is used for the TooManyInstances error message
+    # project_id is also used for the TooManyInstances error message
     if project_id is None:
         project_id = context.project_id
+    if user_id is None:
+        user_id = context.user_id
+    # Check whether we need to count resources per-user and check a per-user
+    # quota limit. If we have no per-user quota limit defined for a
+    # project/user, we can avoid wasteful resource counting.
+    user_quotas = objects.Quotas.get_all_by_project_and_user(
+        context, project_id, user_id)
+    if not any(r in user_quotas for r in ['instances', 'cores', 'ram']):
+        user_id = None
     # Determine requested cores and ram
-    req_cores = max_count * instance_type.vcpus
-    req_ram = max_count * instance_type.memory_mb
+    req_cores = max_count * flavor.vcpus
+    req_ram = max_count * flavor.memory_mb
     deltas = {'instances': max_count, 'cores': req_cores, 'ram': req_ram}
 
     try:
@@ -1132,8 +1118,8 @@ def check_num_instances_quota(context, instance_type, min_count,
         if min_count == max_count == 0:
             # orig_num_req is the original number of instances requested in the
             # case of a recheck quota, for use in the over quota exception.
-            req_cores = orig_num_req * instance_type.vcpus
-            req_ram = orig_num_req * instance_type.memory_mb
+            req_cores = orig_num_req * flavor.vcpus
+            req_ram = orig_num_req * flavor.memory_mb
             requested = {'instances': orig_num_req, 'cores': req_cores,
                          'ram': req_ram}
             (overs, reqs, total_alloweds, useds) = get_over_quota_detail(
@@ -1151,21 +1137,19 @@ def check_num_instances_quota(context, instance_type, min_count,
 
         allowed = headroom.get('instances', 1)
         # Reduce 'allowed' instances in line with the cores & ram headroom
-        if instance_type.vcpus:
-            allowed = min(allowed,
-                          headroom['cores'] // instance_type.vcpus)
-        if instance_type.memory_mb:
-            allowed = min(allowed,
-                          headroom['ram'] // instance_type.memory_mb)
+        if flavor.vcpus:
+            allowed = min(allowed, headroom['cores'] // flavor.vcpus)
+        if flavor.memory_mb:
+            allowed = min(allowed, headroom['ram'] // flavor.memory_mb)
 
         # Convert to the appropriate exception message
         if allowed <= 0:
             msg = "Cannot run any more instances of this type."
         elif min_count <= allowed <= max_count:
             # We're actually OK, but still need to check against allowed
-            return check_num_instances_quota(context, instance_type, min_count,
-                                             allowed, project_id=project_id,
-                                             user_id=user_id)
+            return check_num_instances_quota(
+                context, flavor, min_count, allowed, project_id=project_id,
+                user_id=user_id)
         else:
             msg = "Can only run %s more instances of this type." % allowed
 
@@ -1290,6 +1274,9 @@ def initialize_instance_snapshot_metadata(context, instance, name,
     properties = image_meta['properties']
     keys_to_pop = set(CONF.non_inheritable_image_properties).union(
         NON_INHERITABLE_IMAGE_PROPERTIES)
+    for ns in NON_INHERITABLE_IMAGE_NAMESPACES:
+        keys_to_pop |= {key for key in properties
+                        if key.startswith(ns)}
     for key in keys_to_pop:
         properties.pop(key, None)
 
@@ -1499,13 +1486,13 @@ def notify_about_instance_delete(notifier, context, instance,
 
 
 def update_pci_request_spec_with_allocated_interface_name(
-        context, report_client, instance, provider_mapping):
+        context, report_client, pci_requests, provider_mapping):
     """Update the instance's PCI request based on the request group -
     resource provider mapping and the device RP name from placement.
 
     :param context: the request context
     :param report_client: a SchedulerReportClient instance
-    :param instance: an Instance object to be updated
+    :param pci_requests: A list of InstancePCIRequest objects to be updated
     :param provider_mapping: the request group - resource provider mapping
         in the form returned by the RequestSpec.get_request_group_mapping()
         call.
@@ -1516,14 +1503,14 @@ def update_pci_request_spec_with_allocated_interface_name(
         have a well formatted name so we cannot parse the parent interface
         name out of it.
     """
-    if not instance.pci_requests:
+    if not pci_requests:
         return
 
     def needs_update(pci_request, mapping):
         return (pci_request.requester_id and
                 pci_request.requester_id in mapping)
 
-    for pci_request in instance.pci_requests.requests:
+    for pci_request in pci_requests:
         if needs_update(pci_request, provider_mapping):
 
             provider_uuids = provider_mapping[pci_request.requester_id]
@@ -1548,3 +1535,18 @@ def update_pci_request_spec_with_allocated_interface_name(
 
             for spec in pci_request.spec:
                 spec['parent_ifname'] = rp_name_pieces[2]
+
+
+def delete_arqs_if_needed(context, instance):
+    """Delete Cyborg ARQs for the instance."""
+    dp_name = instance.flavor.extra_specs.get('accel:device_profile')
+    if dp_name is None:
+        return
+    cyclient = cyborg.get_client(context)
+    LOG.debug('Calling Cyborg to delete ARQs for instance %(instance)s',
+              {'instance': instance.uuid})
+    try:
+        cyclient.delete_arqs_for_instance(instance.uuid)
+    except exception.AcceleratorRequestOpFailed as e:
+        LOG.exception('Failed to delete accelerator requests for '
+                      'instance %s. Exception: %s', instance.uuid, e)

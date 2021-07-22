@@ -18,7 +18,6 @@
 """Utilities and helper functions."""
 
 import contextlib
-import copy
 import datetime
 import functools
 import hashlib
@@ -44,15 +43,13 @@ import oslo_messaging as messaging
 from oslo_utils import encodeutils
 from oslo_utils import excutils
 from oslo_utils import importutils
+from oslo_utils.secretutils import md5
 from oslo_utils import strutils
 from oslo_utils import timeutils
-from oslo_utils import units
-import six
-from six.moves import range
 
 import nova.conf
 from nova import exception
-from nova.i18n import _, _LE, _LW
+from nova.i18n import _
 from nova import safe_utils
 
 profiler = importutils.try_import('osprofiler.profiler')
@@ -77,22 +74,10 @@ SM_SKIP_KEYS = (
     # Modern names
     'img_mappings', 'img_block_device_mapping',
 )
-# Image attributes which Cinder stores in volume image metadata
-# as regular properties
-VIM_IMAGE_ATTRIBUTES = (
-    'image_id', 'image_name', 'size', 'checksum',
-    'container_format', 'disk_format', 'min_ram', 'min_disk',
-)
 
 _FILE_CACHE = {}
 
 _SERVICE_TYPES = service_types.ServiceTypes()
-
-
-if hasattr(inspect, 'getfullargspec'):
-    getargspec = inspect.getfullargspec
-else:
-    getargspec = inspect.getargspec
 
 
 # NOTE(mikal): this seems to have to stay for now to handle os-brick
@@ -264,11 +249,11 @@ def utf8(value):
     http://github.com/facebook/tornado/blob/master/tornado/escape.py
 
     """
-    if value is None or isinstance(value, six.binary_type):
+    if value is None or isinstance(value, bytes):
         return value
 
-    if not isinstance(value, six.text_type):
-        value = six.text_type(value)
+    if not isinstance(value, str):
+        value = str(value)
 
     return value.encode('utf-8')
 
@@ -298,7 +283,7 @@ def parse_server_string(server_str):
         return (address, port)
 
     except (ValueError, netaddr.AddrFormatError):
-        LOG.error(_LE('Invalid server_string: %s'), server_str)
+        LOG.error('Invalid server_string: %s', server_str)
         return ('', '')
 
 
@@ -371,19 +356,17 @@ def sanitize_hostname(hostname, default_name=None):
 
     def truncate_hostname(name):
         if len(name) > 63:
-            LOG.warning(_LW("Hostname %(hostname)s is longer than 63, "
-                            "truncate it to %(truncated_name)s"),
-                            {'hostname': name, 'truncated_name': name[:63]})
+            LOG.warning("Hostname %(hostname)s is longer than 63, "
+                        "truncate it to %(truncated_name)s",
+                        {'hostname': name, 'truncated_name': name[:63]})
         return name[:63]
 
-    if isinstance(hostname, six.text_type):
+    if isinstance(hostname, str):
         # Remove characters outside the Unicode range U+0000-U+00FF
-        hostname = hostname.encode('latin-1', 'ignore')
-        if six.PY3:
-            hostname = hostname.decode('latin-1')
+        hostname = hostname.encode('latin-1', 'ignore').decode('latin-1')
 
     hostname = truncate_hostname(hostname)
-    hostname = re.sub('[ _]', '-', hostname)
+    hostname = re.sub(r'[ _\.]', '-', hostname)
     hostname = re.sub(r'[^\w.-]+', '', hostname)
     hostname = hostname.lower()
     hostname = hostname.strip('.-')
@@ -494,7 +477,7 @@ def tempdir(**kwargs):
         try:
             shutil.rmtree(tmpdir)
         except OSError as e:
-            LOG.error(_LE('Could not remove tmpdir: %s'), e)
+            LOG.error('Could not remove tmpdir: %s', e)
 
 
 class UndoManager(object):
@@ -547,6 +530,8 @@ def instance_meta(instance):
         return metadata_to_dict(instance['metadata'])
 
 
+# TODO(stephenfin): Instance.system_metadata is always a dict now (thanks,
+# o.vo) so this check (and the function as a whole) can be removed
 def instance_sys_meta(instance):
     if not instance.get('system_metadata'):
         return {}
@@ -562,7 +547,7 @@ def expects_func_args(*args):
         @functools.wraps(dec)
         def _decorator(f):
             base_f = safe_utils.get_wrapped_function(f)
-            argspec = getargspec(base_f)
+            argspec = inspect.getfullargspec(base_f)
             if argspec[1] or argspec[2] or set(args) <= set(argspec[0]):
                 # NOTE (ndipanov): We can't really tell if correct stuff will
                 # be passed if it's a function with *args or **kwargs so
@@ -594,7 +579,7 @@ class ExceptionHelper(object):
             try:
                 return func(*args, **kwargs)
             except messaging.ExpectedException as e:
-                six.reraise(*e.exc_info)
+                raise e.exc_info[1]
         return wrapper
 
 
@@ -626,7 +611,7 @@ def validate_integer(value, name, min_value=None, max_value=None):
     try:
         return strutils.validate_integer(value, name, min_value, max_value)
     except ValueError as e:
-        raise exception.InvalidInput(reason=six.text_type(e))
+        raise exception.InvalidInput(reason=str(e))
 
 
 def _serialize_profile_info():
@@ -697,10 +682,15 @@ def spawn_n(func, *args, **kwargs):
     eventlet.spawn_n(context_wrapper, *args, **kwargs)
 
 
+def tpool_execute(func, *args, **kwargs):
+    """Run func in a native thread"""
+    eventlet.tpool.execute(func, *args, **kwargs)
+
+
 def is_none_string(val):
     """Check if a string represents a None value.
     """
-    if not isinstance(val, six.string_types):
+    if not isinstance(val, str):
         return False
 
     return val.lower() == 'none'
@@ -733,7 +723,7 @@ def get_system_metadata_from_image(image_meta, flavor=None):
         if key in SM_SKIP_KEYS:
             continue
 
-        new_value = safe_truncate(six.text_type(value), 255)
+        new_value = safe_truncate(str(value), 255)
         system_meta[prefix_format % key] = new_value
 
     for key in SM_INHERITABLE_KEYS:
@@ -782,42 +772,14 @@ def get_image_from_system_metadata(system_meta):
     return image_meta
 
 
-def get_image_metadata_from_volume(volume):
-    properties = copy.copy(volume.get('volume_image_metadata', {}))
-    image_meta = {'properties': properties}
-    # Volume size is no longer related to the original image size,
-    # so we take it from the volume directly. Cinder creates
-    # volumes in Gb increments, and stores size in Gb, whereas
-    # glance reports size in bytes. As we're returning glance
-    # metadata here, we need to convert it.
-    image_meta['size'] = volume.get('size', 0) * units.Gi
-    # NOTE(yjiang5): restore the basic attributes
-    # NOTE(mdbooth): These values come from volume_glance_metadata
-    # in cinder. This is a simple key/value table, and all values
-    # are strings. We need to convert them to ints to avoid
-    # unexpected type errors.
-    for attr in VIM_IMAGE_ATTRIBUTES:
-        val = properties.pop(attr, None)
-        if attr in ('min_ram', 'min_disk'):
-            image_meta[attr] = int(val or 0)
-    # NOTE(mriedem): Set the status to 'active' as a really old hack
-    # from when this method was in the compute API class and is
-    # needed for _validate_flavor_image which makes sure the image
-    # is 'active'. For volume-backed servers, if the volume is not
-    # available because the image backing the volume is not active,
-    # then the compute API trying to reserve the volume should fail.
-    image_meta['status'] = 'active'
-    return image_meta
-
-
 def get_hash_str(base_str):
     """Returns string that represents MD5 hash of base_str (in hex format).
 
     If base_str is a Unicode string, encode it to UTF-8.
     """
-    if isinstance(base_str, six.text_type):
+    if isinstance(base_str, str):
         base_str = base_str.encode('utf-8')
-    return hashlib.md5(base_str).hexdigest()
+    return md5(base_str, usedforsecurity=False).hexdigest()
 
 
 def get_sha256_str(base_str):
@@ -828,7 +790,7 @@ def get_sha256_str(base_str):
     or anything else that needs to be retained for a long period a salted
     hash is better.
     """
-    if isinstance(base_str, six.text_type):
+    if isinstance(base_str, str):
         base_str = base_str.encode('utf-8')
     return hashlib.sha256(base_str).hexdigest()
 
@@ -840,8 +802,6 @@ def get_obj_repr_unicode(obj):
     else it converts the repr() to unicode.
     """
     obj_repr = repr(obj)
-    if not six.PY3:
-        obj_repr = six.text_type(obj_repr, 'utf-8')
     return obj_repr
 
 
@@ -1019,7 +979,7 @@ def get_sdk_adapter(service_type, check_service=False):
     except sdk_exc.ServiceDiscoveryException as e:
         raise exception.ServiceUnavailable(
             _("The %(service_type)s service is unavailable: %(error)s") %
-            {'service_type': service_type, 'error': six.text_type(e)})
+            {'service_type': service_type, 'error': str(e)})
     return getattr(conn, service_type)
 
 
@@ -1070,13 +1030,10 @@ def generate_hostid(host, project_id):
     return ""
 
 
-if six.PY2:
-    nested_contexts = contextlib.nested
-else:
-    @contextlib.contextmanager
-    def nested_contexts(*contexts):
-        with contextlib.ExitStack() as stack:
-            yield [stack.enter_context(c) for c in contexts]
+@contextlib.contextmanager
+def nested_contexts(*contexts):
+    with contextlib.ExitStack() as stack:
+        yield [stack.enter_context(c) for c in contexts]
 
 
 def normalize_rc_name(rc_name):
@@ -1089,3 +1046,99 @@ def normalize_rc_name(rc_name):
     norm_name = norm_name.upper()
     norm_name = orc.CUSTOM_NAMESPACE + norm_name
     return norm_name
+
+
+def raise_if_old_compute():
+    # to avoid circular imports
+    from nova import context as nova_context
+    from nova.objects import service
+
+    ctxt = nova_context.get_admin_context()
+
+    if CONF.api_database.connection is not None:
+        scope = 'system'
+        try:
+            current_service_version = service.get_minimum_version_all_cells(
+                ctxt, ['nova-compute'])
+        except exception.DBNotAllowed:
+            # This most likely means we are in a nova-compute service
+            # configured which is configured with a connection to the API
+            # database. We should not be attempting to "get out" of our cell to
+            # look at the minimum versions of nova-compute services in other
+            # cells, so DBNotAllowed was raised. Leave a warning message
+            # and fall back to only querying computes in our cell.
+            LOG.warning(
+                'This service is configured for access to the API database '
+                'but is not allowed to directly access the database. You '
+                'should run this service without the '
+                '[api_database]/connection config option. The service version '
+                'check will only query the local cell.')
+            scope = 'cell'
+            current_service_version = service.Service.get_minimum_version(
+                ctxt, 'nova-compute')
+    else:
+        scope = 'cell'
+        # We in a cell so target our query to the current cell only
+        current_service_version = service.Service.get_minimum_version(
+            ctxt, 'nova-compute')
+
+    if current_service_version == 0:
+        # 0 means no compute in the system,
+        # probably a fresh install before the computes are registered
+        return
+
+    oldest_supported_service_level = service.SERVICE_VERSION_ALIASES[
+            service.OLDEST_SUPPORTED_SERVICE_VERSION]
+
+    if current_service_version < oldest_supported_service_level:
+        raise exception.TooOldComputeService(
+            oldest_supported_version=service.OLDEST_SUPPORTED_SERVICE_VERSION,
+            scope=scope,
+            min_service_level=current_service_version,
+            oldest_supported_service=oldest_supported_service_level)
+
+
+def run_once(message, logger, cleanup=None):
+    """This is a utility function decorator to ensure a function
+    is run once and only once in an interpreter instance.
+
+    Note: this is copied from the placement repo (placement/util.py)
+
+    The decorated function object can be reset by calling its
+    reset function. All exceptions raised by the wrapped function,
+    logger and cleanup function will be propagated to the caller.
+    """
+    def outer_wrapper(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if not wrapper.called:
+                # Note(sean-k-mooney): the called state is always
+                # updated even if the wrapped function completes
+                # by raising an exception. If the caller catches
+                # the exception it is their responsibility to call
+                # reset if they want to re-execute the wrapped function.
+                try:
+                    return func(*args, **kwargs)
+                finally:
+                    wrapper.called = True
+            else:
+                logger(message)
+
+        wrapper.called = False
+
+        def reset(wrapper, *args, **kwargs):
+            # Note(sean-k-mooney): we conditionally call the
+            # cleanup function if one is provided only when the
+            # wrapped function has been called previously. We catch
+            # and reraise any exception that may be raised and update
+            # the called state in a finally block to ensure its
+            # always updated if reset is called.
+            try:
+                if cleanup and wrapper.called:
+                    return cleanup(*args, **kwargs)
+            finally:
+                wrapper.called = False
+
+        wrapper.reset = functools.partial(reset, wrapper)
+        return wrapper
+    return outer_wrapper

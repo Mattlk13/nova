@@ -15,7 +15,6 @@
 
 import mock
 from oslo_config import cfg
-import six
 
 from nova.compute import instance_actions
 from nova import context
@@ -26,13 +25,8 @@ from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional.api import client
 from nova.tests.functional import fixtures as func_fixtures
 from nova.tests.functional import integrated_helpers
-from nova.tests.unit import policy_fixture
 from nova import utils
 from nova.virt import fake
-
-import nova.scheduler.utils
-import nova.servicegroup
-import nova.tests.unit.image.fake
 
 # An alternate project id
 PROJECT_ID_ALT = "616c6c796f7572626173656172656f73"
@@ -66,7 +60,8 @@ class ServerGroupTestBase(test.TestCase,
         self.flags(weight_classes=self._get_weight_classes(),
                    group='filter_scheduler')
 
-        self.useFixture(policy_fixture.RealPolicyFixture())
+        self.useFixture(nova_fixtures.RealPolicyFixture())
+        self.useFixture(nova_fixtures.GlanceFixture(self))
         self.useFixture(nova_fixtures.NeutronFixture(self))
 
         self.useFixture(func_fixtures.PlacementFixture())
@@ -78,13 +73,8 @@ class ServerGroupTestBase(test.TestCase,
         self.admin_api = api_fixture.admin_api
         self.admin_api.microversion = self.microversion
 
-        # the image fake backend needed for image discovery
-        nova.tests.unit.image.fake.stub_out_image_service(self)
-
         self.start_service('conductor')
         self.start_service('scheduler')
-
-        self.addCleanup(nova.tests.unit.image.fake.FakeImageService_reset)
 
     def _boot_a_server_to_group(self, group,
                                 expected_status='ACTIVE', flavor=None,
@@ -371,6 +361,42 @@ class ServerGroupTestV21(ServerGroupTestBase):
         self.assertNotEqual(servers[0]['OS-EXT-SRV-ATTR:host'],
                             migrated_server['OS-EXT-SRV-ATTR:host'])
 
+    def test_migrate_with_anti_affinity_confirm_updates_scheduler(self):
+        # Start additional host to test migration with anti-affinity
+        compute3 = self.start_service('compute', host='host3')
+
+        # make sure that compute syncing instance info to scheduler
+        # this tells the scheduler that it can expect such updates periodically
+        # and don't have to look into the db for it at the start of each
+        # scheduling
+        for compute in [self.compute, self.compute2, compute3]:
+            compute.manager._sync_scheduler_instance_info(
+                context.get_admin_context())
+
+        created_group = self.api.post_server_groups(self.anti_affinity)
+        servers = self._boot_servers_to_group(created_group)
+
+        post = {'migrate': {}}
+        self.admin_api.post_server_action(servers[1]['id'], post)
+        migrated_server = self._wait_for_state_change(
+            servers[1], 'VERIFY_RESIZE')
+
+        self.assertNotEqual(servers[0]['OS-EXT-SRV-ATTR:host'],
+                            migrated_server['OS-EXT-SRV-ATTR:host'])
+
+        # We have 3 hosts, so after the move is confirmed one of the hosts
+        # should be considered empty so we could boot a 3rd server on that host
+        post = {'confirmResize': {}}
+        self.admin_api.post_server_action(servers[1]['id'], post)
+        self._wait_for_state_change(servers[1], 'ACTIVE')
+
+        server3 = self._boot_a_server_to_group(created_group)
+
+        # we have 3 servers that should occupy 3 different hosts
+        hosts = {server['OS-EXT-SRV-ATTR:host']
+                 for server in [servers[0], migrated_server, server3]}
+        self.assertEqual(3, len(hosts))
+
     def test_resize_to_same_host_with_anti_affinity(self):
         self.flags(allow_resize_to_same_host=True)
         created_group = self.api.post_server_groups(self.anti_affinity)
@@ -418,10 +444,9 @@ class ServerGroupTestV21(ServerGroupTestBase):
         # Start additional host to test evacuation
         self.start_service('compute', host='host3')
 
-        post = {'evacuate': {'onSharedStorage': False}}
-        self.admin_api.post_server_action(servers[1]['id'], post)
-        self._wait_for_migration_status(servers[1], ['done'])
-        evacuated_server = self._wait_for_state_change(servers[1], 'ACTIVE')
+        evacuated_server = self._evacuate_server(
+            servers[1], {'onSharedStorage': 'False'},
+            expected_migration_status='done')
 
         # check that the server is evacuated to another host
         self.assertNotEqual(evacuated_server['OS-EXT-SRV-ATTR:host'],
@@ -439,11 +464,9 @@ class ServerGroupTestV21(ServerGroupTestBase):
         # Set forced_down on the host to ensure nova considers the host down.
         self._set_forced_down(host, True)
 
-        post = {'evacuate': {'onSharedStorage': False}}
-        self.admin_api.post_server_action(servers[1]['id'], post)
-        self._wait_for_migration_status(servers[1], ['error'])
-        server_after_failed_evac = self._wait_for_state_change(
-            servers[1], 'ERROR')
+        server_after_failed_evac = self._evacuate_server(
+            servers[1], {'onSharedStorage': 'False'}, expected_state='ERROR',
+            expected_migration_status='error')
 
         # assert that after a failed evac the server active on the same host
         # as before
@@ -459,11 +482,9 @@ class ServerGroupTestV21(ServerGroupTestBase):
         # Set forced_down on the host to ensure nova considers the host down.
         self._set_forced_down(host, True)
 
-        post = {'evacuate': {'onSharedStorage': False}}
-        self.admin_api.post_server_action(servers[1]['id'], post)
-        self._wait_for_migration_status(servers[1], ['error'])
-        server_after_failed_evac = self._wait_for_state_change(
-            servers[1], 'ERROR')
+        server_after_failed_evac = self._evacuate_server(
+            servers[1], {'onSharedStorage': 'False'}, expected_state='ERROR',
+            expected_migration_status='error')
 
         # assert that after a failed evac the server active on the same host
         # as before
@@ -601,10 +622,8 @@ class ServerGroupTestV215(ServerGroupTestV21):
         # Start additional host to test evacuation
         compute3 = self.start_service('compute', host='host3')
 
-        post = {'evacuate': {}}
-        self.admin_api.post_server_action(servers[1]['id'], post)
-        self._wait_for_migration_status(servers[1], ['done'])
-        evacuated_server = self._wait_for_state_change(servers[1], 'ACTIVE')
+        evacuated_server = self._evacuate_server(
+            servers[1], expected_migration_status='done')
 
         # check that the server is evacuated
         self.assertNotEqual(evacuated_server['OS-EXT-SRV-ATTR:host'],
@@ -624,11 +643,9 @@ class ServerGroupTestV215(ServerGroupTestV21):
         # Set forced_down on the host to ensure nova considers the host down.
         self._set_forced_down(host, True)
 
-        post = {'evacuate': {}}
-        self.admin_api.post_server_action(servers[1]['id'], post)
-        self._wait_for_migration_status(servers[1], ['error'])
-        server_after_failed_evac = self._wait_for_state_change(
-            servers[1], 'ERROR')
+        server_after_failed_evac = self._evacuate_server(
+            servers[1], expected_state='ERROR',
+            expected_migration_status='error')
 
         # assert that after a failed evac the server active on the same host
         # as before
@@ -644,11 +661,9 @@ class ServerGroupTestV215(ServerGroupTestV21):
         # Set forced_down on the host to ensure nova considers the host down.
         self._set_forced_down(host, True)
 
-        post = {'evacuate': {}}
-        self.admin_api.post_server_action(servers[1]['id'], post)
-        self._wait_for_migration_status(servers[1], ['error'])
-        server_after_failed_evac = self._wait_for_state_change(
-            servers[1], 'ERROR')
+        server_after_failed_evac = self._evacuate_server(
+            servers[1], expected_state='ERROR',
+            expected_migration_status='error')
 
         # assert that after a failed evac the server active on the same host
         # as before
@@ -786,10 +801,8 @@ class ServerGroupTestV215(ServerGroupTestV21):
         # Set forced_down on the host to ensure nova considers the host down.
         self._set_forced_down(host, True)
 
-        post = {'evacuate': {}}
-        self.admin_api.post_server_action(servers[1]['id'], post)
-        self._wait_for_migration_status(servers[1], ['done'])
-        evacuated_server = self._wait_for_state_change(servers[1], 'ACTIVE')
+        evacuated_server = self._evacuate_server(
+            servers[1], expected_migration_status='done')
 
         # Note(gibi): need to get the server again as the state of the instance
         # goes to ACTIVE first then the host of the instance changes to the
@@ -867,9 +880,9 @@ class ServerGroupTestMultiCell(ServerGroupTestBase):
         super(ServerGroupTestMultiCell, self).setUp()
         # Start two compute services, one per cell
         self.compute1 = self.start_service('compute', host='host1',
-                                           cell='cell1')
+                                           cell_name='cell1')
         self.compute2 = self.start_service('compute', host='host2',
-                                           cell='cell2')
+                                           cell_name='cell2')
         # This is needed to find a server that is still booting with multiple
         # cells, while waiting for the state change to ACTIVE. See the
         # _get_instance method in the compute/api for details.
@@ -937,17 +950,17 @@ class TestAntiAffinityLiveMigration(test.TestCase,
     def setUp(self):
         super(TestAntiAffinityLiveMigration, self).setUp()
         # Setup common fixtures.
-        self.useFixture(policy_fixture.RealPolicyFixture())
+        self.useFixture(nova_fixtures.RealPolicyFixture())
         self.useFixture(nova_fixtures.NeutronFixture(self))
+        self.useFixture(nova_fixtures.GlanceFixture(self))
         self.useFixture(func_fixtures.PlacementFixture())
+
         # Setup API.
         api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
             api_version='v2.1'))
         self.api = api_fixture.api
         self.admin_api = api_fixture.admin_api
-        # Fake out glance.
-        nova.tests.unit.image.fake.stub_out_image_service(self)
-        self.addCleanup(nova.tests.unit.image.fake.FakeImageService_reset)
+
         # Start conductor, scheduler and two computes.
         self.start_service('conductor')
         self.start_service('scheduler')
@@ -1005,7 +1018,7 @@ class TestAntiAffinityLiveMigration(test.TestCase,
                                self.admin_api.post_server_action,
                                server['id'], body)
         self.assertEqual(400, ex.response.status_code)
-        self.assertIn('No valid host', six.text_type(ex))
+        self.assertIn('No valid host', str(ex))
 
         # Now start up a 3rd compute service and retry the live migration which
         # should work this time.

@@ -64,6 +64,7 @@ class EvacuatePolicyTest(base.BasePolicyTest):
             self.system_member_context, self.system_reader_context,
             self.system_foo_context, self.project_member_context,
             self.other_project_member_context,
+            self.other_project_reader_context,
             self.project_foo_context, self.project_reader_context
         ]
 
@@ -126,7 +127,16 @@ class EvacuateScopeTypePolicyTest(EvacuatePolicyTest):
         super(EvacuateScopeTypePolicyTest, self).setUp()
         self.flags(enforce_scope=True, group="oslo_policy")
 
-        self.user_req.environ['nova.context'].system_scope = 'all'
+
+class EvacuateNoLegacyPolicyTest(EvacuateScopeTypePolicyTest):
+    """Test Evacuate APIs policies with system scope enabled,
+    and no more deprecated rules that allow the legacy admin API to
+    access system APIs.
+    """
+    without_deprecated_rules = True
+
+    def setUp(self):
+        super(EvacuateNoLegacyPolicyTest, self).setUp()
 
         # Check that system admin is able to evacuate server.
         self.admin_authorized_contexts = [
@@ -138,5 +148,6 @@ class EvacuateScopeTypePolicyTest(EvacuatePolicyTest):
             self.system_reader_context, self.system_foo_context,
             self.project_admin_context, self.project_member_context,
             self.other_project_member_context,
+            self.other_project_reader_context,
             self.project_foo_context, self.project_reader_context
         ]

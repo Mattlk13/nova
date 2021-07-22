@@ -15,8 +15,6 @@ from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional import fixtures as func_fixtures
 from nova.tests.functional import integrated_helpers
-from nova.tests.unit.image import fake as fake_image
-from nova.tests.unit import policy_fixture
 from nova import utils
 
 
@@ -29,11 +27,10 @@ class TestInstanceActionBuryInCell0(test.TestCase,
     def setUp(self):
         super(TestInstanceActionBuryInCell0, self).setUp()
         # Setup common fixtures.
-        fake_image.stub_out_image_service(self)
-        self.addCleanup(fake_image.FakeImageService_reset)
         self.useFixture(func_fixtures.PlacementFixture())
         self.useFixture(nova_fixtures.NeutronFixture(self))
-        policy = self.useFixture(policy_fixture.RealPolicyFixture())
+        self.useFixture(nova_fixtures.GlanceFixture(self))
+        policy = self.useFixture(nova_fixtures.RealPolicyFixture())
         # Allow non-admins to see instance action events.
         policy.set_rules({
             'os_compute_api:os-instance-actions:events': 'rule:admin_or_owner'

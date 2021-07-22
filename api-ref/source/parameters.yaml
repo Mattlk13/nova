@@ -396,7 +396,7 @@ all_tenants_query:
   description: |
     Specify the ``all_tenants`` query parameter to list all instances
     for all projects. By default this is only allowed by administrators.
-    If the value of this parameter is not specified, it is treated as
+    If this parameter is specified without a value, the value defaults to
     ``True``. If the value is specified, ``1``, ``t``, ``true``,
     ``on``, ``y`` and ``yes`` are treated as ``True``. ``0``, ``f``,
     ``false``, ``off``, ``n`` and ``no`` are treated as ``False``.
@@ -417,8 +417,9 @@ availability_zone_query_server:
   description: |
     Filter the server list result by server availability zone.
 
-    This parameter is only valid when specified by administrators.
-    If non-admin users specify this parameter, it is ignored.
+    This parameter is restricted to administrators until microversion 2.83.
+    If non-admin users specify this parameter on a microversion less than 2.83,
+    it will be ignored.
   in: query
   required: false
   type: string
@@ -579,8 +580,9 @@ config_drive_query_server:
   description: |
     Filter the server list result by the config drive setting of the server.
 
-    This parameter is only valid when specified by administrators.
-    If non-admin users specify this parameter, it is ignored.
+    This parameter is restricted to administrators until microversion 2.83.
+    If non-admin users specify this parameter on a microversion less than 2.83,
+    it will be ignored.
   in: query
   required: false
   type: string
@@ -597,8 +599,9 @@ created_at_query_server:
     For example, ``2015-08-27T09:49:58-05:00``.
     If you omit the time zone, the UTC time zone is assumed.
 
-    This parameter is only valid when specified by administrators.
-    If non-admin users specify this parameter, it is ignored.
+    This parameter is restricted to administrators until microversion 2.83.
+    If non-admin users specify this parameter on a microversion less than 2.83,
+    it will be ignored.
   in: query
   required: false
   type: string
@@ -888,8 +891,9 @@ key_name_query_server:
   description: |
     Filter the server list result by keypair name.
 
-    This parameter is only valid when specified by administrators.
-    If non-admin users specify this parameter, it is ignored.
+    This parameter is restricted to administrators until microversion 2.83.
+    If non-admin users specify this parameter on a microversion less than 2.83,
+    it will be ignored.
   in: query
   required: false
   type: string
@@ -942,8 +946,9 @@ launched_at_query_server:
     For example, ``2015-08-27T09:49:58-05:00``.
     If you omit the time zone, the UTC time zone is assumed.
 
-    This parameter is only valid when specified by administrators.
-    If non-admin users specify this parameter, it is ignored.
+    This parameter is restricted to administrators until microversion 2.83.
+    If non-admin users specify this parameter on a microversion less than 2.83,
+    it will be ignored.
   in: query
   required: false
   type: string
@@ -1121,15 +1126,17 @@ power_state_query_server:
       6: CRASHED
       7: SUSPENDED
 
-    This parameter is only valid when specified by administrators.
-    If non-admin users specify this parameter, it is ignored.
+    This parameter is restricted to administrators until microversion 2.83.
+    If non-admin users specify this parameter on a microversion less than 2.83,
+    it will be ignored.
 progress_query_server:
   description: |
     Filter the server list result by the progress of the server.
     The value could be from 0 to 100 as integer.
 
-    This parameter is only valid when specified by administrators.
-    If non-admin users specify this parameter, it is ignored.
+    This parameter is restricted to administrators until microversion 2.83.
+    If non-admin users specify this parameter on a microversion less than 2.83,
+    it will be ignored.
   in: query
   required: false
   type: integer
@@ -1237,7 +1244,7 @@ sort_dir_flavor:
     Sort direction. A valid value is ``asc`` (ascending) or ``desc`` (descending).
     Default is ``asc``. You can specify multiple pairs of sort key and sort direction
     query parameters. If you omit the sort direction in a pair, the API uses the natural
-    sorting direction of the direction of the flavor ``sort_key`` attribute.
+    sorting direction of the flavor ``sort_key`` attribute.
   in: query
   required: false
   type: string
@@ -1246,7 +1253,7 @@ sort_dir_server:
     Sort direction. A valid value is ``asc`` (ascending) or ``desc`` (descending).
     Default is ``desc``. You can specify multiple pairs of sort key and sort direction
     query parameters. If you omit the sort direction in a pair, the API uses the natural
-    sorting direction of the direction of the server ``sort_key`` attribute.
+    sorting direction of the server ``sort_key`` attribute.
   in: query
   required: false
   type: string
@@ -1371,8 +1378,9 @@ task_state_query_server:
   description: |
     Filter the server list result by task state.
 
-    This parameter is only valid when specified by administrators.
-    If non-admin users specify this parameter, it is ignored.
+    This parameter is restricted to administrators until microversion 2.83.
+    If non-admin users specify this parameter on a microversion less than 2.83,
+    it will be ignored.
 tenant_id_query:
   description: |
     Specify the project ID (tenant ID) to show the rate and absolute limits.
@@ -1392,8 +1400,9 @@ terminated_at_query_server:
     For example, ``2015-08-27T09:49:58-05:00``.
     If you omit the time zone, the UTC time zone is assumed.
 
-    This parameter is only valid when specified by administrators.
-    If non-admin users specify this parameter, it is ignored.
+    This parameter is restricted to administrators until microversion 2.83.
+    If non-admin users specify this parameter on a microversion less than 2.83,
+    it will be ignored.
   in: query
   required: false
   type: string
@@ -1439,8 +1448,9 @@ user_id_query_server:
   description: |
     Filter the list of servers by the given user ID.
 
-    This parameter is only valid when specified by administrators.
-    If non-admin users specify this parameter, it is ignored.
+    This parameter is restricted to administrators until microversion 2.83.
+    If non-admin users specify this parameter on a microversion less than 2.83,
+    it will be ignored.
   in: query
   required: false
   type: string
@@ -1469,8 +1479,9 @@ vm_state_query_server:
     - ``STOPPED``
     - ``SUSPENDED``
 
-    This parameter is only valid when specified by administrators.
-    If non-admin users specify this parameter, it is ignored.
+    This parameter is restricted to administrators until microversion 2.83.
+    If non-admin users specify this parameter on a microversion less than 2.83,
+    it will be ignored.
   in: query
   required: false
   type: string
@@ -1765,12 +1776,26 @@ associate_host:
   in: body
   required: true
   type: string
+attachment_device_put_req:
+  description: |
+    Name of the device in the attachment object, such as, ``/dev/vdb``.
+  in: body
+  required: false
+  type: string
+  min_version: 2.85
 attachment_device_resp:
   description: |
     Name of the device in the attachment object, such as, ``/dev/vdb``.
   in: body
   required: false
   type: string
+attachment_id_put_req:
+  description: |
+    The UUID of the attachment.
+  in: body
+  required: false
+  type: string
+  min_version: 2.85
 attachment_id_required:
   description: |
     The UUID of the attachment.
@@ -1783,6 +1808,13 @@ attachment_id_resp:
   in: body
   required: false
   type: string
+attachment_server_id_put_req:
+  description: |
+    The UUID of the server.
+  in: body
+  required: false
+  type: string
+  min_version: 2.85
 attachment_server_id_resp:
   description: |
     The UUID of the server.
@@ -2194,6 +2226,7 @@ cpu_info:
   in: body
   required: true
   type: object
+  max_version: 2.87
 create_info:
   description: |
     Information for snapshot creation.
@@ -2248,9 +2281,20 @@ createImage:
   type: object
 current_workload:
   description: |
-    The current_workload is the number of tasks the hypervisor is responsible for. This will be
-    equal or greater than the number of active VMs on the system (it can be greater when VMs
-    are being deleted and the hypervisor is still cleaning up).
+    The current_workload is the number of tasks the hypervisor is responsible
+    for. This will be equal or greater than the number of active VMs on the
+    system (it can be greater when VMs are being deleted and the hypervisor is
+    still cleaning up).
+  in: body
+  required: true
+  type: integer
+  max_version: 2.87
+current_workload_total:
+  description: |
+    The current_workload is the number of tasks the hypervisors are responsible
+    for. This will be equal or greater than the number of active VMs on the
+    systems (it can be greater when VMs are being deleted and a hypervisor is
+    still cleaning up).
   in: body
   required: true
   type: integer
@@ -2283,6 +2327,14 @@ delete_on_termination_attachments_resp:
   required: true
   type: boolean
   min_version: 2.79
+delete_on_termination_put_req:
+  description: |
+    A flag indicating if the attached volume will be deleted when the server is
+    deleted.
+  in: body
+  required: false
+  type: boolean
+  min_version: 2.85
 deleted:
   description: |
     A boolean indicates whether this aggregate is deleted or not, if it has
@@ -2373,6 +2425,13 @@ device_tag_bdm_attachment:
   required: false
   type: string
   min_version: 2.49
+device_tag_bdm_attachment_put_req:
+  description: |
+    The device tag applied to the volume block device or ``null``.
+  in: body
+  required: true
+  type: string
+  min_version: 2.85
 device_tag_bdm_attachment_resp:
   description: |
     The device tag applied to the volume block device or ``null``.
@@ -2457,6 +2516,7 @@ disk_available_least:
   in: body
   required: true
   type: integer
+  max_version: 2.87
 disk_available_least_total:
   description: |
     The actual free disk on all hypervisors(in GiB). If allocation ratios used
@@ -2468,9 +2528,10 @@ disk_available_least_total:
 disk_bus:
   description: |
     Disk bus type, some hypervisors (currently only libvirt) support
-    specify this parameter. Some example disk_bus values can be: `ide`,
-    `usb`, `virtio`, `scsi`. This is not an exhaustive list as it depends
-    on the virtualization driver, and may change as more support is added.
+    specify this parameter. Some example disk_bus values can be: ``fdc``,
+    ``ide``, ``sata``, ``scsi``, ``usb``, ``virtio``, ``xen``, ``lxc``
+    and ``uml``. Support for each bus type depends on the virtualization driver
+    and underlying hypervisor.
   in: body
   required: false
   type: string
@@ -2597,6 +2658,13 @@ evacuate:
 event:
   description: |
     The name of the event.
+  in: body
+  required: true
+  type: string
+event_details:
+  min_version: 2.84
+  description: |
+    Details of the event. May be ``null``.
   in: body
   required: true
   type: string
@@ -3383,6 +3451,7 @@ free_ram_mb:
   in: body
   required: true
   type: integer
+  max_version: 2.87
 free_ram_mb_total:
   description: |
     The free RAM on all hypervisors(in MiB). This does not take allocation
@@ -3687,6 +3756,7 @@ hypervisor_free_disk_gb:
   in: body
   required: true
   type: integer
+  max_version: 2.87
 hypervisor_free_disk_gb_total:
   description: |
     The free disk remaining on all hypervisors(in GiB). This does not take
@@ -3697,8 +3767,8 @@ hypervisor_free_disk_gb_total:
   type: integer
 hypervisor_hostname:
   description: |
-    The hypervisor host name provided by the Nova virt driver. For the Ironic driver,
-    it is the Ironic node uuid.
+    The hypervisor host name provided by the Nova virt driver. For the Ironic
+    driver, it is the Ironic node uuid.
   in: body
   required: true
   type: string
@@ -3798,17 +3868,26 @@ hypervisor_type_body:
   in: body
   required: true
   type: string
+hypervisor_uptime:
+  description: |
+    The total uptime of the hypervisor and information about average load. Only
+    reported for active hosts where the virt driver supports this feature.
+  in: body
+  required: true
+  type: string
+  min_version: 2.88
 hypervisor_vcpus:
   description: |
-    The number of vcpu in this hypervisor. This does not take allocation
+    The number of vCPU in this hypervisor. This does not take allocation
     ratios used for overcommit into account so there may be disparity between
     this and the used count.
   in: body
   required: true
   type: integer
+  max_version: 2.87
 hypervisor_vcpus_total:
   description: |
-    The number of vcpu on all hypervisors. This does not take allocation
+    The number of vCPU on all hypervisors. This does not take allocation
     ratios used for overcommit into account so there may be disparity between
     this and the used count.
   in: body
@@ -3816,13 +3895,14 @@ hypervisor_vcpus_total:
   type: integer
 hypervisor_vcpus_used:
   description: |
-    The number of vcpu used in this hypervisor.
+    The number of vCPU used in this hypervisor.
   in: body
   required: true
   type: integer
+  max_version: 2.87
 hypervisor_vcpus_used_total:
   description: |
-    The number of vcpu used on all hypervisors.
+    The number of vCPU used on all hypervisors.
   in: body
   required: true
   type: integer
@@ -4425,12 +4505,13 @@ links:
   type: array
 local_gb:
   description: |
-    The disk in this hypervisor(in GiB). This does not take allocation
+    The disk in this hypervisor (in GiB). This does not take allocation
     ratios used for overcommit into account so there may be disparity between
     this and the used count.
   in: body
   required: true
   type: integer
+  max_version: 2.87
 local_gb_simple_tenant_usage:
   description: |
     The sum of the root disk size of the server and
@@ -4447,7 +4528,7 @@ local_gb_simple_tenant_usage_optional:
   type: integer
 local_gb_total:
   description: |
-    The disk on all hypervisors(in GiB). This does not take allocation
+    The disk on all hypervisors (in GiB). This does not take allocation
     ratios used for overcommit into account so there may be disparity between
     this and the used count.
   in: body
@@ -4455,13 +4536,14 @@ local_gb_total:
   type: integer
 local_gb_used:
   description: |
-    The disk used in this hypervisor(in GiB).
+    The disk used in this hypervisor (in GiB).
   in: body
   required: true
   type: integer
+  max_version: 2.87
 local_gb_used_total:
   description: |
-    The disk used on all hypervisors(in GiB).
+    The disk used on all hypervisors (in GiB).
   in: body
   required: true
   type: integer
@@ -4545,12 +4627,13 @@ memory_details_diagnostics:
   min_version: 2.48
 memory_mb:
   description: |
-    The memory of this hypervisor(in MiB). This does not take allocation
+    The memory of this hypervisor (in MiB). This does not take allocation
     ratios used for overcommit into account so there may be disparity between
     this and the used count.
   in: body
   required: true
   type: integer
+  max_version: 2.87
 memory_mb_simple_tenant_usage:
   description: |
     The memory size of the server (in MiB).
@@ -4565,7 +4648,7 @@ memory_mb_simple_tenant_usage_optional:
   type: integer
 memory_mb_total:
   description: |
-    The memory of all hypervisors(in MiB). This does not take allocation
+    The memory of all hypervisors (in MiB). This does not take allocation
     ratios used for overcommit into account so there may be disparity between
     this and the used count.
   in: body
@@ -4573,10 +4656,11 @@ memory_mb_total:
   type: integer
 memory_mb_used:
   description: |
-    The memory used in this hypervisor(in MiB).
+    The memory used in this hypervisor (in MiB).
   in: body
   required: true
   type: integer
+  max_version: 2.87
 memory_mb_used_total:
   description: |
     The memory used on all hypervisors(in MiB).
@@ -5965,13 +6049,14 @@ rules:
   type: array
 running_vms:
   description: |
-    The number of running vms on this hypervisor.
+    The number of running VMs on this hypervisor.
   in: body
   required: true
   type: integer
+  max_version: 2.87
 running_vms_total:
   description: |
-    The total number of running vms on all hypervisors.
+    The total number of running VMs on all hypervisors.
   in: body
   required: true
   type: integer
@@ -7352,7 +7437,8 @@ volumeAttachment_post:
 volumeAttachment_put:
   description: |
     A dictionary representation of a volume attachment containing the field
-    ``volumeId`` which is the UUID of the replacement volume.
+    ``volumeId`` which is the UUID of the replacement volume, and other fields
+    to update in the attachment.
   in: body
   required: true
   type: object

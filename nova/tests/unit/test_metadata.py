@@ -36,7 +36,6 @@ from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
 from oslo_utils.fixture import uuidsentinel as uuids
 import requests
-import six
 import webob
 
 from nova.api.metadata import base
@@ -49,6 +48,7 @@ from nova import exception
 from nova.network import model as network_model
 from nova.network import neutron as neutronapi
 from nova import objects
+from nova.objects import instance_numa as numa
 from nova.objects import virt_device_metadata as metadata_obj
 from nova import test
 from nova.tests.unit.api.openstack import fakes
@@ -321,12 +321,14 @@ class MetadataTestCase(test.TestCase):
                          'uuid': 'e5fe5518-0288-4fa3-b0c4-c79764101b85',
                          'root_device_name': None,
                          'default_ephemeral_device': None,
-                         'default_swap_device': None})
+                         'default_swap_device': None,
+                         'context': self.context})
         instance_ref1 = objects.Instance(**{'id': 0,
                          'uuid': 'b65cee2f-8c69-4aeb-be2f-f79742548fc2',
                          'root_device_name': '/dev/sda1',
                          'default_ephemeral_device': None,
-                         'default_swap_device': None})
+                         'default_swap_device': None,
+                         'context': self.context})
 
         def fake_bdm_get(ctxt, uuid):
             return [fake_block_device.FakeDbBlockDeviceDict(
@@ -365,10 +367,12 @@ class MetadataTestCase(test.TestCase):
                     'swap': '/dev/sdc',
                     'ebs0': '/dev/sdh'}
 
-        self.assertEqual(base._format_instance_mapping(self.context,
-                         instance_ref0), block_device._DEFAULT_MAPPINGS)
-        self.assertEqual(base._format_instance_mapping(self.context,
-                         instance_ref1), expected)
+        self.assertEqual(
+            base._format_instance_mapping(instance_ref0),
+            block_device._DEFAULT_MAPPINGS)
+        self.assertEqual(
+            base._format_instance_mapping(instance_ref1),
+            expected)
 
     def test_pubkey(self):
         md = fake_InstanceMetadata(self, self.instance.obj_clone())
@@ -419,6 +423,8 @@ class MetadataTestCase(test.TestCase):
                 inst.device_metadata = original_device_meta
             elif attrname == 'ec2_ids':
                 inst.ec2_ids = objects.EC2Ids()
+            elif attrname == 'numa_topology':
+                inst.numa_topology = None
             else:
                 self.fail('Unexpected instance lazy-load: %s' % attrname)
 
@@ -428,9 +434,11 @@ class MetadataTestCase(test.TestCase):
                 side_effect=fake_obj_load_attr) as mock_obj_load_attr:
             md = fake_InstanceMetadata(self, inst)
         self.assertFalse(hasattr(md.instance, '_will_not_pass'))
-        self.assertEqual(2, mock_obj_load_attr.call_count)
+        self.assertEqual(3, mock_obj_load_attr.call_count)
         mock_obj_load_attr.assert_has_calls(
-            [mock.call('device_metadata'), mock.call('ec2_ids')],
+            [mock.call('device_metadata'),
+             mock.call('ec2_ids'),
+             mock.call('numa_topology')],
             any_order=True)
         self.assertIs(original_device_meta, inst.device_metadata)
 
@@ -502,6 +510,11 @@ class MetadataTestCase(test.TestCase):
             'openstack/2018-08-27/vendor_data.json',
             'openstack/2018-08-27/network_data.json',
             'openstack/2018-08-27/vendor_data2.json',
+            'openstack/2020-10-14/meta_data.json',
+            'openstack/2020-10-14/user_data',
+            'openstack/2020-10-14/vendor_data.json',
+            'openstack/2020-10-14/network_data.json',
+            'openstack/2020-10-14/vendor_data2.json',
             'openstack/latest/meta_data.json',
             'openstack/latest/user_data',
             'openstack/latest/vendor_data.json',
@@ -588,6 +601,8 @@ class MetadataTestCase(test.TestCase):
             expose_trusted = md._check_os_version(base.ROCKY, os_version)
             expected_metadata['devices'] = fake_metadata_dicts(
                 True, expose_trusted)
+        if md._check_os_version(base.VICTORIA, os_version):
+            expected_metadata['dedicated_cpus'] = []
         md._metadata_as_json(os_version, 'non useless path parameter')
         self.assertEqual(md.md_mimetype, base.MIME_TYPE_APPLICATION_JSON)
         mock_json_dump_as_bytes.assert_called_once_with(expected_metadata)
@@ -610,6 +625,30 @@ class MetadataTestCase(test.TestCase):
         meta = jsonutils.loads(meta)
         self.assertNotIn('keys', meta)
         self.assertNotIn('public_keys', meta)
+
+    @mock.patch.object(objects.Instance, 'get_by_uuid')
+    def test_metadata_as_json_numatopology(self, mock_inst_get_by_uuid):
+        """Ensure instance dedicated CPUs is properly listed."""
+        fake_topo = numa.InstanceNUMATopology(cells=[
+            numa.InstanceNUMACell(id=0, memory=1024, pagesize=4,
+                                  cpuset=set([2]), pcpuset=set([0, 1])),
+            numa.InstanceNUMACell(id=1, memory=2048, pagesize=4,
+                                  cpuset=set([5]), pcpuset=set([3, 4])),
+        ])
+        instance = self.instance.obj_clone()
+
+        mock_inst_get_by_uuid.return_value = instance
+        md = fake_InstanceMetadata(self, instance)
+        meta = md._metadata_as_json(base.OPENSTACK_VERSIONS[-1], path=None)
+        meta = jsonutils.loads(meta)
+        self.assertEqual([], meta['dedicated_cpus'])
+
+        instance.numa_topology = fake_topo
+        mock_inst_get_by_uuid.return_value = instance
+        md = fake_InstanceMetadata(self, instance)
+        meta = md._metadata_as_json(base.OPENSTACK_VERSIONS[-1], path=None)
+        meta = jsonutils.loads(meta)
+        self.assertEqual([0, 1, 3, 4], meta['dedicated_cpus'])
 
 
 class OpenStackMetadataTestCase(test.TestCase):
@@ -893,7 +932,7 @@ class OpenStackMetadataTestCase(test.TestCase):
                 # Verify the warning message is the one we expect which is the
                 # first and only arg to the first and only call to the warning.
                 self.assertIn('Passing insecure dynamic vendordata requests',
-                              six.text_type(warning_calls[0][0]))
+                              str(warning_calls[0][0]))
             self.assertEqual('10.0.0.1', vd['static'].get('ldap'))
             self.assertEqual('10.0.0.2', vd['static'].get('ad'))
 
@@ -1702,7 +1741,7 @@ class MetadataHandlerTestCase(test.TestCase):
         mock_uuid.assert_called_once_with(ctxt, 'foo',
             expected_attrs=['ec2_ids', 'flavor', 'info_cache', 'metadata',
                             'system_metadata', 'security_groups', 'keypairs',
-                            'device_metadata'])
+                            'device_metadata', 'numa_topology'])
         imd.assert_called_once_with(inst, 'bar')
 
     @mock.patch.object(context, 'get_admin_context')
@@ -1720,7 +1759,7 @@ class MetadataHandlerTestCase(test.TestCase):
         mock_uuid.assert_called_once_with(mock_context.return_value, 'foo',
             expected_attrs=['ec2_ids', 'flavor', 'info_cache', 'metadata',
                             'system_metadata', 'security_groups', 'keypairs',
-                            'device_metadata'])
+                            'device_metadata', 'numa_topology'])
         imd.assert_called_once_with(inst, 'bar')
 
     @mock.patch.object(objects.Instance, 'get_by_uuid')

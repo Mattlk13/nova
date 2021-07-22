@@ -13,11 +13,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import fixtures
 import mock
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import uuidutils
-import six
 import webob
 
 from nova.api.openstack import api_version_request
@@ -25,7 +23,6 @@ from nova.api.openstack.compute import migrate_server as \
     migrate_server_v21
 from nova import exception
 from nova import objects
-from nova import test
 from nova.tests.unit.api.openstack.compute import admin_only_action_common
 from nova.tests.unit.api.openstack import fakes
 
@@ -47,9 +44,6 @@ class MigrateServerTestsV21(admin_only_action_common.CommonTests):
         self.stub_out('nova.api.openstack.compute.migrate_server.'
                       'MigrateServerController',
                       lambda *a, **kw: self.controller)
-        self.mock_list_port = self.useFixture(
-            fixtures.MockPatch('nova.network.neutron.API.list_ports')).mock
-        self.mock_list_port.return_value = {'ports': []}
 
     def _get_migration_body(self, **kwargs):
         return {'os-migrateLive': self._get_params(**kwargs)}
@@ -227,7 +221,7 @@ class MigrateServerTestsV21(admin_only_action_common.CommonTests):
                                    self.controller._migrate_live,
                                    self.req, instance.uuid, body=body)
             if check_response:
-                self.assertIn(six.text_type(fake_exc), ex.explanation)
+                self.assertIn(str(fake_exc), ex.explanation)
             mock_live_migrate.assert_called_once_with(
                 self.context, instance, False, self.disk_over_commit,
                 'hostname', self.force, self.async_)
@@ -285,6 +279,27 @@ class MigrateServerTestsV21(admin_only_action_common.CommonTests):
             expected_exc=webob.exc.HTTPConflict,
             check_response=False)
 
+    def test_migrate_live_sev_not_supported(self):
+        self._test_migrate_live_failed_with_exception(
+            exception.OperationNotSupportedForSEV(
+                instance_uuid=uuids.instance, operation='foo'),
+            expected_exc=webob.exc.HTTPConflict,
+            check_response=False)
+
+    def test_migrate_live_vtpm_not_supported(self):
+        self._test_migrate_live_failed_with_exception(
+            exception.OperationNotSupportedForVTPM(
+                instance_uuid=uuids.instance, operation='foo'),
+            expected_exc=webob.exc.HTTPConflict,
+            check_response=False)
+
+    def test_migrate_live_vdpa_interfaces_not_supported(self):
+        self._test_migrate_live_failed_with_exception(
+            exception.OperationNotSupportedForVDPAInterface(
+                instance_uuid=uuids.instance, operation='foo'),
+            expected_exc=webob.exc.HTTPConflict,
+            check_response=False)
+
     def test_migrate_live_pre_check_error(self):
         self._test_migrate_live_failed_with_exception(
             exception.MigrationPreCheckError(reason=''))
@@ -295,27 +310,13 @@ class MigrateServerTestsV21(admin_only_action_common.CommonTests):
             expected_exc=webob.exc.HTTPInternalServerError,
             check_response=False)
 
-    @mock.patch('nova.api.openstack.common.'
-                'supports_port_resource_request_during_move',
-                return_value=True)
-    @mock.patch('nova.objects.Service.get_by_host_and_binary')
-    @mock.patch('nova.api.openstack.common.'
-                'instance_has_port_with_resource_request', return_value=True)
-    def test_migrate_with_bandwidth_from_old_compute_not_supported(
-            self, mock_has_res_req, mock_get_service, mock_support):
-        instance = self._stub_instance_get()
-
-        mock_get_service.return_value = objects.Service(host=instance['host'])
-        mock_get_service.return_value.version = 38
-
-        self.assertRaises(
-            webob.exc.HTTPConflict, self.controller._migrate, self.req,
-            instance['uuid'], body={'migrate': None})
-
-        mock_has_res_req.assert_called_once_with(
-            instance['uuid'], self.controller.network_api)
-        mock_get_service.assert_called_once_with(
-            self.req.environ['nova.context'], instance['host'], 'nova-compute')
+    @mock.patch('nova.compute.api.API.live_migrate',
+                side_effect=exception.ForbiddenWithAccelerators)
+    def test_live_migration_raises_http_forbidden(self, mock_migrate):
+        body = self._get_migration_body(host='hostname')
+        self.assertRaises(webob.exc.HTTPForbidden,
+                          self.controller._migrate_live,
+                          self.req, fakes.FAKE_UUID, body=body)
 
 
 class MigrateServerTestsV225(MigrateServerTestsV21):
@@ -603,20 +604,6 @@ class MigrateServerTestsV268(MigrateServerTestsV256):
                            method_translations=method_translations,
                            args_map=args_map)
 
-    @mock.patch('nova.virt.hardware.get_mem_encryption_constraint',
-                new=mock.Mock(return_value=True))
-    @mock.patch.object(objects.instance.Instance, 'image_meta')
-    def test_live_migrate_sev_rejected(self, mock_image):
-        instance = self._stub_instance_get()
-        body = {'os-migrateLive': {'host': 'hostname',
-                                   'block_migration': 'auto'}}
-        ex = self.assertRaises(webob.exc.HTTPConflict,
-                               self.controller._migrate_live,
-                               self.req, fakes.FAKE_UUID, body=body)
-        self.assertIn("Operation 'live-migration' not supported for "
-                      "SEV-enabled instance (%s)" % instance.uuid,
-                      six.text_type(ex))
-
     def test_live_migrate_with_forced_host(self):
         body = {'os-migrateLive': {'host': 'hostname',
                                    'block_migration': 'auto',
@@ -624,39 +611,4 @@ class MigrateServerTestsV268(MigrateServerTestsV256):
         ex = self.assertRaises(self.validation_error,
                                self.controller._migrate_live,
                                self.req, fakes.FAKE_UUID, body=body)
-        self.assertIn('force', six.text_type(ex))
-
-
-class MigrateServerPolicyEnforcementV21(test.NoDBTestCase):
-
-    def setUp(self):
-        super(MigrateServerPolicyEnforcementV21, self).setUp()
-        self.controller = migrate_server_v21.MigrateServerController()
-        self.req = fakes.HTTPRequest.blank('')
-
-    def test_migrate_policy_failed(self):
-        rule_name = "os_compute_api:os-migrate-server:migrate"
-        self.policy.set_rules({rule_name: "project:non_fake"})
-        exc = self.assertRaises(
-                                exception.PolicyNotAuthorized,
-                                self.controller._migrate, self.req,
-                                fakes.FAKE_UUID,
-                                body={'migrate': {}})
-        self.assertEqual(
-                      "Policy doesn't allow %s to be performed." % rule_name,
-                      exc.format_message())
-
-    def test_migrate_live_policy_failed(self):
-        rule_name = "os_compute_api:os-migrate-server:migrate_live"
-        self.policy.set_rules({rule_name: "project:non_fake"})
-        body_args = {'os-migrateLive': {'host': 'hostname',
-                'block_migration': False,
-                'disk_over_commit': False}}
-        exc = self.assertRaises(
-                                exception.PolicyNotAuthorized,
-                                self.controller._migrate_live, self.req,
-                                fakes.FAKE_UUID,
-                                body=body_args)
-        self.assertEqual(
-                      "Policy doesn't allow %s to be performed." % rule_name,
-                      exc.format_message())
+        self.assertIn('force', str(ex))

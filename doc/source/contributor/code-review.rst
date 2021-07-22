@@ -176,9 +176,9 @@ from the relevant third party test, on the latest patchset, before a +2 vote
 can be applied.
 Specifically, changes to nova/virt/driver/<NNNN> need a +1 vote from the
 respective third party CI.
-For example, if you change something in the XenAPI virt driver, you must wait
-for a +1 from the XenServer CI on the latest patchset, before you can give
-that patch set a +2 vote.
+For example, if you change something in the Hyper-V virt driver, you must wait
+for a +1 from the Hyper-V CI on the latest patchset, before you can give that
+patch set a +2 vote.
 
 This is important to ensure:
 
@@ -235,10 +235,12 @@ Microversion API
 
 If a new microversion API is added, the following needs to happen:
 
-* A new patch for the microversion API change in python-novaclient side
-  should be submitted before the microversion change in Nova is merged.
-  See :python-novaclient-doc:`Adding support for a new microversion
-  <contributor/microversions>` in python-novaclient for more details.
+* A new patch for the microversion API change in both python-novaclient
+  and in python-openstackclient should be submitted before the microversion
+  change in Nova is merged. See :python-novaclient-doc:`Adding support for a
+  new microversion <contributor/microversions>` in python-novaclient for more
+  details. See also `Add support for 'server group create --rule' parameter`_
+  patch as example how to support a new microversion in the openstack client.
 * If the microversion changes the response schema, a new schema and test for
   the microversion must be added to Tempest. The microversion change in Nova
   should not be merged until the Tempest test is submitted and at least
@@ -246,6 +248,8 @@ If a new microversion API is added, the following needs to happen:
   Nova change via Depends-On. The Nova microversion change commit message
   should reference the Change-Id of the Tempest test for reviewers to identify
   it.
+
+.. _`Add support for 'server group create --rule' parameter`: https://review.opendev.org/#/c/761597
 
 Notifications
 =============

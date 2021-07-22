@@ -46,6 +46,14 @@ ALL_SUPPORTED_NETWORK_DEVICES = ['VirtualE1000', 'VirtualE1000e',
                                  'VirtualPCNet32', 'VirtualSriovEthernetCard',
                                  'VirtualVmxnet', 'VirtualVmxnet3']
 
+CONTROLLER_TO_ADAPTER_TYPE = {
+    "VirtualLsiLogicController": constants.DEFAULT_ADAPTER_TYPE,
+    "VirtualBusLogicController": constants.ADAPTER_TYPE_BUSLOGIC,
+    "VirtualIDEController": constants.ADAPTER_TYPE_IDE,
+    "VirtualLsiLogicSASController": constants.ADAPTER_TYPE_LSILOGICSAS,
+    "ParaVirtualSCSIController": constants.ADAPTER_TYPE_PARAVIRTUAL
+}
+
 # A simple cache for storing inventory folder references.
 # Format: {inventory_path: folder_ref}
 _FOLDER_PATH_REF_MAPPING = {}
@@ -242,9 +250,9 @@ def get_vm_create_spec(client_factory, instance, data_store_name,
         config_spec.firmware = extra_specs.firmware
 
     devices = []
-    for vif_info in vif_infos:
+    for i, vif_info in enumerate(vif_infos):
         vif_spec = _create_vif_spec(client_factory, vif_info,
-                                    extra_specs.vif_limits)
+                                    extra_specs.vif_limits, i)
         devices.append(vif_spec)
 
     serial_port_spec = create_serial_port_spec(client_factory)
@@ -268,7 +276,7 @@ def get_vm_create_spec(client_factory, instance, data_store_name,
     # enable to provide info needed by udev to generate /dev/disk/by-id
     opt = client_factory.create('ns0:OptionValue')
     opt.key = "disk.EnableUUID"
-    opt.value = True
+    opt.value = 'true'
     extra_config.append(opt)
 
     port_index = 0
@@ -416,7 +424,7 @@ def convert_vif_model(name):
     return name
 
 
-def _create_vif_spec(client_factory, vif_info, vif_limits=None):
+def _create_vif_spec(client_factory, vif_info, vif_limits=None, offset=0):
     """Builds a config spec for the addition of a new network
     adapter to the VM.
     """
@@ -478,7 +486,7 @@ def _create_vif_spec(client_factory, vif_info, vif_limits=None):
     # The Server assigns a Key to the device. Here we pass a -ve temporary key.
     # -ve because actual keys are +ve numbers and we don't
     # want a clash with the key that server might associate with the device
-    net_device.key = -47
+    net_device.key = -47 - offset
     net_device.addressType = "manual"
     net_device.macAddress = mac_address
     net_device.wakeOnLanEnabled = True
@@ -674,14 +682,17 @@ def _get_device_disk_type(device):
             return constants.DEFAULT_DISK_TYPE
 
 
-def get_vmdk_info(session, vm_ref, uuid=None):
-    """Returns information for the primary VMDK attached to the given VM."""
+def get_hardware_devices(session, vm_ref):
     hardware_devices = session._call_method(vutil,
                                             "get_object_property",
                                             vm_ref,
                                             "config.hardware.device")
-    if hardware_devices.__class__.__name__ == "ArrayOfVirtualDevice":
-        hardware_devices = hardware_devices.VirtualDevice
+    return vim_util.get_array_items(hardware_devices)
+
+
+def get_vmdk_info(session, vm_ref, uuid=None):
+    """Returns information for the primary VMDK attached to the given VM."""
+    hardware_devices = get_hardware_devices(session, vm_ref)
     vmdk_file_path = None
     vmdk_controller_key = None
     disk_type = None
@@ -703,16 +714,9 @@ def get_vmdk_info(session, vm_ref, uuid=None):
                 if root_disk and path.basename == root_disk:
                     root_device = device
                 vmdk_device = device
-        elif device.__class__.__name__ == "VirtualLsiLogicController":
-            adapter_type_dict[device.key] = constants.DEFAULT_ADAPTER_TYPE
-        elif device.__class__.__name__ == "VirtualBusLogicController":
-            adapter_type_dict[device.key] = constants.ADAPTER_TYPE_BUSLOGIC
-        elif device.__class__.__name__ == "VirtualIDEController":
-            adapter_type_dict[device.key] = constants.ADAPTER_TYPE_IDE
-        elif device.__class__.__name__ == "VirtualLsiLogicSASController":
-            adapter_type_dict[device.key] = constants.ADAPTER_TYPE_LSILOGICSAS
-        elif device.__class__.__name__ == "ParaVirtualSCSIController":
-            adapter_type_dict[device.key] = constants.ADAPTER_TYPE_PARAVIRTUAL
+        elif device.__class__.__name__ in CONTROLLER_TO_ADAPTER_TYPE:
+            adapter_type_dict[device.key] = CONTROLLER_TO_ADAPTER_TYPE[
+                device.__class__.__name__]
 
     if root_disk:
         vmdk_device = root_device
@@ -1035,10 +1039,7 @@ def get_vnc_config_spec(client_factory, port):
     opt_port.value = port
     opt_keymap = client_factory.create('ns0:OptionValue')
     opt_keymap.key = "RemoteDisplay.vnc.keyMap"
-    if CONF.vnc.keymap:
-        opt_keymap.value = CONF.vnc.keymap
-    else:
-        opt_keymap.value = CONF.vmware.vnc_keymap
+    opt_keymap.value = CONF.vmware.vnc_keymap
 
     extras = [opt_enabled, opt_port, opt_keymap]
 
@@ -1068,7 +1069,7 @@ def _get_allocated_vnc_ports(session):
                                   "VirtualMachine", [VNC_CONFIG_KEY])
     while result:
         for obj in result.objects:
-            if not hasattr(obj, 'propSet'):
+            if not hasattr(obj, 'propSet') or not obj.propSet:
                 continue
             dynamic_prop = obj.propSet[0]
             option_value = dynamic_prop.val
@@ -1327,7 +1328,7 @@ def get_cluster_ref_by_name(session, cluster_name):
     """Get reference to the vCenter cluster with the specified name."""
     all_clusters = get_all_cluster_mors(session)
     for cluster in all_clusters:
-        if (hasattr(cluster, 'propSet') and
+        if (hasattr(cluster, 'propSet') and cluster.propSet and
                     cluster.propSet[0].val == cluster_name):
             return cluster.obj
 
@@ -1386,7 +1387,7 @@ def destroy_vm(session, instance, vm_ref=None):
         session._wait_for_task(destroy_task)
         LOG.info("Destroyed the VM", instance=instance)
     except Exception:
-        LOG.exception(_('Destroy VM failed'), instance=instance)
+        LOG.exception('Destroy VM failed', instance=instance)
 
 
 def create_virtual_disk(session, dc_ref, adapter_type, disk_type,
@@ -1622,15 +1623,18 @@ def create_folder(session, parent_folder_ref, name):
     """
 
     LOG.debug("Creating folder: %(name)s. Parent ref: %(parent)s.",
-              {'name': name, 'parent': parent_folder_ref.value})
+              {'name': name,
+               'parent': vutil.get_moref_value(parent_folder_ref)})
     try:
         folder = session._call_method(session.vim, "CreateFolder",
                                       parent_folder_ref, name=name)
         LOG.info("Created folder: %(name)s in parent %(parent)s.",
-                 {'name': name, 'parent': parent_folder_ref.value})
+                 {'name': name,
+                  'parent': vutil.get_moref_value(parent_folder_ref)})
     except vexc.DuplicateName as e:
         LOG.debug("Folder already exists: %(name)s. Parent ref: %(parent)s.",
-                  {'name': name, 'parent': parent_folder_ref.value})
+                  {'name': name,
+                   'parent': vutil.get_moref_value(parent_folder_ref)})
         val = e.details['object']
         folder = vutil.get_moref(val, 'Folder')
     return folder

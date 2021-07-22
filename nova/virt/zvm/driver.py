@@ -14,7 +14,6 @@
 
 import eventlet
 import os
-import six
 import time
 
 import os_resource_classes as orc
@@ -144,7 +143,7 @@ class ZVMDriver(driver.ComputeDriver):
 
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
-              block_device_info=None, power_on=True):
+              block_device_info=None, power_on=True, accel_info=None):
 
         LOG.info("Spawning new instance %s on zVM hypervisor",
                  instance.name, instance=instance)
@@ -291,7 +290,7 @@ class ZVMDriver(driver.ComputeDriver):
                 raise exception.VirtualInterfaceCreateException()
         except Exception as err:
             with excutils.save_and_reraise_exception():
-                LOG.error("Failed for vif plugging: %s", six.text_type(err),
+                LOG.error("Failed for vif plugging: %s", str(err),
                           instance=instance)
 
     def _import_spawn_image(self, context, image_meta_id, image_os_version):
@@ -395,7 +394,7 @@ class ZVMDriver(driver.ComputeDriver):
             self._hypervisor.guest_softstop(instance.name)
 
     def power_on(self, context, instance, network_info,
-                 block_device_info=None):
+                 block_device_info=None, accel_info=None):
         self._hypervisor.guest_start(instance.name)
 
     def pause(self, instance):
@@ -405,7 +404,8 @@ class ZVMDriver(driver.ComputeDriver):
         self._hypervisor.guest_unpause(instance.name)
 
     def reboot(self, context, instance, network_info, reboot_type,
-               block_device_info=None, bad_volumes_callback=None):
+               block_device_info=None, bad_volumes_callback=None,
+               accel_info=None):
 
         if reboot_type == 'SOFT':
             self._hypervisor.guest_reboot(instance.name)

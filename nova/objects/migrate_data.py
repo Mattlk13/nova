@@ -22,8 +22,8 @@ from nova import exception
 from nova.objects import base as obj_base
 from nova.objects import fields
 
-
 LOG = log.getLogger(__name__)
+OS_VIF_DELEGATION = 'os_vif_delegation'
 
 
 @obj_base.NovaObjectRegistry.register
@@ -60,6 +60,8 @@ class VIFMigrateData(obj_base.NovaObject):
 
     @property
     def vif_details(self):
+        if 'vif_details_json' not in self:
+            return {}
         return jsonutils.loads(self.vif_details_json)
 
     @vif_details.setter
@@ -68,11 +70,23 @@ class VIFMigrateData(obj_base.NovaObject):
 
     @property
     def profile(self):
+        if 'profile_json' not in self:
+            return {}
         return jsonutils.loads(self.profile_json)
 
     @profile.setter
     def profile(self, profile_dict):
         self.profile_json = jsonutils.dumps(profile_dict)
+
+    @property
+    def supports_os_vif_delegation(self):
+        return self.profile.get(OS_VIF_DELEGATION, False)
+
+    # TODO(stephenfin): add a proper delegation field instead of storing this
+    # info in the profile catch-all blob
+    @supports_os_vif_delegation.setter
+    def supports_os_vif_delegation(self, supported):
+        self.profile[OS_VIF_DELEGATION] = supported
 
     def get_dest_vif(self):
         """Get a destination VIF representation of this object.
@@ -91,6 +105,7 @@ class VIFMigrateData(obj_base.NovaObject):
         vif['vnic_type'] = self.vnic_type
         vif['profile'] = self.profile
         vif['details'] = self.vif_details
+        vif['delegate_create'] = self.supports_os_vif_delegation
         return vif
 
     @classmethod
@@ -241,10 +256,10 @@ class LibvirtLiveMigrateData(LiveMigrateData):
         'bdms': fields.ListOfObjectsField('LibvirtLiveMigrateBDMInfo'),
         'target_connect_addr': fields.StringField(nullable=True),
         'supported_perf_events': fields.ListOfStringsField(),
+        # TODO(lyarwood): No longer used, drop in version 2.0
         'src_supports_native_luks': fields.BooleanField(),
         'dst_wants_file_backed_memory': fields.BooleanField(),
-        # file_backed_memory_discard is ignored unless
-        # dst_wants_file_backed_memory is set
+        # TODO(lyarwood): No longer used, drop in version 2.0
         'file_backed_memory_discard': fields.BooleanField(),
         # TODO(artom) (src|dst)_supports_numa_live_migration are only used as
         # flags to indicate that the compute host is new enough to perform a
@@ -290,41 +305,6 @@ class LibvirtLiveMigrateData(LiveMigrateData):
 
     def is_on_shared_storage(self):
         return self.is_shared_block_storage or self.is_shared_instance_path
-
-
-@obj_base.NovaObjectRegistry.register
-class XenapiLiveMigrateData(LiveMigrateData):
-    # Version 1.0: Initial version
-    # Version 1.1: Added vif_uuid_map
-    # Version 1.2: Added old_vol_attachment_ids
-    # Version 1.3: Added wait_for_vif_plugged
-    # Version 1.4: Inherited vifs from LiveMigrateData
-    VERSION = '1.4'
-
-    fields = {
-        'block_migration': fields.BooleanField(nullable=True),
-        'destination_sr_ref': fields.StringField(nullable=True),
-        'migrate_send_data': fields.DictOfStringsField(nullable=True),
-        'sr_uuid_map': fields.DictOfStringsField(),
-        'kernel_file': fields.StringField(),
-        'ramdisk_file': fields.StringField(),
-        'vif_uuid_map': fields.DictOfStringsField(),
-    }
-
-    def obj_make_compatible(self, primitive, target_version):
-        super(XenapiLiveMigrateData, self).obj_make_compatible(
-            primitive, target_version)
-        target_version = versionutils.convert_version_to_tuple(target_version)
-        if target_version < (1, 4) and 'vifs' in primitive:
-            del primitive['vifs']
-        if target_version < (1, 3) and 'wait_for_vif_plugged' in primitive:
-            del primitive['wait_for_vif_plugged']
-        if target_version < (1, 2):
-            if 'old_vol_attachment_ids' in primitive:
-                del primitive['old_vol_attachment_ids']
-        if target_version < (1, 1):
-            if 'vif_uuid_map' in primitive:
-                del primitive['vif_uuid_map']
 
 
 @obj_base.NovaObjectRegistry.register

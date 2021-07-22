@@ -18,7 +18,6 @@ import binascii
 import ddt
 import mock
 import os
-import six
 
 import nova.privsep.libvirt
 from nova import test
@@ -134,10 +133,8 @@ class LibvirtTestCase(test.NoDBTestCase):
             return orig_import(module, *args)
 
         with test.nested(
-                mock.patch.object(six.moves.builtins, 'open',
-                                  new=mock.mock_open()),
-                mock.patch.object(six.moves.builtins, '__import__',
-                                  side_effect=fake_import),
+                mock.patch('builtins.open', new=mock.mock_open()),
+                mock.patch('builtins.__import__', side_effect=fake_import),
                 ) as (mock_open, mock_import):
             nova.privsep.libvirt.readpty('/fake/path')
 
@@ -150,16 +147,9 @@ class LibvirtTestCase(test.NoDBTestCase):
                            mock_fcntl.F_SETFL, 32769 | os.O_NONBLOCK)])
             self.assertIn(mock.call('/fake/path', 'r'), mock_open.mock_calls)
 
-    @mock.patch('oslo_concurrency.processutils.execute')
-    def test_xend_probe(self, mock_execute):
-        nova.privsep.libvirt.xend_probe()
-        mock_execute.assert_called_with('xend', 'status',
-                                        check_exit_code=True)
-
     def test_create_nmdev(self):
         mock_open = mock.mock_open()
-        with mock.patch.object(six.moves.builtins, 'open',
-                               new=mock_open) as mock_open:
+        with mock.patch('builtins.open', new=mock_open) as mock_open:
             nova.privsep.libvirt.create_mdev('phys', 'mdevtype',
                                              uuid='fakeuuid')
 

@@ -39,10 +39,11 @@ from nova.objects import pci_device
 from nova.pci import manager as pci_manager
 from nova.scheduler.client import report
 from nova import test
+from nova.tests import fixtures
 from nova.tests.unit import fake_instance
-from nova.tests.unit import fake_notifier
 from nova.tests.unit.objects import test_pci_device as fake_pci_device
 from nova.tests.unit import utils
+from nova import utils as nova_utils
 from nova.virt import driver
 
 _HOSTNAME = 'fake-host'
@@ -103,7 +104,7 @@ _COMPUTE_NODE_FIXTURES = [
         ),
 ]
 
-_INSTANCE_TYPE_FIXTURES = {
+_FLAVOR_FIXTURES = {
     1: {
         'id': 1,
         'flavorid': 'fakeid-1',
@@ -135,7 +136,7 @@ _INSTANCE_TYPE_FIXTURES = {
 }
 
 
-_INSTANCE_TYPE_OBJ_FIXTURES = {
+_FLAVOR_OBJ_FIXTURES = {
     1: objects.Flavor(id=1, flavorid='fakeid-1', name='fake1.small',
                       memory_mb=128, vcpus=1, root_gb=1,
                       ephemeral_gb=0, swap=0, rxtx_factor=0,
@@ -152,9 +153,9 @@ _2MB = 2 * units.Mi / units.Ki
 _INSTANCE_NUMA_TOPOLOGIES = {
     '2mb': objects.InstanceNUMATopology(cells=[
         objects.InstanceNUMACell(
-            id=0, cpuset=set([1]), memory=_2MB, pagesize=0),
+            id=0, cpuset=set([1]), pcpuset=set(), memory=_2MB, pagesize=0),
         objects.InstanceNUMACell(
-            id=1, cpuset=set([3]), memory=_2MB, pagesize=0)]),
+            id=1, cpuset=set([3]), pcpuset=set(), memory=_2MB, pagesize=0)]),
 }
 
 _NUMA_LIMIT_TOPOLOGIES = {
@@ -198,50 +199,50 @@ _INSTANCE_FIXTURES = [
         host=_HOSTNAME,
         node=_NODENAME,
         uuid='c17741a5-6f3d-44a8-ade8-773dc8c29124',
-        memory_mb=_INSTANCE_TYPE_FIXTURES[1]['memory_mb'],
-        vcpus=_INSTANCE_TYPE_FIXTURES[1]['vcpus'],
-        root_gb=_INSTANCE_TYPE_FIXTURES[1]['root_gb'],
-        ephemeral_gb=_INSTANCE_TYPE_FIXTURES[1]['ephemeral_gb'],
+        memory_mb=_FLAVOR_FIXTURES[1]['memory_mb'],
+        vcpus=_FLAVOR_FIXTURES[1]['vcpus'],
+        root_gb=_FLAVOR_FIXTURES[1]['root_gb'],
+        ephemeral_gb=_FLAVOR_FIXTURES[1]['ephemeral_gb'],
         numa_topology=_INSTANCE_NUMA_TOPOLOGIES['2mb'],
         pci_requests=None,
         pci_devices=None,
-        instance_type_id=1,
+        instance_type_id=_FLAVOR_OBJ_FIXTURES[1].id,
+        flavor=_FLAVOR_OBJ_FIXTURES[1],
+        old_flavor=_FLAVOR_OBJ_FIXTURES[1],
+        new_flavor=_FLAVOR_OBJ_FIXTURES[1],
         vm_state=vm_states.ACTIVE,
         power_state=power_state.RUNNING,
         task_state=None,
         os_type='fake-os',  # Used by the stats collector.
         project_id='fake-project',  # Used by the stats collector.
         user_id=uuids.user_id,
-        flavor = _INSTANCE_TYPE_OBJ_FIXTURES[1],
-        old_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[1],
-        new_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[1],
-        deleted = False,
-        resources = None,
+        deleted=False,
+        resources=None,
     ),
     objects.Instance(
         id=2,
         host=_HOSTNAME,
         node=_NODENAME,
         uuid='33805b54-dea6-47b8-acb2-22aeb1b57919',
-        memory_mb=_INSTANCE_TYPE_FIXTURES[2]['memory_mb'],
-        vcpus=_INSTANCE_TYPE_FIXTURES[2]['vcpus'],
-        root_gb=_INSTANCE_TYPE_FIXTURES[2]['root_gb'],
-        ephemeral_gb=_INSTANCE_TYPE_FIXTURES[2]['ephemeral_gb'],
+        memory_mb=_FLAVOR_FIXTURES[2]['memory_mb'],
+        vcpus=_FLAVOR_FIXTURES[2]['vcpus'],
+        root_gb=_FLAVOR_FIXTURES[2]['root_gb'],
+        ephemeral_gb=_FLAVOR_FIXTURES[2]['ephemeral_gb'],
         numa_topology=None,
         pci_requests=None,
         pci_devices=None,
-        instance_type_id=2,
+        instance_type_id=_FLAVOR_OBJ_FIXTURES[2].id,
+        flavor=_FLAVOR_OBJ_FIXTURES[2],
+        old_flavor=_FLAVOR_OBJ_FIXTURES[2],
+        new_flavor=_FLAVOR_OBJ_FIXTURES[2],
         vm_state=vm_states.DELETED,
         power_state=power_state.SHUTDOWN,
         task_state=None,
         os_type='fake-os',
         project_id='fake-project-2',
         user_id=uuids.user_id,
-        flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2],
-        old_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2],
-        new_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2],
-        deleted = False,
-        resources = None,
+        deleted=False,
+        resources=None,
     ),
 ]
 
@@ -311,24 +312,24 @@ _MIGRATION_INSTANCE_FIXTURES = {
         host=None,  # prevent RT trying to lazy-load this
         node=None,
         uuid='f15ecfb0-9bf6-42db-9837-706eb2c4bf08',
-        memory_mb=_INSTANCE_TYPE_FIXTURES[1]['memory_mb'],
-        vcpus=_INSTANCE_TYPE_FIXTURES[1]['vcpus'],
-        root_gb=_INSTANCE_TYPE_FIXTURES[1]['root_gb'],
-        ephemeral_gb=_INSTANCE_TYPE_FIXTURES[1]['ephemeral_gb'],
+        memory_mb=_FLAVOR_FIXTURES[1]['memory_mb'],
+        vcpus=_FLAVOR_FIXTURES[1]['vcpus'],
+        root_gb=_FLAVOR_FIXTURES[1]['root_gb'],
+        ephemeral_gb=_FLAVOR_FIXTURES[1]['ephemeral_gb'],
         numa_topology=_INSTANCE_NUMA_TOPOLOGIES['2mb'],
         pci_requests=None,
         pci_devices=None,
-        instance_type_id=1,
+        instance_type_id=_FLAVOR_OBJ_FIXTURES[1].id,
+        flavor=_FLAVOR_OBJ_FIXTURES[1],
+        old_flavor=_FLAVOR_OBJ_FIXTURES[1],
+        new_flavor=_FLAVOR_OBJ_FIXTURES[2],
         vm_state=vm_states.ACTIVE,
         power_state=power_state.RUNNING,
         task_state=task_states.RESIZE_MIGRATING,
         system_metadata={},
         os_type='fake-os',
         project_id='fake-project',
-        flavor=_INSTANCE_TYPE_OBJ_FIXTURES[1],
-        old_flavor=_INSTANCE_TYPE_OBJ_FIXTURES[1],
-        new_flavor=_INSTANCE_TYPE_OBJ_FIXTURES[2],
-        resources = None,
+        resources=None,
     ),
     # dest-only
     'f6ed631a-8645-4b12-8e1e-2fff55795765': objects.Instance(
@@ -336,23 +337,23 @@ _MIGRATION_INSTANCE_FIXTURES = {
         host=None,  # prevent RT trying to lazy-load this
         node=None,
         uuid='f6ed631a-8645-4b12-8e1e-2fff55795765',
-        memory_mb=_INSTANCE_TYPE_FIXTURES[2]['memory_mb'],
-        vcpus=_INSTANCE_TYPE_FIXTURES[2]['vcpus'],
-        root_gb=_INSTANCE_TYPE_FIXTURES[2]['root_gb'],
-        ephemeral_gb=_INSTANCE_TYPE_FIXTURES[2]['ephemeral_gb'],
+        memory_mb=_FLAVOR_FIXTURES[2]['memory_mb'],
+        vcpus=_FLAVOR_FIXTURES[2]['vcpus'],
+        root_gb=_FLAVOR_FIXTURES[2]['root_gb'],
+        ephemeral_gb=_FLAVOR_FIXTURES[2]['ephemeral_gb'],
         numa_topology=None,
         pci_requests=None,
         pci_devices=None,
-        instance_type_id=2,
+        instance_type_id=_FLAVOR_OBJ_FIXTURES[2].id,
+        flavor=_FLAVOR_OBJ_FIXTURES[2],
+        old_flavor=_FLAVOR_OBJ_FIXTURES[1],
+        new_flavor=_FLAVOR_OBJ_FIXTURES[2],
         vm_state=vm_states.ACTIVE,
         power_state=power_state.RUNNING,
         task_state=task_states.RESIZE_MIGRATING,
         system_metadata={},
         os_type='fake-os',
         project_id='fake-project',
-        flavor=_INSTANCE_TYPE_OBJ_FIXTURES[2],
-        old_flavor=_INSTANCE_TYPE_OBJ_FIXTURES[1],
-        new_flavor=_INSTANCE_TYPE_OBJ_FIXTURES[2],
         resources=None,
     ),
     # source-and-dest
@@ -361,23 +362,23 @@ _MIGRATION_INSTANCE_FIXTURES = {
         host=None,  # prevent RT trying to lazy-load this
         node=None,
         uuid='f4f0bfea-fe7e-4264-b598-01cb13ef1997',
-        memory_mb=_INSTANCE_TYPE_FIXTURES[2]['memory_mb'],
-        vcpus=_INSTANCE_TYPE_FIXTURES[2]['vcpus'],
-        root_gb=_INSTANCE_TYPE_FIXTURES[2]['root_gb'],
-        ephemeral_gb=_INSTANCE_TYPE_FIXTURES[2]['ephemeral_gb'],
+        memory_mb=_FLAVOR_FIXTURES[2]['memory_mb'],
+        vcpus=_FLAVOR_FIXTURES[2]['vcpus'],
+        root_gb=_FLAVOR_FIXTURES[2]['root_gb'],
+        ephemeral_gb=_FLAVOR_FIXTURES[2]['ephemeral_gb'],
         numa_topology=None,
         pci_requests=None,
         pci_devices=None,
-        instance_type_id=2,
+        instance_type_id=_FLAVOR_OBJ_FIXTURES[2].id,
+        flavor=_FLAVOR_OBJ_FIXTURES[2],
+        old_flavor=_FLAVOR_OBJ_FIXTURES[1],
+        new_flavor=_FLAVOR_OBJ_FIXTURES[2],
         vm_state=vm_states.ACTIVE,
         power_state=power_state.RUNNING,
         task_state=task_states.RESIZE_MIGRATING,
         system_metadata={},
         os_type='fake-os',
         project_id='fake-project',
-        flavor=_INSTANCE_TYPE_OBJ_FIXTURES[2],
-        old_flavor=_INSTANCE_TYPE_OBJ_FIXTURES[1],
-        new_flavor=_INSTANCE_TYPE_OBJ_FIXTURES[2],
         resources=None,
     ),
     # dest-only-evac
@@ -386,23 +387,23 @@ _MIGRATION_INSTANCE_FIXTURES = {
         host=None,  # prevent RT trying to lazy-load this
         node=None,
         uuid='077fb63a-bdc8-4330-90ef-f012082703dc',
-        memory_mb=_INSTANCE_TYPE_FIXTURES[2]['memory_mb'],
-        vcpus=_INSTANCE_TYPE_FIXTURES[2]['vcpus'],
-        root_gb=_INSTANCE_TYPE_FIXTURES[2]['root_gb'],
-        ephemeral_gb=_INSTANCE_TYPE_FIXTURES[2]['ephemeral_gb'],
+        memory_mb=_FLAVOR_FIXTURES[2]['memory_mb'],
+        vcpus=_FLAVOR_FIXTURES[2]['vcpus'],
+        root_gb=_FLAVOR_FIXTURES[2]['root_gb'],
+        ephemeral_gb=_FLAVOR_FIXTURES[2]['ephemeral_gb'],
         numa_topology=None,
         pci_requests=None,
         pci_devices=None,
-        instance_type_id=2,
+        instance_type_id=_FLAVOR_OBJ_FIXTURES[2].id,
+        flavor=_FLAVOR_OBJ_FIXTURES[2],
+        old_flavor=_FLAVOR_OBJ_FIXTURES[1],
+        new_flavor=_FLAVOR_OBJ_FIXTURES[2],
         vm_state=vm_states.ACTIVE,
         power_state=power_state.RUNNING,
         task_state=task_states.REBUILDING,
         system_metadata={},
         os_type='fake-os',
         project_id='fake-project',
-        flavor=_INSTANCE_TYPE_OBJ_FIXTURES[2],
-        old_flavor=_INSTANCE_TYPE_OBJ_FIXTURES[1],
-        new_flavor=_INSTANCE_TYPE_OBJ_FIXTURES[2],
         resources=None,
     ),
 }
@@ -584,7 +585,7 @@ class TestUpdateAvailableResources(BaseTestCase):
     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
                 return_value=objects.PciDeviceList())
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     def test_disabled(self, get_mock, migr_mock, get_cn_mock, pci_mock,
             instance_pci_mock):
@@ -617,7 +618,7 @@ class TestUpdateAvailableResources(BaseTestCase):
     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
                 return_value=objects.PciDeviceList())
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     def test_no_instances_no_migrations_no_reserved(self, get_mock, migr_mock,
                                                     get_cn_mock, pci_mock,
@@ -669,7 +670,7 @@ class TestUpdateAvailableResources(BaseTestCase):
     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
                 return_value=objects.PciDeviceList())
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
                 '_remove_deleted_instances_allocations')
@@ -698,7 +699,7 @@ class TestUpdateAvailableResources(BaseTestCase):
                 return_value=objects.PciDeviceList())
     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
                 '_init_compute_node', return_value=True)
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
                 '_remove_deleted_instances_allocations')
@@ -728,7 +729,7 @@ class TestUpdateAvailableResources(BaseTestCase):
     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
                 return_value=objects.PciDeviceList())
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     def test_no_instances_no_migrations_reserved_disk_ram_and_cpu(
             self, get_mock, migr_mock, get_cn_mock, pci_mock,
@@ -770,7 +771,7 @@ class TestUpdateAvailableResources(BaseTestCase):
     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
                 return_value=objects.PciDeviceList())
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     def test_some_instances_no_migrations(self, get_mock, migr_mock,
                                           get_cn_mock, pci_mock,
@@ -814,70 +815,6 @@ class TestUpdateAvailableResources(BaseTestCase):
                                                  actual_resources))
         update_mock.assert_called_once()
 
-    @mock.patch('nova.objects.InstancePCIRequests.get_by_instance',
-                return_value=objects.InstancePCIRequests(requests=[]))
-    @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
-                return_value=objects.PciDeviceList())
-    @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
-    @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
-    def test_orphaned_instances_no_migrations(self, get_mock, migr_mock,
-                                              get_cn_mock, pci_mock,
-                                              instance_pci_mock):
-        # Setup virt resources to match used resources to number
-        # of defined instances on the hypervisor
-        virt_resources = copy.deepcopy(_VIRT_DRIVER_AVAIL_RESOURCES)
-        virt_resources.update(memory_mb_used=64)
-        self._setup_rt(virt_resources=virt_resources)
-
-        get_mock.return_value = []
-        migr_mock.return_value = []
-        get_cn_mock.return_value = _COMPUTE_NODE_FIXTURES[0]
-
-        # Orphaned instances are those that the virt driver has on
-        # record as consuming resources on the compute node, but the
-        # Nova database has no record of the instance being active
-        # on the host. For some reason, the resource tracker only
-        # considers orphaned instance's memory usage in its calculations
-        # of free resources...
-        orphaned_usages = {
-            '71ed7ef6-9d2e-4c65-9f4e-90bb6b76261d': {
-                # Yes, the return result format of get_per_instance_usage
-                # is indeed this stupid and redundant. Also note that the
-                # libvirt driver just returns an empty dict always for this
-                # method and so who the heck knows whether this stuff
-                # actually works.
-                'uuid': '71ed7ef6-9d2e-4c65-9f4e-90bb6b76261d',
-                'memory_mb': 64
-            }
-        }
-        vd = self.driver_mock
-        vd.get_per_instance_usage.return_value = orphaned_usages
-
-        update_mock = self._update_available_resources()
-
-        get_cn_mock.assert_called_once_with(mock.ANY, _HOSTNAME, _NODENAME)
-        expected_resources = copy.deepcopy(_COMPUTE_NODE_FIXTURES[0])
-        vals = {
-            'free_disk_gb': 6,
-            'local_gb': 6,
-            'free_ram_mb': 448,  # 512 - 64 orphaned usage
-            'memory_mb_used': 64,
-            'vcpus_used': 0,
-            'local_gb_used': 0,
-            'memory_mb': 512,
-            'current_workload': 0,
-            'vcpus': 4,
-            # Yep, for some reason, orphaned instances are not counted
-            # as running VMs...
-            'running_vms': 0
-        }
-        _update_compute_node(expected_resources, **vals)
-        actual_resources = update_mock.call_args[0][1]
-        self.assertTrue(obj_base.obj_equal_prims(expected_resources,
-                                                 actual_resources))
-        update_mock.assert_called_once()
-
     @mock.patch('nova.compute.utils.is_volume_backed_instance',
                 return_value=False)
     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance',
@@ -885,7 +822,7 @@ class TestUpdateAvailableResources(BaseTestCase):
     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
                 return_value=objects.PciDeviceList())
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.Instance.get_by_uuid')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     def test_no_instances_source_migration(self, get_mock, get_inst_mock,
@@ -951,7 +888,7 @@ class TestUpdateAvailableResources(BaseTestCase):
     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
                 return_value=objects.PciDeviceList())
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.Instance.get_by_uuid')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     def test_no_instances_dest_migration(self, get_mock, get_inst_mock,
@@ -1014,7 +951,7 @@ class TestUpdateAvailableResources(BaseTestCase):
     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
                 return_value=objects.PciDeviceList())
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.Instance.get_by_uuid')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     def test_no_instances_dest_evacuation(self, get_mock, get_inst_mock,
@@ -1075,7 +1012,7 @@ class TestUpdateAvailableResources(BaseTestCase):
     @mock.patch('nova.objects.MigrationContext.get_by_instance_uuid',
                 return_value=None)
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.Instance.get_by_uuid')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     def test_some_instances_source_and_dest_migration(self, get_mock,
@@ -1140,13 +1077,76 @@ class TestUpdateAvailableResources(BaseTestCase):
         update_mock.assert_called_once()
 
     @mock.patch('nova.compute.utils.is_volume_backed_instance',
+                return_value=False)
+    @mock.patch('nova.objects.InstancePCIRequests.get_by_instance',
+                return_value=objects.InstancePCIRequests(requests=[]))
+    @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
+                return_value=objects.PciDeviceList())
+    @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
+    @mock.patch('nova.objects.Instance.get_by_uuid')
+    @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
+    def test_no_instances_err_migration(
+        self, get_mock, get_inst_mock, migr_mock, get_cn_mock, pci_mock,
+        instance_pci_mock, mock_is_volume_backed_instance
+    ):
+        # We test the behavior of update_available_resource() when
+        # there is an error migration that involves this compute node
+        # as the destination host not the source host, and the resource
+        # tracker does not yet have any instances assigned to it. This is
+        # the case when a migration to this compute host from another host
+        # is in error, the resources claimed on destination host might not
+        # be cleaned up, so the resource tracker must reserve the resources
+        # for the error migration.
+
+        # Setup virt resources to match used resources to number
+        # of defined instances on the hypervisor
+        virt_resources = copy.deepcopy(_VIRT_DRIVER_AVAIL_RESOURCES)
+        virt_resources.update(
+            vcpus_used=2, memory_mb_used=256, local_gb_used=5)
+        self._setup_rt(virt_resources=virt_resources)
+
+        get_mock.return_value = []
+        migr_obj = _MIGRATION_FIXTURES['dest-only']
+        migr_obj.status = 'error'
+        # in-process and error migrations
+        migr_mock.return_value = [migr_obj]
+        inst_uuid = migr_obj.instance_uuid
+        instance = _MIGRATION_INSTANCE_FIXTURES[inst_uuid].obj_clone()
+        get_inst_mock.return_value = instance
+        get_cn_mock.return_value = _COMPUTE_NODE_FIXTURES[0]
+        instance.migration_context = _MIGRATION_CONTEXT_FIXTURES[inst_uuid]
+
+        update_mock = self._update_available_resources()
+
+        get_cn_mock.assert_called_once_with(mock.ANY, _HOSTNAME, _NODENAME)
+        expected_resources = copy.deepcopy(_COMPUTE_NODE_FIXTURES[0])
+        vals = {
+            'free_disk_gb': 1,
+            'local_gb': 6,
+            'free_ram_mb': 256,  # 512 total - 256 for possible confirm of new
+            'memory_mb_used': 256,  # 256 possible confirmed amount
+            'vcpus_used': 2,
+            'local_gb_used': 5,
+            'memory_mb': 512,
+            'current_workload': 0,
+            'vcpus': 4,
+            'running_vms': 0
+        }
+        _update_compute_node(expected_resources, **vals)
+        actual_resources = update_mock.call_args[0][1]
+        self.assertTrue(
+            obj_base.obj_equal_prims(expected_resources, actual_resources))
+        update_mock.assert_called_once()
+
+    @mock.patch('nova.compute.utils.is_volume_backed_instance',
                 new=mock.Mock(return_value=False))
     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
                 new=mock.Mock(return_value=objects.PciDeviceList()))
     @mock.patch('nova.objects.MigrationContext.get_by_instance_uuid',
                 new=mock.Mock(return_value=None))
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.Instance.get_by_uuid')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     def test_populate_assigned_resources(self, mock_get_instances,
@@ -1198,7 +1198,7 @@ class TestUpdateAvailableResources(BaseTestCase):
     @mock.patch('nova.objects.MigrationContext.get_by_instance_uuid',
                 new=mock.Mock(return_value=None))
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.Instance.get_by_uuid')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     def test_check_resources_startup_success(self, mock_get_instances,
@@ -1239,7 +1239,7 @@ class TestUpdateAvailableResources(BaseTestCase):
     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
                 new=mock.Mock(return_value=objects.PciDeviceList()))
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     def test_check_resources_startup_fail(self, mock_get_instances,
                                           mock_get_migrations,
@@ -1948,7 +1948,7 @@ class TestInstanceClaim(BaseTestCase):
         self.assertIsInstance(claim, claims.NopClaim)
 
     @mock.patch('nova.compute.utils.is_volume_backed_instance')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     def test_update_usage_with_claim(self, migr_mock, check_bfv_mock):
         # Test that RT.update_usage() only changes the compute node
         # resources if there has been a claim first.
@@ -1988,7 +1988,7 @@ class TestInstanceClaim(BaseTestCase):
             self.assertTrue(obj_base.obj_equal_prims(expected, cn))
 
     @mock.patch('nova.compute.utils.is_volume_backed_instance')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     def test_update_usage_removed(self, migr_mock, check_bfv_mock):
         # Test that RT.update_usage() removes the instance when update is
         # called in a removed state
@@ -2064,7 +2064,7 @@ class TestInstanceClaim(BaseTestCase):
             self.assertEqual(0, len(self.rt.assigned_resources[cn.uuid][rc]))
 
     @mock.patch('nova.compute.utils.is_volume_backed_instance')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     def test_claim(self, migr_mock, check_bfv_mock):
         self.instance.pci_requests = objects.InstancePCIRequests(requests=[])
         check_bfv_mock.return_value = False
@@ -2104,7 +2104,7 @@ class TestInstanceClaim(BaseTestCase):
     @mock.patch('nova.compute.utils.is_volume_backed_instance')
     @mock.patch('nova.pci.stats.PciDeviceStats.support_requests',
                 return_value=True)
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     def test_claim_with_pci(self, migr_mock, pci_stats_mock,
                             check_bfv_mock):
         # Test that a claim involving PCI requests correctly claims
@@ -2113,7 +2113,12 @@ class TestInstanceClaim(BaseTestCase):
 
         # TODO(jaypipes): Remove once the PCI tracker is always created
         # upon the resource tracker being initialized...
-        self.rt.pci_tracker = pci_manager.PciDevTracker(mock.sentinel.ctx)
+        with mock.patch.object(
+            objects.PciDeviceList, 'get_by_compute_node',
+            return_value=objects.PciDeviceList()
+        ):
+            self.rt.pci_tracker = pci_manager.PciDevTracker(
+                mock.sentinel.ctx, _COMPUTE_NODE_FIXTURES[0])
 
         pci_dev = pci_device.PciDevice.create(
             None, fake_pci_device.dev_dict)
@@ -2237,7 +2242,7 @@ class TestInstanceClaim(BaseTestCase):
     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
                 '_sync_compute_service_disabled_trait', new=mock.Mock())
     @mock.patch('nova.compute.utils.is_volume_backed_instance')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.ComputeNode.save')
     def test_claim_abort_context_manager(self, save_mock, migr_mock,
                                          check_bfv_mock):
@@ -2281,7 +2286,7 @@ class TestInstanceClaim(BaseTestCase):
     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
                 '_sync_compute_service_disabled_trait', new=mock.Mock())
     @mock.patch('nova.compute.utils.is_volume_backed_instance')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.ComputeNode.save')
     def test_claim_abort(self, save_mock, migr_mock, check_bfv_mock):
         self.instance.pci_requests = objects.InstancePCIRequests(requests=[])
@@ -2323,7 +2328,7 @@ class TestInstanceClaim(BaseTestCase):
         self.assertEqual(0, cn.running_vms)
 
     @mock.patch('nova.compute.utils.is_volume_backed_instance')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.ComputeNode.save')
     def test_claim_numa(self, save_mock, migr_mock, check_bfv_mock):
         self.instance.pci_requests = objects.InstancePCIRequests(requests=[])
@@ -2359,7 +2364,7 @@ class TestResize(BaseTestCase):
     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
                 return_value=objects.PciDeviceList())
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     @mock.patch('nova.objects.ComputeNode.save')
     def test_resize_claim_same_host(self, save_mock, get_mock, migr_mock,
@@ -2383,7 +2388,7 @@ class TestResize(BaseTestCase):
         get_cn_mock.return_value = _COMPUTE_NODE_FIXTURES[0]
 
         instance = _INSTANCE_FIXTURES[0].obj_clone()
-        instance.new_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2]
+        instance.new_flavor = _FLAVOR_OBJ_FIXTURES[2]
         # This migration context is fine, it points to the first instance
         # fixture and indicates a source-and-dest resize.
         mig_context_obj = _MIGRATION_CONTEXT_FIXTURES[instance.uuid]
@@ -2404,7 +2409,7 @@ class TestResize(BaseTestCase):
             status='migrating',
             uuid=uuids.migration,
         )
-        new_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2]
+        new_flavor = _FLAVOR_OBJ_FIXTURES[2]
 
         # not using mock.sentinel.ctx because resize_claim calls #elevated
         ctx = mock.MagicMock()
@@ -2464,7 +2469,7 @@ class TestResize(BaseTestCase):
                 return_value=objects.PciDeviceList())
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename',
                 return_value=_COMPUTE_NODE_FIXTURES[0])
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node',
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error',
                 return_value=[])
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node',
                 return_value=[])
@@ -2472,13 +2477,12 @@ class TestResize(BaseTestCase):
     def _test_instance_build_resize(self,
                                     save_mock,
                                     get_by_host_and_node_mock,
-                                    get_in_progress_by_host_and_node_mock,
+                                    get_in_progress_and_error_mock,
                                     get_by_host_and_nodename_mock,
                                     pci_get_by_compute_node_mock,
                                     pci_get_by_instance_mock,
                                     is_bfv_mock,
                                     revert=False):
-
         self.flags(reserved_host_disk_mb=0,
                    reserved_host_memory_mb=0)
         virt_resources = copy.deepcopy(_VIRT_DRIVER_AVAIL_RESOURCES)
@@ -2495,7 +2499,7 @@ class TestResize(BaseTestCase):
 
         instance = _INSTANCE_FIXTURES[0].obj_clone()
         old_flavor = instance.flavor
-        instance.new_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2]
+        instance.new_flavor = _FLAVOR_OBJ_FIXTURES[2]
         instance.pci_requests = objects.InstancePCIRequests(requests=[])
 
         # allocations for create
@@ -2540,6 +2544,7 @@ class TestResize(BaseTestCase):
         mig_context_obj.new_resources = objects.ResourceList(
             objects=[self.resource_1, self.resource_2])
         instance.migration_context = mig_context_obj
+        instance.system_metadata = {}
 
         migration = objects.Migration(
             id=3,
@@ -2554,7 +2559,7 @@ class TestResize(BaseTestCase):
             status='migrating',
             uuid=uuids.migration,
         )
-        new_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2]
+        new_flavor = _FLAVOR_OBJ_FIXTURES[2]
 
         # Resize instance
         with test.nested(
@@ -2581,15 +2586,17 @@ class TestResize(BaseTestCase):
                              len(self.rt.assigned_resources[cn.uuid][rc]))
 
         # Confirm or revert resize
-        if revert:
-            flavor = new_flavor
-            prefix = 'new_'
-        else:
-            flavor = old_flavor
-            prefix = 'old_'
-
-        self.rt.drop_move_claim(ctx, instance, _NODENAME, flavor,
-                                prefix=prefix)
+        with test.nested(
+            mock.patch('nova.objects.Migration.save'),
+            mock.patch('nova.objects.Instance.drop_migration_context'),
+            mock.patch('nova.objects.Instance.save'),
+        ):
+            if revert:
+                flavor = new_flavor
+                self.rt.drop_move_claim_at_dest(ctx, instance, migration)
+            else:  # confirm
+                flavor = old_flavor
+                self.rt.drop_move_claim_at_source(ctx, instance, migration)
 
         expected = compute_update_usage(expected, flavor, sign=-1)
         self.assertTrue(obj_base.obj_equal_prims(
@@ -2633,7 +2640,7 @@ class TestResize(BaseTestCase):
     @mock.patch('nova.pci.request.get_pci_requests_from_flavor')
     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node')
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     @mock.patch('nova.objects.ComputeNode.save')
     def test_resize_claim_dest_host_with_pci(self, save_mock, get_mock,
@@ -2649,7 +2656,8 @@ class TestResize(BaseTestCase):
 
         # TODO(jaypipes): Remove once the PCI tracker is always created
         # upon the resource tracker being initialized...
-        self.rt.pci_tracker = pci_manager.PciDevTracker(mock.sentinel.ctx)
+        self.rt.pci_tracker = pci_manager.PciDevTracker(
+            mock.sentinel.ctx, _COMPUTE_NODE_FIXTURES[0])
 
         pci_dev = pci_device.PciDevice.create(
             None, fake_pci_device.dev_dict)
@@ -2666,7 +2674,7 @@ class TestResize(BaseTestCase):
 
         instance = _INSTANCE_FIXTURES[0].obj_clone()
         instance.task_state = task_states.RESIZE_MIGRATING
-        instance.new_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2]
+        instance.new_flavor = _FLAVOR_OBJ_FIXTURES[2]
 
         # A destination-only migration
         migration = objects.Migration(
@@ -2690,7 +2698,7 @@ class TestResize(BaseTestCase):
             old_numa_topology=None,
         )
         instance.migration_context = mig_context_obj
-        new_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2]
+        new_flavor = _FLAVOR_OBJ_FIXTURES[2]
 
         request = objects.InstancePCIRequest(count=1,
             spec=[{'vendor_id': 'v', 'product_id': 'p'}])
@@ -2740,7 +2748,12 @@ class TestResize(BaseTestCase):
 
         # TODO(jaypipes): Remove once the PCI tracker is always created
         # upon the resource tracker being initialized...
-        self.rt.pci_tracker = pci_manager.PciDevTracker(mock.sentinel.ctx)
+        with mock.patch.object(
+            objects.PciDeviceList, 'get_by_compute_node',
+            return_value=objects.PciDeviceList()
+        ):
+            self.rt.pci_tracker = pci_manager.PciDevTracker(
+                mock.sentinel.ctx, cn)
 
         pci_dev = pci_device.PciDevice.create(
             None, fake_pci_device.dev_dict)
@@ -2748,37 +2761,45 @@ class TestResize(BaseTestCase):
 
         instance = _INSTANCE_FIXTURES[0].obj_clone()
         instance.task_state = task_states.RESIZE_MIGRATING
-        instance.new_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2]
+        instance.new_flavor = _FLAVOR_OBJ_FIXTURES[2]
         instance.migration_context = objects.MigrationContext()
         instance.migration_context.new_pci_devices = objects.PciDeviceList(
             objects=pci_devs)
 
-        # When reverting a resize and dropping the move claim, the
-        # destination compute calls drop_move_claim to drop the new_flavor
+        # When reverting a resize and dropping the move claim, the destination
+        # compute calls drop_move_claim_at_dest to drop the new_flavor
         # usage and the instance should be in tracked_migrations from when
         # the resize_claim was made on the dest during prep_resize.
-        self.rt.tracked_migrations = {
-            instance.uuid: objects.Migration(migration_type='resize')}
+        migration = objects.Migration(
+            dest_node=cn.hypervisor_hostname,
+            migration_type='resize',
+        )
+        self.rt.tracked_migrations = {instance.uuid: migration}
 
-        # not using mock.sentinel.ctx because drop_move_claim calls elevated
+        # not using mock.sentinel.ctx because _drop_move_claim calls elevated
         ctx = mock.MagicMock()
 
         with test.nested(
             mock.patch.object(self.rt, '_update'),
             mock.patch.object(self.rt.pci_tracker, 'free_device'),
             mock.patch.object(self.rt, '_get_usage_dict'),
-            mock.patch.object(self.rt, '_update_usage')
+            mock.patch.object(self.rt, '_update_usage'),
+            mock.patch.object(migration, 'save'),
+            mock.patch.object(instance, 'save'),
         ) as (
             update_mock, mock_pci_free_device, mock_get_usage,
-            mock_update_usage,
+            mock_update_usage, mock_migrate_save, mock_instance_save,
         ):
-            self.rt.drop_move_claim(ctx, instance, _NODENAME)
+            self.rt.drop_move_claim_at_dest(ctx, instance, migration)
+
             mock_pci_free_device.assert_called_once_with(
                 pci_dev, mock.ANY)
             mock_get_usage.assert_called_once_with(
                 instance.new_flavor, instance, numa_topology=None)
             mock_update_usage.assert_called_once_with(
                 mock_get_usage.return_value, _NODENAME, sign=-1)
+            mock_migrate_save.assert_called_once()
+            mock_instance_save.assert_called_once()
 
     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
                 '_sync_compute_service_disabled_trait', new=mock.Mock())
@@ -2789,7 +2810,7 @@ class TestResize(BaseTestCase):
     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
                 return_value=objects.PciDeviceList())
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     @mock.patch('nova.objects.ComputeNode.save')
     def test_resize_claim_two_instances(self, save_mock, get_mock, migr_mock,
@@ -2814,7 +2835,7 @@ class TestResize(BaseTestCase):
         instance1.id = 1
         instance1.uuid = uuids.instance1
         instance1.task_state = task_states.RESIZE_MIGRATING
-        instance1.new_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2]
+        instance1.new_flavor = _FLAVOR_OBJ_FIXTURES[2]
 
         migration1 = objects.Migration(
             id=1,
@@ -2837,7 +2858,7 @@ class TestResize(BaseTestCase):
             old_numa_topology=None,
         )
         instance1.migration_context = mig_context_obj1
-        flavor1 = _INSTANCE_TYPE_OBJ_FIXTURES[2]
+        flavor1 = _FLAVOR_OBJ_FIXTURES[2]
 
         # Instance #2 is resizing to instance type 1 which has 1 vCPU, 128MB
         # RAM and 1GB root disk.
@@ -2845,8 +2866,8 @@ class TestResize(BaseTestCase):
         instance2.id = 2
         instance2.uuid = uuids.instance2
         instance2.task_state = task_states.RESIZE_MIGRATING
-        instance2.old_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2]
-        instance2.new_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[1]
+        instance2.old_flavor = _FLAVOR_OBJ_FIXTURES[2]
+        instance2.new_flavor = _FLAVOR_OBJ_FIXTURES[1]
 
         migration2 = objects.Migration(
             id=2,
@@ -2869,7 +2890,7 @@ class TestResize(BaseTestCase):
             old_numa_topology=None,
         )
         instance2.migration_context = mig_context_obj2
-        flavor2 = _INSTANCE_TYPE_OBJ_FIXTURES[1]
+        flavor2 = _FLAVOR_OBJ_FIXTURES[1]
 
         expected = self.rt.compute_nodes[_NODENAME].obj_clone()
         expected.vcpus_used = (expected.vcpus_used +
@@ -2921,7 +2942,7 @@ class TestRebuild(BaseTestCase):
     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
                 return_value=objects.PciDeviceList())
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
-    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_and_error')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     @mock.patch('nova.objects.ComputeNode.save')
     def test_rebuild_claim(self, save_mock, get_mock, migr_mock, get_cn_mock,
@@ -2969,23 +2990,23 @@ class TestRebuild(BaseTestCase):
             host=None,
             node=None,
             uuid='abef5b54-dea6-47b8-acb2-22aeb1b57919',
-            memory_mb=_INSTANCE_TYPE_FIXTURES[2]['memory_mb'],
-            vcpus=_INSTANCE_TYPE_FIXTURES[2]['vcpus'],
-            root_gb=_INSTANCE_TYPE_FIXTURES[2]['root_gb'],
-            ephemeral_gb=_INSTANCE_TYPE_FIXTURES[2]['ephemeral_gb'],
+            memory_mb=_FLAVOR_FIXTURES[2]['memory_mb'],
+            vcpus=_FLAVOR_FIXTURES[2]['vcpus'],
+            root_gb=_FLAVOR_FIXTURES[2]['root_gb'],
+            ephemeral_gb=_FLAVOR_FIXTURES[2]['ephemeral_gb'],
             numa_topology=None,
             pci_requests=None,
             pci_devices=None,
-            instance_type_id=2,
+            instance_type_id=_FLAVOR_OBJ_FIXTURES[2].id,
+            flavor=_FLAVOR_OBJ_FIXTURES[2],
+            old_flavor=_FLAVOR_OBJ_FIXTURES[2],
+            new_flavor=_FLAVOR_OBJ_FIXTURES[2],
             vm_state=vm_states.ACTIVE,
             power_state=power_state.RUNNING,
             task_state=task_states.REBUILDING,
             os_type='fake-os',
             project_id='fake-project',
-            flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2],
-            old_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2],
-            new_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2],
-            resources = None,
+            resources=None,
         )
 
         # not using mock.sentinel.ctx because resize_claim calls #elevated
@@ -3019,7 +3040,12 @@ class TestLiveMigration(BaseTestCase):
         migration = objects.Migration(id=42, migration_type='live-migration',
                                       status='accepted')
         image_meta = objects.ImageMeta(properties=objects.ImageMetaProps())
-        self.rt.pci_tracker = pci_manager.PciDevTracker(mock.sentinel.ctx)
+        with mock.patch.object(
+            objects.PciDeviceList, 'get_by_compute_node',
+            return_value=objects.PciDeviceList()
+        ):
+            self.rt.pci_tracker = pci_manager.PciDevTracker(
+                mock.sentinel.ctx, _COMPUTE_NODE_FIXTURES[0])
         with test.nested(
             mock.patch.object(objects.ImageMeta, 'from_instance',
                               return_value=image_meta),
@@ -3031,7 +3057,8 @@ class TestLiveMigration(BaseTestCase):
         ) as (mock_from_instance, mock_migration_save, mock_instance_save,
               mock_update, mock_pci_claim_instance, mock_update_usage):
             claim = self.rt.live_migration_claim(ctxt, instance, _NODENAME,
-                                                 migration, limits=None)
+                                                 migration, limits=None,
+                                                 allocs=None)
             self.assertEqual(42, claim.migration.id)
             # Check that we didn't set the status to 'pre-migrating', like we
             # do for cold migrations, but which doesn't exist for live
@@ -3093,13 +3120,13 @@ class TestUpdateUsageFromMigrations(BaseTestCase):
             instance_uuid='some_uuid',
         )
         self._setup_rt()
-        self.rt._update_usage_from_migrations(mock.sentinel.ctx, [migration],
+        ctx = mock.MagicMock()
+        self.rt._update_usage_from_migrations(ctx, [migration],
                                               _NODENAME)
-        mock_get_instance.assert_called_once_with(mock.sentinel.ctx,
-                                                  'some_uuid',
-                                                  expected_attrs=[
-                                                      'migration_context',
-                                                      'flavor'])
+        mock_get_instance.assert_called_once_with(
+            ctx.elevated.return_value, 'some_uuid',
+            expected_attrs=['migration_context', 'flavor'])
+        ctx.elevated.assert_called_once_with(read_deleted='yes')
         self.assertFalse(mock_update_usage.called)
 
     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
@@ -3147,17 +3174,16 @@ class TestUpdateUsageFromMigrations(BaseTestCase):
         mig_list = objects.MigrationList(objects=migrations)
         instance.migration_context = objects.MigrationContext(
             migration_id=mig2.id)
-        self.rt._update_usage_from_migrations(mock.sentinel.ctx, mig_list,
-                                              _NODENAME)
-        upd_mock.assert_called_once_with(mock.sentinel.ctx, instance, mig2,
-                                         _NODENAME)
+        ctxt = mock.MagicMock()
+        self.rt._update_usage_from_migrations(ctxt, mig_list, _NODENAME)
+        upd_mock.assert_called_once_with(ctxt, instance, mig2, _NODENAME)
 
         upd_mock.reset_mock()
         mig2.updated_at = None
         instance.migration_context.migration_id = mig1.id
-        self.rt._update_usage_from_migrations(mock.sentinel.ctx, mig_list,
+        self.rt._update_usage_from_migrations(ctxt, mig_list,
                 _NODENAME)
-        upd_mock.assert_called_once_with(mock.sentinel.ctx, instance, mig1,
+        upd_mock.assert_called_once_with(ctxt, instance, mig1,
                 _NODENAME)
 
     @mock.patch('nova.objects.migration.Migration.save')
@@ -3186,8 +3212,8 @@ class TestUpdateUsageFromMigrations(BaseTestCase):
                               id=1,
                               instance=instance)
         mig_list = objects.MigrationList(objects=[mig1])
-        self.rt._update_usage_from_migrations(mock.sentinel.ctx, mig_list,
-                                              _NODENAME)
+        ctxt = mock.MagicMock()
+        self.rt._update_usage_from_migrations(ctxt, mig_list, _NODENAME)
         self.assertFalse(upd_mock.called)
         self.assertEqual(mig1.status, "error")
 
@@ -3206,10 +3232,11 @@ class TestUpdateUsageFromMigrations(BaseTestCase):
             instance_uuid=uuids.instance, id=1, instance=instance)
         for state in task_states.rebuild_states + task_states.resizing_states:
             instance.task_state = state
+            ctxt = mock.MagicMock()
             self.rt._update_usage_from_migrations(
-                mock.sentinel.ctx, [migration], _NODENAME)
+                ctxt, [migration], _NODENAME)
             mock_update_usage.assert_called_once_with(
-                mock.sentinel.ctx, instance, migration, _NODENAME)
+                ctxt, instance, migration, _NODENAME)
             mock_update_usage.reset_mock()
 
     @mock.patch('nova.objects.migration.Migration.save')
@@ -3226,10 +3253,11 @@ class TestUpdateUsageFromMigrations(BaseTestCase):
             dest_compute=_HOSTNAME, dest_node=_NODENAME,
             instance_uuid=uuids.instance, id=1, instance=instance,
             migration_type='live-migration')
+        ctxt = mock.MagicMock()
         self.rt._update_usage_from_migrations(
-            mock.sentinel.ctx, [migration], _NODENAME)
+            ctxt, [migration], _NODENAME)
         mock_update_usage.assert_called_once_with(
-            mock.sentinel.ctx, instance, migration, _NODENAME)
+            ctxt, instance, migration, _NODENAME)
 
 
 class TestUpdateUsageFromInstance(BaseTestCase):
@@ -3768,8 +3796,7 @@ class ComputeMonitorTestCase(BaseTestCase):
 
     @mock.patch('nova.compute.utils.notify_about_metrics_update')
     def test_get_host_metrics(self, mock_notify):
-        fake_notifier.stub_notifier(self)
-        self.addCleanup(fake_notifier.reset)
+        self.notifier = self.useFixture(fixtures.NotificationFixture(self))
 
         class FakeCPUMonitor(monitor_base.MonitorBase):
 
@@ -3814,8 +3841,8 @@ class ComputeMonitorTestCase(BaseTestCase):
             'nodename': _NODENAME,
         }
 
-        self.assertEqual(1, len(fake_notifier.NOTIFICATIONS))
-        msg = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual(1, len(self.notifier.notifications))
+        msg = self.notifier.notifications[0]
         self.assertEqual('compute.metrics.update', msg.event_type)
         for p_key in payload:
             if p_key == 'metrics':
@@ -3861,10 +3888,19 @@ class TestPciTrackerDelegationMethods(BaseTestCase):
         pci_requests = objects.InstancePCIRequests(
             requests=[request],
             instance_uuid=self.instance.uuid)
-        self.rt.claim_pci_devices(self.context, pci_requests)
+        self.rt.claim_pci_devices(
+            self.context, pci_requests, mock.sentinel.numa_topology)
         self.rt.pci_tracker.claim_instance.assert_called_once_with(
-            self.context, pci_requests, None)
+            self.context, pci_requests, mock.sentinel.numa_topology)
         self.assertTrue(self.rt.pci_tracker.save.called)
+
+    def test_unclaim_pci_devices(self):
+        self.rt.unclaim_pci_devices(
+            self.context, mock.sentinel.pci_device, mock.sentinel.instance)
+
+        self.rt.pci_tracker.free_device.assert_called_once_with(
+            mock.sentinel.pci_device, mock.sentinel.instance)
+        self.rt.pci_tracker.save.assert_called_once_with(self.context)
 
     def test_allocate_pci_devices_for_instance(self):
         self.rt.allocate_pci_devices_for_instance(self.context, self.instance)
@@ -3896,3 +3932,248 @@ class ResourceTrackerTestCase(test.NoDBTestCase):
         rt = resource_tracker.ResourceTracker(
             _HOSTNAME, mock.sentinel.driver, mock.sentinel.reportclient)
         self.assertIs(rt.reportclient, mock.sentinel.reportclient)
+
+    def test_that_unfair_usage_of_compute_resource_semaphore_is_caught(self):
+        def _test_explict_unfair():
+            class MyResourceTracker(resource_tracker.ResourceTracker):
+                @nova_utils.synchronized(
+                    resource_tracker.COMPUTE_RESOURCE_SEMAPHORE, fair=False)
+                def foo(self):
+                    pass
+
+        def _test_implicit_unfair():
+            class MyResourceTracker(resource_tracker.ResourceTracker):
+                @nova_utils.synchronized(
+                    resource_tracker.COMPUTE_RESOURCE_SEMAPHORE)
+                def foo(self):
+                    pass
+
+        self.assertRaises(AssertionError, _test_explict_unfair)
+        self.assertRaises(AssertionError, _test_implicit_unfair)
+
+
+class ProviderConfigTestCases(BaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self._setup_rt()
+        self.p_tree = self._setup_ptree(_COMPUTE_NODE_FIXTURES[0])
+
+    @staticmethod
+    def _get_provider_config(uuid=uuids.cn1):
+        return {"__source_file": "test_provider_config.yaml",
+                "identification": {
+                    "uuid": uuid
+                },
+                "inventories": {
+                    "additional": [
+                        {
+                            orc.normalize_name(uuid): {
+                                "total": 100,
+                                "reserved": 0,
+                                "min_unit": 1,
+                                "max_unit": 10,
+                                "step_size": 1,
+                                "allocation_ratio": 1
+                            }
+                        }
+                    ]
+                },
+                "traits": {
+                    "additional": [os_traits.normalize_name(uuid)]
+                }}
+
+    def test_merge_provider_configs(self):
+        """Test tratis and inventories from provider configs are
+        correctly merged into provider tree via _merge_provider_configs()
+        """
+        # get both an explicit and a uuid=$COMPUTE_NODE provider config
+        provider = self._get_provider_config()
+        cn_provider = self._get_provider_config(uuid="$COMPUTE_NODE")
+
+        # ensure uuids.cn1 provider has COMPUTE_NODE trait
+        self.p_tree.add_traits(uuids.cn1, os_traits.COMPUTE_NODE)
+
+        # test that only the explicit traits and inventories are merged
+        self.rt._merge_provider_configs({"$COMPUTE_NODE": cn_provider,
+                                         uuids.cn1: provider}, self.p_tree)
+
+        expected_traits = {os_traits.COMPUTE_NODE,
+                           *provider['traits']['additional']}
+        actual_traits = self.p_tree.data(uuids.cn1).traits
+        self.assertEqual(expected_traits, actual_traits)
+
+        expected_inventory = provider['inventories']['additional'][0]
+        actual_inventory = self.p_tree.data(uuids.cn1).inventory
+        self.assertEqual(expected_inventory, actual_inventory)
+
+    def test_merge_provider_configs_dup_providers_exception(self):
+        """If _get_providers_to_update() returned two providers with the same
+        uuid, make sure exception will be raised.
+        """
+        provider = self._get_provider_config(uuid=uuids.cn1)
+
+        mock_gptu = mock.MagicMock()
+
+        # create duplicated providers for raising exception
+        mock_gptu.return_value = self.rt._get_providers_to_update(
+            uuids.cn1, self.p_tree, "test_provider_config.yaml"
+        ) * 2
+        self.rt._get_providers_to_update = mock_gptu
+
+        # it does not matter what to pass in
+        actual = self.assertRaises(
+            ValueError,
+            self.rt._merge_provider_configs, {uuids.cn1: provider}, self.p_tree
+        )
+
+        expected = ("Provider config 'test_provider_config.yaml' conflicts "
+                    "with provider config 'test_provider_config.yaml'. "
+                    "The same provider is specified using both name '" +
+                    uuids.cn1 + "' and uuid '" + uuids.cn1 + "'.")
+        self.assertEqual(expected, str(actual))
+
+    def test_merge_provider_configs_additional_traits_exception(self):
+        """If traits from provider config are duplicated with traits
+        from virt driver or placement api, make sure exception will be raised.
+        """
+        provider = self._get_provider_config(uuid=uuids.cn1)
+
+        # add the same trait in p_tree and provider config
+        # for raising exception
+        ex_trait = "EXCEPTION_TRAIT"
+        self.p_tree.add_traits(uuids.cn1, ex_trait)
+        provider["traits"]["additional"].append(ex_trait)
+
+        # add the same trait in p_tree and provider config
+        # for testing ignoring CUSTOM trait code logic.
+        # If a programmer accidently forgets to ignore (substract)
+        # existing custom traits, this test case will fail as we only expect
+        # "EXCEPTION_TRAIT" showed in ValueError exception rather than
+        # "EXCEPTION_TRAIT,CUSTOM_IGNORE_TRAIT"
+        ignore_trait = "CUSTOM_IGNORE_TRAIT"
+        self.p_tree.add_traits(uuids.cn1, ignore_trait)
+        provider["traits"]["additional"].append(ignore_trait)
+
+        expected = ("Provider config 'test_provider_config.yaml' attempts to "
+                    "define a trait that is owned by the virt driver or "
+                    "specified via the placment api. Invalid traits '" +
+                    ex_trait + "' must be removed from "
+                    "'test_provider_config.yaml'.")
+
+        actual = self.assertRaises(
+            ValueError,
+            self.rt._merge_provider_configs, {uuids.cn1: provider}, self.p_tree
+        )
+
+        self.assertEqual(expected, str(actual))
+
+    def test_merge_provider_configs_additional_inventories_exception(self):
+        """If inventories from provider config are already in provider tree,
+        make sure exception will be raised.
+        """
+        ex_key = 'EXCEPTION_INVENTORY'
+        ex_inventory = {ex_key: {
+                            'allocation_ratio': 1,
+                            'max_unit': 10,
+                            'min_unit': 1,
+                            'reserved': 0,
+                            'step_size': 1,
+                            'total': 100}
+                        }
+        provider = self._get_provider_config(uuid=uuids.cn1)
+
+        # add the same inventory in p_tree and provider config
+        # for raising exception
+        self.p_tree.update_inventory(uuids.cn1, ex_inventory)
+        provider["inventories"]["additional"].append(ex_inventory)
+
+        actual = self.assertRaises(
+            ValueError,
+            self.rt._merge_provider_configs, {uuids.cn1: provider}, self.p_tree
+        )
+
+        expected = ("Provider config 'test_provider_config.yaml' attempts to "
+                    "define an inventory that is owned by the virt driver. "
+                    "Invalid inventories '" + ex_key +
+                    "' must be removed from 'test_provider_config.yaml'.")
+
+        self.assertEqual(expected, str(actual))
+
+    def test__get_providers_to_update(self):
+        """Test specified provider will be found from provide tree.
+        """
+        provider = self._get_provider_config(uuid=uuids.cp1)
+
+        # add a new child provider with uuid from provider config
+        self.p_tree.new_child(uuids.cp1, uuids.cn1, uuid=uuids.cp1)
+
+        # test that only the child is found
+        results = [
+            provider.uuid for provider
+            in self.rt._get_providers_to_update(
+                uuids.cp1, self.p_tree, provider['__source_file'])]
+
+        self.assertEqual([uuids.cp1], results)
+
+    def test__get_providers_to_update_roots(self):
+        """Test _get_provider_config can correctly process $COMPUTE_NODE and
+        only return roots.
+        """
+        provider = self._get_provider_config(uuid="$compute_node")
+
+        # add some new roots with COMPUTE_NODE trait
+        cn_uuids = [self.p_tree.new_root(uuid, uuid)
+                    for uuid in [uuids.cn2, uuids.cn3, uuids.cn4]]
+        for cn_uuid in cn_uuids:
+            self.p_tree.add_traits(cn_uuid, os_traits.COMPUTE_NODE)
+
+        # add some children to each root
+        for cn_uuid in cn_uuids:
+            for i in range(3):
+                self.p_tree.new_child(cn_uuid + str(i), cn_uuid)
+
+        # test that only COMPUTE_NODE roots are found
+        results = [provider.uuid for provider
+                   in self.rt._get_providers_to_update(
+                "$COMPUTE_NODE", self.p_tree, provider['__source_file'])]
+
+        self.assertEqual(cn_uuids, results)
+
+    @mock.patch.object(resource_tracker, 'LOG')
+    def test__get_providers_to_update_not_in_tree(self, mock_log):
+        """If provider from provider config is not in provider tree,
+        make sure correct warning log will be recorded.
+        """
+        provider = self._get_provider_config(uuid=uuids.unknown)
+        expected_log_call = [
+            "Provider '%(uuid_or_name)s' specified in provider "
+            "config file '%(source_file)s' does not exist in "
+            "the ProviderTree and will be ignored.",
+            {"uuid_or_name": uuids.unknown,
+             "source_file": provider['__source_file']}]
+
+        # missing provider is only logged once when called twice
+        result = self.rt._get_providers_to_update(
+            uuids.unknown, self.p_tree, provider['__source_file'])
+        self.rt._get_providers_to_update(
+            uuids.unknown, self.p_tree, provider['__source_file'])
+        mock_log.warning.assert_called_once_with(*expected_log_call)
+        self.assertIn(uuids.unknown, self.rt.absent_providers)
+        self.assertEqual(result, [])
+
+        # returning provider is removed from absent providers and not logged
+        mock_log.warning.reset_mock()
+        self.p_tree.new_root(name=uuids.unknown, uuid=uuids.unknown)
+        result = self.rt._get_providers_to_update(
+            uuids.unknown, self.p_tree, provider['__source_file'])
+        mock_log.warning.assert_not_called()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].uuid, uuids.unknown)
+
+        # missing again provider is logged when called again
+        self.p_tree.remove(uuids.unknown)
+        result = self.rt._get_providers_to_update(
+            uuids.unknown, self.p_tree, provider['__source_file'])
+        mock_log.warning.assert_called_once_with(*expected_log_call)
+        self.assertIn(uuids.unknown, self.rt.absent_providers)
+        self.assertEqual(result, [])

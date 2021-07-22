@@ -23,12 +23,14 @@ import sys
 
 from nova.cmd import baseproxy
 import nova.conf
+from nova.conf import remote_debug
 from nova.conf import vnc
 from nova import config
 from nova.console.securityproxy import rfb
 
 
 CONF = nova.conf.CONF
+remote_debug.register_cli_opts(CONF)
 vnc.register_cli_opts(CONF)
 
 
@@ -37,13 +39,7 @@ def main():
     CONF.set_default('web', '/usr/share/novnc')
     config.parse_args(sys.argv)
 
-    # TODO(stephenfin): Always enable the security proxy once we support RFB
-    # version 3.3, as used in XenServer.
-    security_proxy = None
-    if CONF.compute_driver != 'xenapi.XenAPIDriver':
-        security_proxy = rfb.RFBSecurityProxy()
-
     baseproxy.proxy(
         host=CONF.vnc.novncproxy_host,
         port=CONF.vnc.novncproxy_port,
-        security_proxy=security_proxy)
+        security_proxy=rfb.RFBSecurityProxy())

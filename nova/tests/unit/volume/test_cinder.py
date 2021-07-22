@@ -14,6 +14,7 @@
 #    under the License.
 
 from cinderclient import api_versions as cinder_api_versions
+from cinderclient import apiclient as cinder_apiclient
 from cinderclient import exceptions as cinder_exception
 from cinderclient.v2 import limits as cinder_limits
 from keystoneauth1 import loading as ks_loading
@@ -22,7 +23,6 @@ from keystoneclient import exceptions as keystone_exception
 import mock
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
-import six
 
 import nova.conf
 from nova import context
@@ -217,7 +217,7 @@ class CinderApiTestCase(test.NoDBTestCase):
 
         ex = self.assertRaises(exception.NotFound,
                                self.api.create, self.ctx, 1, '', '')
-        self.assertEqual('Volume type can not be found.', six.text_type(ex))
+        self.assertEqual('Volume type can not be found.', str(ex))
 
     @mock.patch('nova.volume.cinder.cinderclient')
     def test_create_over_quota_failed(self, mock_cinderclient):
@@ -530,7 +530,7 @@ class CinderApiTestCase(test.NoDBTestCase):
                                attachment_id)
 
         self.assertEqual(404, ex.code)
-        self.assertIn(attachment_id, six.text_type(ex))
+        self.assertIn(attachment_id, str(ex))
 
     @mock.patch('nova.volume.cinder.cinderclient',
                 side_effect=exception.CinderAPIVersionNotAvailable(
@@ -545,6 +545,38 @@ class CinderApiTestCase(test.NoDBTestCase):
                           self.ctx, uuids.attachment_id)
         mock_cinderclient.assert_called_once_with(self.ctx, '3.44',
                                                   skip_version_check=True)
+
+    @mock.patch('nova.volume.cinder.cinderclient',
+                side_effect=cinder_apiclient.exceptions.InternalServerError)
+    def test_attachment_delete_internal_server_error(self, mock_cinderclient):
+
+        self.assertRaises(cinder_apiclient.exceptions.InternalServerError,
+                          self.api.attachment_delete,
+                          self.ctx, uuids.attachment_id)
+
+        self.assertEqual(5, mock_cinderclient.call_count)
+
+    @mock.patch('nova.volume.cinder.cinderclient')
+    def test_attachment_delete_internal_server_error_do_not_raise(
+                                                      self, mock_cinderclient):
+        # generate exception, and then have a normal return on the next retry
+        mock_cinderclient.return_value.attachments.delete.side_effect = [
+                         cinder_apiclient.exceptions.InternalServerError, None]
+
+        attachment_id = uuids.attachment
+        self.api.attachment_delete(self.ctx, attachment_id)
+
+        self.assertEqual(2, mock_cinderclient.call_count)
+
+    @mock.patch('nova.volume.cinder.cinderclient',
+                side_effect=cinder_exception.BadRequest(code=400))
+    def test_attachment_delete_bad_request_exception(self, mock_cinderclient):
+
+        self.assertRaises(exception.InvalidInput,
+                          self.api.attachment_delete,
+                          self.ctx, uuids.attachment_id)
+
+        self.assertEqual(1, mock_cinderclient.call_count)
 
     @mock.patch('nova.volume.cinder.cinderclient')
     def test_attachment_complete(self, mock_cinderclient):
@@ -571,7 +603,7 @@ class CinderApiTestCase(test.NoDBTestCase):
                                attachment_id)
 
         self.assertEqual(404, ex.code)
-        self.assertIn(attachment_id, six.text_type(ex))
+        self.assertIn(attachment_id, str(ex))
 
     @mock.patch('nova.volume.cinder.cinderclient',
                 side_effect=exception.CinderAPIVersionNotAvailable(
@@ -635,6 +667,38 @@ class CinderApiTestCase(test.NoDBTestCase):
         mock_cinderclient.assert_called_with(self.ctx, microversion=None)
         mock_volumes.detach.assert_called_once_with('id1', 'fakeid')
 
+    @mock.patch('nova.volume.cinder.cinderclient',
+                side_effect=cinder_apiclient.exceptions.InternalServerError)
+    def test_detach_internal_server_error(self, mock_cinderclient):
+
+        self.assertRaises(cinder_apiclient.exceptions.InternalServerError,
+                          self.api.detach,
+                          self.ctx, 'id1', instance_uuid='fake_uuid')
+
+        self.assertEqual(5, mock_cinderclient.call_count)
+
+    @mock.patch('nova.volume.cinder.cinderclient')
+    def test_detach_internal_server_error_do_not_raise(
+                                               self, mock_cinderclient):
+        # generate exception, and then have a normal return on the next retry
+        mock_cinderclient.return_value.volumes.detach.side_effect = [
+                        cinder_apiclient.exceptions.InternalServerError, None]
+
+        self.api.detach(self.ctx, 'id1', instance_uuid='fake_uuid',
+                        attachment_id='fakeid')
+
+        self.assertEqual(2, mock_cinderclient.call_count)
+
+    @mock.patch('nova.volume.cinder.cinderclient',
+                side_effect=cinder_exception.BadRequest(code=400))
+    def test_detach_bad_request_exception(self, mock_cinderclient):
+
+        self.assertRaises(exception.InvalidInput,
+                          self.api.detach,
+                          self.ctx, 'id1', instance_uuid='fake_uuid')
+
+        self.assertEqual(1, mock_cinderclient.call_count)
+
     @mock.patch('nova.volume.cinder.cinderclient')
     def test_attachment_get(self, mock_cinderclient):
         mock_attachment = mock.MagicMock()
@@ -660,7 +724,7 @@ class CinderApiTestCase(test.NoDBTestCase):
                                attachment_id)
 
         self.assertEqual(404, ex.code)
-        self.assertIn(attachment_id, six.text_type(ex))
+        self.assertIn(attachment_id, str(ex))
 
     @mock.patch('nova.volume.cinder.cinderclient',
                 side_effect=exception.CinderAPIVersionNotAvailable(
@@ -753,6 +817,38 @@ class CinderApiTestCase(test.NoDBTestCase):
         mock_cinderclient.assert_called_once_with(self.ctx)
         mock_volumes.terminate_connection.assert_called_once_with('id1',
                                                                   'connector')
+
+    @mock.patch('nova.volume.cinder.cinderclient',
+                side_effect=cinder_apiclient.exceptions.InternalServerError)
+    def test_terminate_connection_internal_server_error(
+                                                    self, mock_cinderclient):
+        self.assertRaises(cinder_apiclient.exceptions.InternalServerError,
+                          self.api.terminate_connection,
+                          self.ctx, 'id1', 'connector')
+
+        self.assertEqual(5, mock_cinderclient.call_count)
+
+    @mock.patch('nova.volume.cinder.cinderclient')
+    def test_terminate_connection_internal_server_error_do_not_raise(
+                                                    self, mock_cinderclient):
+        # generate exception, and then have a normal return on the next retry
+        mock_cinderclient.return_value.volumes.terminate_connection.\
+            side_effect = [cinder_apiclient.exceptions.InternalServerError,
+                           None]
+
+        self.api.terminate_connection(self.ctx, 'id1', 'connector')
+
+        self.assertEqual(2, mock_cinderclient.call_count)
+
+    @mock.patch('nova.volume.cinder.cinderclient',
+                side_effect=cinder_exception.BadRequest(code=400))
+    def test_terminate_connection_bad_request_exception(
+                                                    self, mock_cinderclient):
+        self.assertRaises(exception.InvalidInput,
+                          self.api.terminate_connection,
+                          self.ctx, 'id1', 'connector')
+
+        self.assertEqual(1, mock_cinderclient.call_count)
 
     @mock.patch('nova.volume.cinder.cinderclient')
     def test_delete(self, mock_cinderclient):

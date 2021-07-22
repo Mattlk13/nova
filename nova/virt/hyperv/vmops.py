@@ -41,6 +41,7 @@ from nova import exception
 from nova.i18n import _
 from nova import objects
 from nova.objects import fields
+from nova import version
 from nova.virt import configdrive
 from nova.virt import hardware
 from nova.virt.hyperv import block_device_manager
@@ -395,7 +396,8 @@ class VMOps(object):
                                 cpus_per_numa_node,
                                 CONF.hyperv.limit_cpu_features,
                                 dynamic_memory_ratio,
-                                host_shutdown_action=host_shutdown_action)
+                                host_shutdown_action=host_shutdown_action,
+                                chassis_asset_tag=version.product_string())
 
         self._configure_remotefx(instance, vm_gen)
 
@@ -464,7 +466,13 @@ class VMOps(object):
         memory_per_numa_node = instance_topology.cells[0].memory
         cpus_per_numa_node = len(instance_topology.cells[0].cpuset)
 
-        if instance_topology.cpu_pinning_requested:
+        # TODO(stephenfin): We can avoid this check entirely if we rely on the
+        # 'supports_pcpus' driver capability (via a trait), but we need to drop
+        # support for the legacy 'vcpu_pin_set' path in the libvirt driver
+        # first
+        if instance_topology.cpu_policy not in (
+            None, fields.CPUAllocationPolicy.SHARED,
+        ):
             raise exception.InstanceUnacceptable(
                 reason=_("Hyper-V does not support CPU pinning."),
                 instance_id=instance.uuid)
@@ -650,7 +658,7 @@ class VMOps(object):
 
         inst_md = instance_metadata.InstanceMetadata(
                       instance, content=injected_files, extra_md=extra_md,
-                      network_info=network_info, request_context=context)
+                      network_info=network_info)
 
         configdrive_path_iso = self._pathutils.get_configdrive_path(
             instance.name, constants.DVD_FORMAT, rescue=rescue)
@@ -745,8 +753,7 @@ class VMOps(object):
                 self._delete_disk_files(instance_name)
         except Exception:
             with excutils.save_and_reraise_exception():
-                LOG.exception(_('Failed to destroy instance: %s'),
-                              instance_name)
+                LOG.exception('Failed to destroy instance: %s', instance_name)
 
     def reboot(self, instance, network_info, reboot_type):
         """Reboot the specified instance."""

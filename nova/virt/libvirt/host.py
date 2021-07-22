@@ -28,46 +28,53 @@ the other libvirt related classes
 """
 
 from collections import defaultdict
+import fnmatch
+import glob
 import inspect
 import operator
 import os
+import queue
 import socket
-import sys
 import threading
-import traceback
+import typing as ty
 
 from eventlet import greenio
 from eventlet import greenthread
 from eventlet import patcher
 from eventlet import tpool
 from oslo_log import log as logging
-from oslo_utils import encodeutils
+from oslo_serialization import jsonutils
 from oslo_utils import excutils
 from oslo_utils import importutils
 from oslo_utils import units
 from oslo_utils import versionutils
-import six
 
 from nova.compute import utils as compute_utils
 import nova.conf
 from nova import context as nova_context
 from nova import exception
 from nova.i18n import _
+from nova.objects import fields
+from nova.pci import utils as pci_utils
 from nova import rpc
 from nova import utils
 from nova.virt import event as virtevent
 from nova.virt.libvirt import config as vconfig
+from nova.virt.libvirt import event as libvirtevent
 from nova.virt.libvirt import guest as libvirt_guest
 from nova.virt.libvirt import migration as libvirt_migrate
 from nova.virt.libvirt import utils as libvirt_utils
 
-libvirt = None
+if ty.TYPE_CHECKING:
+    import libvirt
+else:
+    libvirt = None
 
 LOG = logging.getLogger(__name__)
 
 native_socket = patcher.original('socket')
 native_threading = patcher.original("threading")
-native_Queue = patcher.original("Queue" if six.PY2 else "queue")
+native_Queue = patcher.original("queue")
 
 CONF = nova.conf.CONF
 
@@ -75,9 +82,38 @@ CONF = nova.conf.CONF
 # This list is for libvirt hypervisor drivers that need special handling.
 # This is *not* the complete list of supported hypervisor drivers.
 HV_DRIVER_QEMU = "QEMU"
-HV_DRIVER_XEN = "Xen"
 
 SEV_KERNEL_PARAM_FILE = '/sys/module/kvm_amd/parameters/sev'
+
+# These are taken from the spec
+# https://github.com/qemu/qemu/blob/v5.2.0/docs/interop/firmware.json
+QEMU_FIRMWARE_DESCRIPTOR_PATHS = [
+    '/usr/share/qemu/firmware',
+    '/etc/qemu/firmware',
+    # we intentionally ignore '$XDG_CONFIG_HOME/qemu/firmware'
+]
+
+
+def _get_loaders():
+    if not any(
+        os.path.exists(path) for path in QEMU_FIRMWARE_DESCRIPTOR_PATHS
+    ):
+        msg = _("Failed to locate firmware descriptor files")
+        raise exception.InternalError(msg)
+
+    _loaders = []
+
+    for path in QEMU_FIRMWARE_DESCRIPTOR_PATHS:
+        if not os.path.exists(path):
+            continue
+
+        for spec_path in sorted(glob.glob(f'{path}/*.json')):
+            with open(spec_path, 'rb') as fh:
+                spec = jsonutils.load(fh)
+
+            _loaders.append(spec)
+
+    return _loaders
 
 
 class Host(object):
@@ -94,7 +130,8 @@ class Host(object):
         self._read_only = read_only
         self._initial_connection = True
         self._conn_event_handler = conn_event_handler
-        self._conn_event_handler_queue = six.moves.queue.Queue()
+        self._conn_event_handler_queue: queue.Queue[ty.Callable] = (
+          queue.Queue())
         self._lifecycle_event_handler = lifecycle_event_handler
         self._caps = None
         self._domain_caps = None
@@ -102,7 +139,7 @@ class Host(object):
 
         self._wrapped_conn = None
         self._wrapped_conn_lock = threading.Lock()
-        self._event_queue = None
+        self._event_queue: ty.Optional[queue.Queue[ty.Callable]] = None
 
         self._events_delayed = {}
         # Note(toabctl): During a reboot of a domain, STOPPED and
@@ -115,25 +152,29 @@ class Host(object):
         self._libvirt_proxy_classes = self._get_libvirt_proxy_classes(libvirt)
         self._libvirt_proxy = self._wrap_libvirt_proxy(libvirt)
 
-        # AMD SEV is conditional on support in the hardware, kernel,
-        # qemu, and libvirt.  This is determined on demand and
-        # memoized by the supports_amd_sev property below.
-        self._supports_amd_sev = None
+        self._loaders: ty.Optional[ty.List[dict]] = None
 
-        self._has_hyperthreading = None
+        # A number of features are conditional on support in the hardware,
+        # kernel, QEMU, and/or libvirt. These are determined on demand and
+        # memoized by various properties below
+        self._supports_amd_sev: ty.Optional[bool] = None
+        self._supports_uefi: ty.Optional[bool] = None
+        self._supports_secure_boot: ty.Optional[bool] = None
+
+        self._has_hyperthreading: ty.Optional[bool] = None
 
     @staticmethod
     def _get_libvirt_proxy_classes(libvirt_module):
         """Return a tuple for tpool.Proxy's autowrap argument containing all
-        classes defined by the libvirt module except libvirtError.
+        public vir* classes defined by the libvirt module.
         """
 
         # Get a list of (name, class) tuples of libvirt classes
         classes = inspect.getmembers(libvirt_module, inspect.isclass)
 
-        # Return a list of just the classes, filtering out libvirtError because
-        # we don't need to proxy that
-        return tuple([cls[1] for cls in classes if cls[0] != 'libvirtError'])
+        # Return a list of just the vir* classes, filtering out libvirtError
+        # and any private globals pointing at private internal classes.
+        return tuple([cls[1] for cls in classes if cls[0].startswith("vir")])
 
     def _wrap_libvirt_proxy(self, obj):
         """Return an object wrapped in a tpool.Proxy using autowrap appropriate
@@ -190,9 +231,35 @@ class Host(object):
         try:
             handler()
         except Exception:
-            LOG.exception(_('Exception handling connection event'))
+            LOG.exception('Exception handling connection event')
         finally:
             self._conn_event_handler_queue.task_done()
+
+    @staticmethod
+    def _event_device_removed_callback(conn, dom, dev, opaque):
+        """Receives device removed events from libvirt.
+
+        NB: this method is executing in a native thread, not
+        an eventlet coroutine. It can only invoke other libvirt
+        APIs, or use self._queue_event(). Any use of logging APIs
+        in particular is forbidden.
+        """
+        self = opaque
+        uuid = dom.UUIDString()
+        self._queue_event(libvirtevent.DeviceRemovedEvent(uuid, dev))
+
+    @staticmethod
+    def _event_device_removal_failed_callback(conn, dom, dev, opaque):
+        """Receives device removed events from libvirt.
+
+        NB: this method is executing in a native thread, not
+        an eventlet coroutine. It can only invoke other libvirt
+        APIs, or use self._queue_event(). Any use of logging APIs
+        in particular is forbidden.
+        """
+        self = opaque
+        uuid = dom.UUIDString()
+        self._queue_event(libvirtevent.DeviceRemovalFailedEvent(uuid, dev))
 
     @staticmethod
     def _event_lifecycle_callback(conn, dom, event, detail, opaque):
@@ -322,10 +389,15 @@ class Host(object):
         # Process as many events as possible without
         # blocking
         last_close_event = None
+        # required for mypy
+        if self._event_queue is None:
+            return
         while not self._event_queue.empty():
             try:
-                event = self._event_queue.get(block=False)
-                if isinstance(event, virtevent.LifecycleEvent):
+                event_type = ty.Union[
+                    virtevent.InstanceEvent, ty.Mapping[str, ty.Any]]
+                event: event_type = self._event_queue.get(block=False)
+                if issubclass(type(event), virtevent.InstanceEvent):
                     # call possibly with delay
                     self._event_emit_delayed(event)
 
@@ -359,10 +431,10 @@ class Host(object):
         if event.uuid in self._events_delayed.keys():
             self._events_delayed[event.uuid].cancel()
             self._events_delayed.pop(event.uuid, None)
-            LOG.debug("Removed pending event for %s due to "
-                      "lifecycle event", event.uuid)
+            LOG.debug("Removed pending event for %s due to event", event.uuid)
 
-        if event.transition == virtevent.EVENT_LIFECYCLE_STOPPED:
+        if (isinstance(event, virtevent.LifecycleEvent) and
+            event.transition == virtevent.EVENT_LIFECYCLE_STOPPED):
             # Delay STOPPED event, as they may be followed by a STARTED
             # event in case the instance is rebooting
             id_ = greenthread.spawn_after(self._lifecycle_delay,
@@ -436,6 +508,16 @@ class Host(object):
                 libvirt.VIR_DOMAIN_EVENT_ID_LIFECYCLE,
                 self._event_lifecycle_callback,
                 self)
+            wrapped_conn.domainEventRegisterAny(
+                None,
+                libvirt.VIR_DOMAIN_EVENT_ID_DEVICE_REMOVED,
+                self._event_device_removed_callback,
+                self)
+            wrapped_conn.domainEventRegisterAny(
+                None,
+                libvirt.VIR_DOMAIN_EVENT_ID_DEVICE_REMOVAL_FAILED,
+                self._event_device_removal_failed_callback,
+                self)
         except Exception as e:
             LOG.warning("URI %(uri)s does not support events: %(error)s",
                         {'uri': self._uri, 'error': e})
@@ -503,17 +585,15 @@ class Host(object):
         try:
             conn = self._get_connection()
         except libvirt.libvirtError as ex:
-            LOG.exception(_("Connection to libvirt failed: %s"), ex)
-            payload = dict(ip=CONF.my_ip,
-                           method='_connect',
-                           reason=ex)
+            LOG.exception("Connection to libvirt failed: %s", ex)
+            payload = {'ip': CONF.my_ip, 'method': '_connect', 'reason': ex}
             ctxt = nova_context.get_admin_context()
             rpc.get_notifier('compute').error(ctxt,
                                               'compute.libvirt.error',
                                               payload)
             compute_utils.notify_about_libvirt_connect_error(
-                ctxt, ip=CONF.my_ip, exception=ex, tb=traceback.format_exc())
-            raise exception.HypervisorUnavailable(host=CONF.host)
+                ctxt, ip=CONF.my_ip, exception=ex)
+            raise exception.HypervisorUnavailable()
 
         return conn
 
@@ -616,31 +696,27 @@ class Host(object):
                     'ex': ex})
             raise exception.InternalError(msg)
 
-    def list_guests(self, only_running=True, only_guests=True):
+    def list_guests(self, only_running=True):
         """Get a list of Guest objects for nova instances
 
         :param only_running: True to only return running instances
-        :param only_guests: True to filter out any host domain (eg Dom-0)
 
         See method "list_instance_domains" for more information.
 
         :returns: list of Guest objects
         """
-        return [libvirt_guest.Guest(dom) for dom in self.list_instance_domains(
-            only_running=only_running, only_guests=only_guests)]
+        domains = self.list_instance_domains(only_running=only_running)
+        return [libvirt_guest.Guest(dom) for dom in domains]
 
-    def list_instance_domains(self, only_running=True, only_guests=True):
+    def list_instance_domains(self, only_running=True):
         """Get a list of libvirt.Domain objects for nova instances
 
         :param only_running: True to only return running instances
-        :param only_guests: True to filter out any host domain (eg Dom-0)
 
         Query libvirt to a get a list of all libvirt.Domain objects
         that correspond to nova instances. If the only_running parameter
         is true this list will only include active domains, otherwise
-        inactive domains will be included too. If the only_guests parameter
-        is true the list will have any "host" domain (aka Xen Domain-0)
-        filtered out.
+        inactive domains will be included too.
 
         :returns: list of libvirt.Domain objects
         """
@@ -656,8 +732,6 @@ class Host(object):
 
         doms = []
         for dom in alldoms:
-            if only_guests and dom.ID() == 0:
-                continue
             doms.append(dom)
 
         return doms
@@ -701,35 +775,41 @@ class Host(object):
 
         :returns: a config.LibvirtConfigCaps object
         """
-        if not self._caps:
-            xmlstr = self.get_connection().getCapabilities()
-            self._log_host_capabilities(xmlstr)
-            self._caps = vconfig.LibvirtConfigCaps()
-            self._caps.parse_str(xmlstr)
-            # NOTE(mriedem): Don't attempt to get baseline CPU features
-            # if libvirt can't determine the host cpu model.
-            if (hasattr(libvirt,
-                        'VIR_CONNECT_BASELINE_CPU_EXPAND_FEATURES') and
-                    self._caps.host.cpu.model is not None):
-                try:
-                    xml_str = self._caps.host.cpu.to_xml()
-                    if six.PY3 and isinstance(xml_str, six.binary_type):
-                        xml_str = xml_str.decode('utf-8')
-                    features = self.get_connection().baselineCPU(
-                        [xml_str],
-                        libvirt.VIR_CONNECT_BASELINE_CPU_EXPAND_FEATURES)
-                    if features:
-                        cpu = vconfig.LibvirtConfigCPU()
-                        cpu.parse_str(features)
-                        self._caps.host.cpu.features = cpu.features
-                except libvirt.libvirtError as ex:
-                    error_code = ex.get_error_code()
-                    if error_code == libvirt.VIR_ERR_NO_SUPPORT:
-                        LOG.warning("URI %(uri)s does not support full set"
-                                    " of host capabilities: %(error)s",
-                                     {'uri': self._uri, 'error': ex})
-                    else:
-                        raise
+        if self._caps:
+            return self._caps
+
+        xmlstr = self.get_connection().getCapabilities()
+        self._log_host_capabilities(xmlstr)
+        self._caps = vconfig.LibvirtConfigCaps()
+        self._caps.parse_str(xmlstr)
+
+        # NOTE(mriedem): Don't attempt to get baseline CPU features
+        # if libvirt can't determine the host cpu model.
+        if (
+            hasattr(libvirt, 'VIR_CONNECT_BASELINE_CPU_EXPAND_FEATURES') and
+            self._caps.host.cpu.model is not None
+        ):
+            try:
+                xml_str = self._caps.host.cpu.to_xml()
+                if isinstance(xml_str, bytes):
+                    xml_str = xml_str.decode('utf-8')
+                features = self.get_connection().baselineCPU(
+                    [xml_str],
+                    libvirt.VIR_CONNECT_BASELINE_CPU_EXPAND_FEATURES)
+                if features:
+                    cpu = vconfig.LibvirtConfigCPU()
+                    cpu.parse_str(features)
+                    self._caps.host.cpu.features = cpu.features
+            except libvirt.libvirtError as ex:
+                error_code = ex.get_error_code()
+                if error_code == libvirt.VIR_ERR_NO_SUPPORT:
+                    LOG.warning(
+                        "URI %(uri)s does not support full set of host "
+                        "capabilities: %(error)s",
+                        {'uri': self._uri, 'error': ex})
+                else:
+                    raise
+
         return self._caps
 
     def get_domain_capabilities(self):
@@ -802,18 +882,14 @@ class Host(object):
         _domain_caps.
 
         :returns: a nested dict of dicts which maps architectures to
-        machine types to instances of config.LibvirtConfigDomainCaps
-        representing the domain capabilities of the host for that arch
-        and machine type:
-
-        { arch:
-          { machine_type: LibvirtConfigDomainCaps }
-        }
+            machine types to instances of config.LibvirtConfigDomainCaps
+            representing the domain capabilities of the host for that arch and
+            machine type: ``{arch:  machine_type: LibvirtConfigDomainCaps}{``
         """
         if self._domain_caps:
             return self._domain_caps
 
-        domain_caps = defaultdict(dict)
+        domain_caps: ty.Dict = defaultdict(dict)
         caps = self.get_capabilities()
         virt_type = CONF.libvirt.virt_type
 
@@ -1000,24 +1076,30 @@ class Host(object):
             if e.get_error_code() == libvirt.VIR_ERR_NO_SECRET:
                 return None
 
-    def create_secret(self, usage_type, usage_id, password=None):
+    def create_secret(self, usage_type, usage_id, password=None, uuid=None):
         """Create a secret.
 
-        :param usage_type: one of 'iscsi', 'ceph', 'rbd' or 'volume'
-                           'rbd' will be converted to 'ceph'.
+        :param usage_type: one of 'iscsi', 'ceph', 'rbd', 'volume', 'vtpm'.
+                           'rbd' will be converted to 'ceph'. 'vtpm' secrets
+                           are private and ephemeral; others are not.
         :param usage_id: name of resource in secret
         :param password: optional secret value to set
+        :param uuid: optional UUID of the secret; else one is generated by
+            libvirt
         """
         secret_conf = vconfig.LibvirtConfigSecret()
-        secret_conf.ephemeral = False
-        secret_conf.private = False
+        secret_conf.ephemeral = usage_type == 'vtpm'
+        secret_conf.private = usage_type == 'vtpm'
         secret_conf.usage_id = usage_id
+        secret_conf.uuid = uuid
         if usage_type in ('rbd', 'ceph'):
             secret_conf.usage_type = 'ceph'
         elif usage_type == 'iscsi':
             secret_conf.usage_type = 'iscsi'
         elif usage_type == 'volume':
             secret_conf.usage_type = 'volume'
+        elif usage_type == 'vtpm':
+            secret_conf.usage_type = 'vtpm'
         else:
             msg = _("Invalid usage_type: %s")
             raise exception.InternalError(msg % usage_type)
@@ -1037,8 +1119,8 @@ class Host(object):
     def delete_secret(self, usage_type, usage_id):
         """Delete a secret.
 
-        usage_type: one of 'iscsi', 'ceph', 'rbd' or 'volume'
-        usage_id: name of resource in secret
+        :param usage_type: one of 'iscsi', 'ceph', 'rbd', 'volume' or 'vtpm'
+        :param usage_id: name of resource in secret
         """
         secret = self.find_secret(usage_type, usage_id)
         if secret is not None:
@@ -1061,14 +1143,10 @@ class Host(object):
         else:
             return self._get_hardware_info()[1]
 
-    def _sum_domain_memory_mb(self, include_host=True):
-        """Get the total memory consumed by guest domains
-
-        If include_host is True, subtract available host memory from guest 0
-        to get real used memory within dom0 within xen
-        """
+    def _sum_domain_memory_mb(self):
+        """Get the total memory consumed by guest domains."""
         used = 0
-        for guest in self.list_guests(only_guests=False):
+        for guest in self.list_guests():
             try:
                 # TODO(sahid): Use get_info...
                 dom_mem = int(guest._get_domain_info()[2])
@@ -1077,12 +1155,7 @@ class Host(object):
                             " %(uuid)s, exception: %(ex)s",
                             {"uuid": guest.uuid, "ex": e})
                 continue
-            if include_host and guest.id == 0:
-                # Memory usage for the host domain (dom0 in xen) is the
-                # reported memory minus available memory
-                used += (dom_mem - self._get_avail_memory_kb())
-            else:
-                used += dom_mem
+            used += dom_mem
         # Convert it to MB
         return used // units.Ki
 
@@ -1103,16 +1176,10 @@ class Host(object):
 
         :returns: the total usage of memory(MB).
         """
-        if sys.platform.upper() not in ['LINUX2', 'LINUX3']:
-            return 0
-
-        if CONF.libvirt.virt_type == 'xen':
-            # For xen, report the sum of all domains, with
-            return self._sum_domain_memory_mb(include_host=True)
-        elif CONF.libvirt.file_backed_memory > 0:
+        if CONF.libvirt.file_backed_memory > 0:
             # For file_backed_memory, report the total usage of guests,
             # ignoring host memory
-            return self._sum_domain_memory_mb(include_host=False)
+            return self._sum_domain_memory_mb()
         else:
             return (self.get_memory_mb_total() -
                    (self._get_avail_memory_kb() // units.Ki))
@@ -1133,8 +1200,6 @@ class Host(object):
 
         :returns: an instance of Guest
         """
-        if six.PY2:
-            xml = encodeutils.safe_encode(xml)
         domain = self.get_connection().defineXML(xml)
         return libvirt_guest.Guest(domain)
 
@@ -1145,6 +1210,175 @@ class Host(object):
         :returns: a virNodeDevice instance
         """
         return self.get_connection().nodeDeviceLookupByName(name)
+
+    def _get_pcinet_info(
+        self,
+        dev: 'libvirt.virNodeDevice',
+        net_devs: ty.List['libvirt.virNodeDevice']
+    ) -> ty.Optional[ty.List[str]]:
+        """Returns a dict of NET device."""
+        net_dev = {dev.parent(): dev for dev in net_devs}.get(dev.name(), None)
+        if net_dev is None:
+            return None
+        xmlstr = net_dev.XMLDesc(0)
+        cfgdev = vconfig.LibvirtConfigNodeDevice()
+        cfgdev.parse_str(xmlstr)
+        return cfgdev.pci_capability.features
+
+    def _get_pcidev_info(
+        self,
+        devname: str,
+        dev: 'libvirt.virNodeDevice',
+        net_devs: ty.List['libvirt.virNodeDevice'],
+        vdpa_devs: ty.List['libvirt.virNodeDevice'],
+    ) -> ty.Dict[str, ty.Union[str, dict]]:
+        """Returns a dict of PCI device."""
+
+        def _get_device_type(
+            cfgdev: vconfig.LibvirtConfigNodeDevice,
+            pci_address: str,
+            device: 'libvirt.virNodeDevice',
+            net_devs: ty.List['libvirt.virNodeDevice'],
+            vdpa_devs: ty.List['libvirt.virNodeDevice'],
+        ) -> ty.Dict[str, str]:
+            """Get a PCI device's device type.
+
+            An assignable PCI device can be a normal PCI device,
+            a SR-IOV Physical Function (PF), or a SR-IOV Virtual
+            Function (VF).
+            """
+            net_dev_parents = {dev.parent() for dev in net_devs}
+            vdpa_parents = {dev.parent() for dev in vdpa_devs}
+            for fun_cap in cfgdev.pci_capability.fun_capability:
+                if fun_cap.type == 'virt_functions':
+                    return {
+                        'dev_type': fields.PciDeviceType.SRIOV_PF,
+                    }
+                if (
+                    fun_cap.type == 'phys_function' and
+                    len(fun_cap.device_addrs) != 0
+                ):
+                    phys_address = "%04x:%02x:%02x.%01x" % (
+                        fun_cap.device_addrs[0][0],
+                        fun_cap.device_addrs[0][1],
+                        fun_cap.device_addrs[0][2],
+                        fun_cap.device_addrs[0][3])
+                    result = {
+                        'dev_type': fields.PciDeviceType.SRIOV_VF,
+                        'parent_addr': phys_address,
+                    }
+                    parent_ifname = None
+                    # NOTE(sean-k-mooney): if the VF is a parent of a netdev
+                    # the PF should also have a netdev, however on some exotic
+                    # hardware such as Cavium ThunderX this may not be the case
+                    # see bug #1915255 for details. As such we wrap this in a
+                    # try except block.
+                    if device.name() in net_dev_parents:
+                        try:
+                            parent_ifname = (
+                                pci_utils.get_ifname_by_pci_address(
+                                    pci_address, pf_interface=True))
+                            result['parent_ifname'] = parent_ifname
+                        except exception.PciDeviceNotFoundById:
+                            # NOTE(sean-k-mooney): we ignore this error as it
+                            # is expected when the virtual function is not a
+                            # NIC or the VF does not have a parent PF with a
+                            # netdev. We do not log here as this is called
+                            # in a periodic task and that would be noisy at
+                            # debug level.
+                            pass
+                    if device.name() in vdpa_parents:
+                        result['dev_type'] = fields.PciDeviceType.VDPA
+                    return result
+
+            return {'dev_type': fields.PciDeviceType.STANDARD}
+
+        def _get_device_capabilities(
+            device_dict: dict,
+            device: 'libvirt.virNodeDevice',
+            net_devs: ty.List['libvirt.virNodeDevice']
+        ) -> ty.Dict[str, ty.Dict[str, ty.Any]]:
+            """Get PCI VF device's additional capabilities.
+
+            If a PCI device is a virtual function, this function reads the PCI
+            parent's network capabilities (must be always a NIC device) and
+            appends this information to the device's dictionary.
+            """
+            caps: ty.Dict[str, ty.Dict[str, ty.Any]] = {}
+
+            if device_dict.get('dev_type') == fields.PciDeviceType.SRIOV_VF:
+                pcinet_info = self._get_pcinet_info(device, net_devs)
+                if pcinet_info:
+                    return {'capabilities': {'network': pcinet_info}}
+            return caps
+
+        xmlstr = dev.XMLDesc(0)
+        cfgdev = vconfig.LibvirtConfigNodeDevice()
+        cfgdev.parse_str(xmlstr)
+
+        address = "%04x:%02x:%02x.%1x" % (
+            cfgdev.pci_capability.domain,
+            cfgdev.pci_capability.bus,
+            cfgdev.pci_capability.slot,
+            cfgdev.pci_capability.function)
+
+        device = {
+            "dev_id": cfgdev.name,
+            "address": address,
+            "product_id": "%04x" % cfgdev.pci_capability.product_id,
+            "vendor_id": "%04x" % cfgdev.pci_capability.vendor_id,
+            }
+
+        device["numa_node"] = cfgdev.pci_capability.numa_node
+
+        # requirement by DataBase Model
+        device['label'] = 'label_%(vendor_id)s_%(product_id)s' % device
+        device.update(
+            _get_device_type(cfgdev, address, dev, net_devs, vdpa_devs))
+        device.update(_get_device_capabilities(device, dev, net_devs))
+        return device
+
+    def get_vdpa_nodedev_by_address(
+        self, pci_address: str,
+    ) -> vconfig.LibvirtConfigNodeDevice:
+        """Finds a vDPA device by the parent VF PCI device address.
+
+        :param pci_address: Parent PCI device address
+        :returns: A libvirt nodedev representing the vDPA device
+        :raises: StopIteration if not found
+        """
+        dev_flags = (
+            libvirt.VIR_CONNECT_LIST_NODE_DEVICES_CAP_VDPA |
+            libvirt.VIR_CONNECT_LIST_NODE_DEVICES_CAP_PCI_DEV
+        )
+        devices = {
+            dev.name(): dev for dev in
+            self.list_all_devices(flags=dev_flags)}
+        vdpa_devs = [
+            dev for dev in devices.values() if "vdpa" in dev.listCaps()]
+        pci_info = [
+            self._get_pcidev_info(name, dev, [], vdpa_devs) for name, dev
+            in devices.items() if "pci" in dev.listCaps()]
+        parent_dev = next(
+            dev for dev in pci_info if dev['address'] == pci_address)
+        vdpa_dev = next(
+            dev for dev in vdpa_devs if dev.parent() == parent_dev['dev_id'])
+        xmlstr = vdpa_dev.XMLDesc(0)
+        cfgdev = vconfig.LibvirtConfigNodeDevice()
+        cfgdev.parse_str(xmlstr)
+        return cfgdev
+
+    def get_vdpa_device_path(
+        self, pci_address: str,
+    ) -> str:
+        """Finds a vDPA device path by the parent VF PCI device address.
+
+        :param pci_address: Parent PCI device address
+        :returns: Device path as string
+        :raises: StopIteration if not found
+        """
+        nodedev = self.get_vdpa_nodedev_by_address(pci_address)
+        return nodedev.vdpa_capability.dev_path
 
     def list_pci_devices(self, flags=0):
         """Lookup pci devices.
@@ -1184,6 +1418,20 @@ class Host(object):
             else:
                 raise
 
+    def list_all_devices(
+        self, flags: int = 0,
+    ) -> ty.List['libvirt.virNodeDevice']:
+        """Lookup devices.
+
+        :param flags: a bitmask of flags to filter the returned devices.
+        :returns: a list of virNodeDevice xml strings.
+        """
+        try:
+            return self.get_connection().listAllDevices(flags) or []
+        except libvirt.libvirtError as ex:
+            LOG.warning(ex)
+            return []
+
     def compare_cpu(self, xmlDesc, flags=0):
         """Compares the given CPU description with the host CPU."""
         return self.get_connection().compareCPU(xmlDesc, flags)
@@ -1205,8 +1453,36 @@ class Host(object):
         except IOError:
             return False
 
+    def get_canonical_machine_type(self, arch, machine) -> str:
+        """Resolve a machine type to its canonical representation.
+
+        Libvirt supports machine type aliases. On an x86 host the 'pc' machine
+        type is an alias for e.g. 'pc-1440fx-5.1'. Resolve the provided machine
+        type to its canonical representation so that it can be used for other
+        operations.
+
+        :param arch: The guest arch.
+        :param machine: The guest machine type.
+        :returns: The canonical machine type.
+        :raises: exception.InternalError if the machine type cannot be resolved
+            to its canonical representation.
+        """
+        for guest in self.get_capabilities().guests:
+            if guest.arch != arch:
+                continue
+
+            for domain in guest.domains:
+                if machine in guest.domains[domain].machines:
+                    return machine
+
+                if machine in guest.domains[domain].aliases:
+                    return guest.domains[domain].aliases[machine]['canonical']
+
+        msg = _('Invalid machine type: %s')
+        raise exception.InternalError(msg % machine)
+
     @property
-    def has_hyperthreading(self):
+    def has_hyperthreading(self) -> bool:
         """Determine if host CPU has SMT, a.k.a. HyperThreading.
 
         :return: True if the host has SMT enabled, else False.
@@ -1225,7 +1501,66 @@ class Host(object):
 
         return self._has_hyperthreading
 
-    def _kernel_supports_amd_sev(self):
+    @property
+    def supports_uefi(self) -> bool:
+        """Determine if the host supports UEFI bootloaders for guests.
+
+        This checks whether the feature is supported by *any* machine type.
+        This is only used for trait-reporting purposes and a machine
+        type-specific check should be used when creating guests.
+        """
+
+        if self._supports_uefi is not None:
+            return self._supports_uefi
+
+        # we only check the host architecture since nova doesn't support
+        # non-host architectures currently
+        arch = self.get_capabilities().host.cpu.arch
+        domain_caps = self.get_domain_capabilities()
+        for machine_type in domain_caps[arch]:
+            LOG.debug("Checking UEFI support for host arch (%s)", arch)
+            _domain_caps = domain_caps[arch][machine_type]
+            if _domain_caps.os.uefi_supported:
+                LOG.info('UEFI support detected')
+                self._supports_uefi = True
+                return True
+
+        LOG.debug('No UEFI support detected')
+        self._supports_uefi = False
+        return False
+
+    @property
+    def supports_secure_boot(self) -> bool:
+        """Determine if the host supports UEFI Secure Boot for guests.
+
+        This checks whether the feature is supported by *any* machine type.
+        This is only used for trait-reporting purposes and a machine
+        type-specific check should be used when creating guests.
+        """
+
+        if self._supports_secure_boot is not None:
+            return self._supports_secure_boot
+
+        # we only check the host architecture since the libvirt driver doesn't
+        # truely support non-host architectures currently
+        arch = self.get_capabilities().host.cpu.arch
+        domain_caps = self.get_domain_capabilities()
+        for machine_type in domain_caps[arch]:
+            LOG.debug(
+                "Checking secure boot support for host arch (%s)",
+                arch,
+            )
+            _domain_caps = domain_caps[arch][machine_type]
+            if _domain_caps.os.secure_boot_supported:
+                LOG.info('Secure Boot support detected')
+                self._supports_secure_boot = True
+                return True
+
+        LOG.debug('No Secure Boot support detected')
+        self._supports_secure_boot = False
+        return False
+
+    def _kernel_supports_amd_sev(self) -> bool:
         if not os.path.exists(SEV_KERNEL_PARAM_FILE):
             LOG.debug("%s does not exist", SEV_KERNEL_PARAM_FILE)
             return False
@@ -1236,28 +1571,29 @@ class Host(object):
             return contents == "1\n"
 
     @property
-    def supports_amd_sev(self):
-        """Returns a boolean indicating whether AMD SEV (Secure Encrypted
+    def supports_amd_sev(self) -> bool:
+        """Determine if the host supports AMD SEV for guests.
+
+        Returns a boolean indicating whether AMD SEV (Secure Encrypted
         Virtualization) is supported.  This is conditional on support
         in the hardware, kernel, qemu, and libvirt.
 
-        The result is memoized, since it is not expected to change
-        during the lifetime of a running nova-compute service; if the
-        hypervisor stack is changed or reconfigured in a way which
-        would affect the support, nova-compute should be restarted
-        anyway.
+        This checks whether the feature is supported by *any* machine type.
+        This is only used for trait-reporting purposes and a machine
+        type-specific check should be used when creating guests.
         """
-        if self._supports_amd_sev is None:
-            self._set_amd_sev_support()
-        return self._supports_amd_sev
+        if self._supports_amd_sev is not None:
+            return self._supports_amd_sev
 
-    def _set_amd_sev_support(self):
         self._supports_amd_sev = False
+
+        caps = self.get_capabilities()
+        if caps.host.cpu.arch != fields.Architecture.X86_64:
+            return self._supports_amd_sev
 
         if not self._kernel_supports_amd_sev():
             LOG.info("kernel doesn't support AMD SEV")
-            self._supports_amd_sev = False
-            return
+            return self._supports_amd_sev
 
         domain_caps = self.get_domain_capabilities()
         for arch in domain_caps:
@@ -1267,9 +1603,75 @@ class Host(object):
                 for feature in domain_caps[arch][machine_type].features:
                     feature_is_sev = isinstance(
                         feature, vconfig.LibvirtConfigDomainCapsFeatureSev)
-                    if (feature_is_sev and feature.supported):
+                    if feature_is_sev and feature.supported:
                         LOG.info("AMD SEV support detected")
                         self._supports_amd_sev = True
-                        return
+                        return self._supports_amd_sev
 
         LOG.debug("No AMD SEV support detected for any (arch, machine_type)")
+        return self._supports_amd_sev
+
+    @property
+    def loaders(self) -> ty.List[dict]:
+        """Retrieve details of loader configuration for the host.
+
+        Inspect the firmware metadata files provided by QEMU [1] to retrieve
+        information about the firmware supported by this host. Note that most
+        distros only publish this information for UEFI loaders currently.
+
+        This should be removed when libvirt correctly supports switching
+        between loaders with or without secure boot enabled [2].
+
+        [1] https://github.com/qemu/qemu/blob/v5.2.0/docs/interop/firmware.json
+        [2] https://bugzilla.redhat.com/show_bug.cgi?id=1906500
+
+        :returns: An ordered list of loader configuration dictionaries.
+        """
+        if self._loaders is not None:
+            return self._loaders
+
+        self._loaders = _get_loaders()
+        return self._loaders
+
+    def get_loader(
+        self,
+        arch: str,
+        machine: str,
+        has_secure_boot: bool,
+    ) -> ty.Tuple[str, str]:
+        """Get loader for the specified architecture and machine type.
+
+        :returns: A tuple of the bootloader executable path and the NVRAM
+            template path.
+        """
+
+        machine = self.get_canonical_machine_type(arch, machine)
+
+        for loader in self.loaders:
+            for target in loader['targets']:
+                if arch != target['architecture']:
+                    continue
+
+                for machine_glob in target['machines']:
+                    # the 'machines' attribute supports glob patterns (e.g.
+                    # 'pc-q35-*') so we need to resolve these
+                    if fnmatch.fnmatch(machine, machine_glob):
+                        break
+                else:
+                    continue
+
+                # if we've got this far, we have a match on the target
+                break
+            else:
+                continue
+
+            # if we request secure boot then we should get it and vice versa
+            if has_secure_boot != ('secure-boot' in loader['features']):
+                continue
+
+            return (
+                loader['mapping']['executable']['filename'],
+                loader['mapping']['nvram-template']['filename'],
+            )
+
+        raise exception.UEFINotSupported()

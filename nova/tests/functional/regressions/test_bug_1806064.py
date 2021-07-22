@@ -18,7 +18,6 @@ from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional import fixtures as func_fixtures
 from nova.tests.functional import integrated_helpers
-from nova.tests.unit import policy_fixture
 
 
 class BootFromVolumeOverQuotaRaceDeleteTest(
@@ -49,7 +48,7 @@ class BootFromVolumeOverQuotaRaceDeleteTest(
         self.cinder_fixture = self.useFixture(
             nova_fixtures.CinderFixture(self))
         # Use the standard fixtures.
-        self.useFixture(policy_fixture.RealPolicyFixture())
+        self.useFixture(nova_fixtures.RealPolicyFixture())
         self.useFixture(nova_fixtures.NeutronFixture(self))
         self.useFixture(func_fixtures.PlacementFixture())
         self.api = self.useFixture(nova_fixtures.OSAPIFixture(
@@ -88,7 +87,7 @@ class BootFromVolumeOverQuotaRaceDeleteTest(
         # but fails in conductor once the instance has been created in cell1.
         original_quota_check = compute_utils.check_num_instances_quota
 
-        def stub_check_num_instances_quota(_self, context, instance_type,
+        def stub_check_num_instances_quota(_self, context, flavor,
                                            min_count, *args, **kwargs):
             # Determine where we are in the flow based on whether or not the
             # min_count is 0 (API will pass 1, conductor will pass 0).
@@ -97,7 +96,7 @@ class BootFromVolumeOverQuotaRaceDeleteTest(
                     'test_bfv_quota_race_local_delete')
             # We're checking from the API so perform the original quota check.
             return original_quota_check(
-                _self, context, instance_type, min_count, *args, **kwargs)
+                _self, context, flavor, min_count, *args, **kwargs)
 
         self.stub_out('nova.compute.utils.check_num_instances_quota',
                       stub_check_num_instances_quota)

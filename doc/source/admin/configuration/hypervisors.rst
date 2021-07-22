@@ -2,17 +2,12 @@
 Hypervisors
 ===========
 
-.. TODO: Add UML (User-Mode Linux) hypervisor to the following list when its
-   dedicated documentation is ready.
-
 .. toctree::
    :maxdepth: 1
 
    hypervisor-basics
    hypervisor-kvm
    hypervisor-qemu
-   hypervisor-xen-api
-   hypervisor-xen-libvirt
    hypervisor-lxc
    hypervisor-vmware
    hypervisor-hyper-v
@@ -43,14 +38,6 @@ The following hypervisors are supported:
 * `VMware vSphere`_ 5.1.0 and newer - Runs VMware-based Linux and Windows
   images through a connection with a vCenter server.
 
-* `Xen (using libvirt)`_ - Xen Project Hypervisor using libvirt as
-  management interface into ``nova-compute`` to run Linux, Windows, FreeBSD and
-  NetBSD virtual machines.
-
-* `XenServer`_ - XenServer, Xen Cloud Platform (XCP) and other XAPI based Xen
-  variants runs Linux or Windows virtual machines. You must install the
-  ``nova-compute`` service in a para-virtualized VM.
-
 * `Hyper-V`_ - Server virtualization with Microsoft Hyper-V, use to run
   Windows, Linux, and FreeBSD virtual machines.  Runs ``nova-compute`` natively
   on the Windows virtualization platform.
@@ -65,21 +52,41 @@ The following hypervisors are supported:
 * `zVM`_ - Server virtualization on z Systems and IBM LinuxONE, it can run Linux,
   z/OS and more.
 
-* `UML`_ - User-Mode Linux is a safe, secure way of running Linux versions and Linux
-  processes.
-
 * `Ironic`_ - OpenStack project which provisions bare metal (as opposed to virtual)
   machines.
+
+
+Nova supports hypervisors via virt drivers. Nova has the following in tree
+virt drivers:
+
+* :oslo.config:option:`compute_driver` = ``libvirt.LibvirtDriver``
+
+  This driver runs on Linux and supports multiple hypervisor backends, which
+  can be configured via the :oslo.config:option:`libvirt.virt_type` config
+  option.
+
+* :oslo.config:option:`compute_driver` = ``ironic.IronicDriver``
+
+* :oslo.config:option:`compute_driver` = ``vmwareapi.VMwareVCDriver``
+
+* :oslo.config:option:`compute_driver` = ``hyperv.HyperVDriver``
+
+* :oslo.config:option:`compute_driver` = ``powervm.PowerVMDriver``
+
+* :oslo.config:option:`compute_driver` = ``zvm.ZVMDriver``
+
+* :oslo.config:option:`compute_driver` = ``fake.FakeDriver``
+
+  This driver does not spawn any virtual machines and therefore should only be
+  used during testing.
+
 
 .. _KVM: https://www.linux-kvm.org/page/Main_Page
 .. _LXC: https://linuxcontainers.org
 .. _QEMU: https://wiki.qemu.org/Manual
 .. _VMware vSphere: https://www.vmware.com/support/vsphere-hypervisor.html
-.. _Xen (using libvirt): https://www.xenproject.org
-.. _XenServer: https://xenserver.org
 .. _Hyper-V: https://docs.microsoft.com/en-us/windows-server/virtualization/hyper-v/hyper-v-technology-overview
 .. _Virtuozzo: https://www.virtuozzo.com/products/vz7.html
 .. _PowerVM: https://www.ibm.com/us-en/marketplace/ibm-powervm
 .. _zVM: https://www.ibm.com/it-infrastructure/z/zvm
-.. _UML: http://user-mode-linux.sourceforge.net
 .. _Ironic: https://docs.openstack.org/ironic/latest/

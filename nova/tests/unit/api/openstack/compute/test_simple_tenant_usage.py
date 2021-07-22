@@ -16,10 +16,8 @@
 import datetime
 
 import mock
-from oslo_policy import policy as oslo_policy
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
-from six.moves import range
 import webob
 
 from nova.api.openstack.compute import simple_tenant_usage as \
@@ -29,13 +27,10 @@ import nova.conf
 from nova import context
 from nova import exception
 from nova import objects
-from nova import policy
 from nova import test
 from nova.tests.unit.api.openstack import fakes
 
-
 CONF = nova.conf.CONF
-
 
 SERVERS = 5
 TENANTS = 2
@@ -48,29 +43,30 @@ NOW = timeutils.utcnow()
 START = NOW - datetime.timedelta(hours=HOURS)
 STOP = NOW
 
-
-FAKE_INST_TYPE = {'id': 1,
-                  'vcpus': VCPUS,
-                  'root_gb': ROOT_GB,
-                  'ephemeral_gb': EPHEMERAL_GB,
-                  'memory_mb': MEMORY_MB,
-                  'name': 'fakeflavor',
-                  'flavorid': 'foo',
-                  'rxtx_factor': 1.0,
-                  'vcpu_weight': 1,
-                  'swap': 0,
-                  'created_at': None,
-                  'updated_at': None,
-                  'deleted_at': None,
-                  'deleted': 0,
-                  'disabled': False,
-                  'is_public': True,
-                  'extra_specs': {'foo': 'bar'}}
+FAKE_FLAVOR = {
+    'id': 1,
+    'vcpus': VCPUS,
+    'root_gb': ROOT_GB,
+    'ephemeral_gb': EPHEMERAL_GB,
+    'memory_mb': MEMORY_MB,
+    'name': 'fakeflavor',
+    'flavorid': 'foo',
+    'rxtx_factor': 1.0,
+    'vcpu_weight': 1,
+    'swap': 0,
+    'created_at': None,
+    'updated_at': None,
+    'deleted_at': None,
+    'deleted': 0,
+    'disabled': False,
+    'is_public': True,
+    'extra_specs': {'foo': 'bar'},
+}
 
 
 def _fake_instance(start, end, instance_id, tenant_id,
                    vm_state=vm_states.ACTIVE):
-    flavor = objects.Flavor(**FAKE_INST_TYPE)
+    flavor = objects.Flavor(**FAKE_FLAVOR)
     return objects.Instance(
         deleted=False,
         id=instance_id,
@@ -79,7 +75,7 @@ def _fake_instance(start, end, instance_id, tenant_id,
         project_id=tenant_id,
         user_id='fakeuser',
         display_name='name',
-        instance_type_id=FAKE_INST_TYPE['id'],
+        instance_type_id=flavor.id,
         launched_at=start,
         terminated_at=end,
         vm_state=vm_state,
@@ -101,7 +97,7 @@ def _fake_instance_deleted_flavorless(context, start, end, instance_id,
         project_id=tenant_id,
         user_id='fakeuser',
         display_name='name',
-        instance_type_id=FAKE_INST_TYPE['id'],
+        instance_type_id=FAKE_FLAVOR['id'],
         launched_at=start,
         terminated_at=end,
         deleted_at=start,
@@ -316,24 +312,6 @@ class SimpleTenantUsageTestV21(test.TestCase):
             self.assertEqual('next', res_dict['tenant_usage_links'][0]['rel'])
         else:
             self.assertNotIn('tenant_usage_links', res_dict)
-
-    def test_verify_show_cannot_view_other_tenant(self):
-        req = fakes.HTTPRequest.blank('?start=%s&end=%s' %
-                    (START.isoformat(), STOP.isoformat()),
-                    version=self.version)
-        req.environ['nova.context'] = self.alt_user_context
-
-        rules = {
-            self.policy_rule_prefix + ":show": [
-                ["role:admin"], ["project_id:%(project_id)s"]]
-        }
-        policy.set_rules(oslo_policy.Rules.from_dict(rules))
-
-        try:
-            self.assertRaises(exception.PolicyNotAuthorized,
-                              self.controller.show, req, 'faketenant_0')
-        finally:
-            policy.reset()
 
     def test_get_tenants_usage_with_bad_start_date(self):
         future = NOW + datetime.timedelta(hours=HOURS)
@@ -611,7 +589,7 @@ class SimpleTenantUsageControllerTestV21(test.TestCase):
         self.inst_obj.deleted = 1
         flavor = self.controller._get_flavor(self.context, self.inst_obj, {})
         self.assertEqual(objects.Flavor, type(flavor))
-        self.assertEqual(FAKE_INST_TYPE['id'], flavor.id)
+        self.assertEqual(FAKE_FLAVOR['id'], flavor.id)
 
     @mock.patch('nova.objects.Instance.get_flavor',
                 side_effect=exception.NotFound())

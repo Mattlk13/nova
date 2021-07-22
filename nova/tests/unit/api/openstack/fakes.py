@@ -19,8 +19,6 @@ from oslo_serialization import jsonutils
 from oslo_utils import timeutils
 from oslo_utils import uuidutils
 import routes
-import six
-from six.moves import range
 import webob.dec
 
 from nova.api import auth as api_auth
@@ -62,23 +60,32 @@ def fake_wsgi(self, req):
 
 def wsgi_app_v21(fake_auth_context=None, v2_compatible=False,
                  custom_routes=None):
+    # NOTE(efried): Keep this (roughly) in sync with api-paste.ini
+
+    def wrap(app, use_context=False):
+        if v2_compatible:
+            app = openstack_api.LegacyV2CompatibleWrapper(app)
+
+        if use_context:
+            if fake_auth_context is not None:
+                ctxt = fake_auth_context
+            else:
+                ctxt = context.RequestContext(
+                    'fake', FAKE_PROJECT_ID, auth_token=True)
+            app = api_auth.InjectContext(ctxt, app)
+
+        app = openstack_api.FaultWrapper(app)
+
+        return app
 
     inner_app_v21 = compute.APIRouterV21(custom_routes=custom_routes)
 
-    if v2_compatible:
-        inner_app_v21 = openstack_api.LegacyV2CompatibleWrapper(inner_app_v21)
-
-    if fake_auth_context is not None:
-        ctxt = fake_auth_context
-    else:
-        ctxt = context.RequestContext(
-                'fake', FAKE_PROJECT_ID, auth_token=True)
-    api_v21 = openstack_api.FaultWrapper(
-          api_auth.InjectContext(ctxt, inner_app_v21))
     mapper = urlmap.URLMap()
-    mapper['/v2'] = api_v21
-    mapper['/v2.1'] = api_v21
-    mapper['/'] = openstack_api.FaultWrapper(versions.Versions())
+    mapper['/'] = wrap(versions.Versions())
+    mapper['/v2'] = wrap(versions.VersionsV2())
+    mapper['/v2.1'] = wrap(versions.VersionsV2())
+    mapper['/v2/+'] = wrap(inner_app_v21, use_context=True)
+    mapper['/v2.1/+'] = wrap(inner_app_v21, use_context=True)
     return mapper
 
 
@@ -323,7 +330,7 @@ def create_info_cache(nw_cache):
                                       {'cidr': 'b33f::/64',
                                        'ips': [_ip(ip) for ip in pub1]}]}}]
 
-    if not isinstance(nw_cache, six.string_types):
+    if not isinstance(nw_cache, str):
         nw_cache = jsonutils.dumps(nw_cache)
 
     return {
@@ -421,7 +428,7 @@ def fake_compute_get_all(num_servers=5, **kwargs):
 
 def stub_instance(id=1, user_id=None, project_id=None, host=None,
                   node=None, vm_state=None, task_state=None,
-                  reservation_id="", uuid=FAKE_UUID, image_ref="10",
+                  reservation_id="", uuid=FAKE_UUID, image_ref=FAKE_UUID,
                   flavor_id="1", name=None, key_name='',
                   access_ipv4=None, access_ipv6=None, progress=0,
                   auto_disk_config=False, display_name=None,
@@ -434,7 +441,7 @@ def stub_instance(id=1, user_id=None, project_id=None, host=None,
                   terminated_at=timeutils.utcnow(),
                   availability_zone='', locked_by=None, cleaned=False,
                   memory_mb=0, vcpus=0, root_gb=0, ephemeral_gb=0,
-                  instance_type=None, launch_index=0, kernel_id="",
+                  flavor=None, launch_index=0, kernel_id="",
                   ramdisk_id="", user_data=None, system_metadata=None,
                   services=None, trusted_certs=None, hidden=False):
     if user_id is None:
@@ -449,8 +456,8 @@ def stub_instance(id=1, user_id=None, project_id=None, host=None,
     else:
         metadata = []
 
-    inst_type = flavors.get_flavor_by_flavor_id(int(flavor_id))
-    sys_meta = flavors.save_flavor_info({}, inst_type)
+    sys_meta = flavors.save_flavor_info(
+        {}, flavors.get_flavor_by_flavor_id(int(flavor_id)))
     sys_meta.update(system_metadata or {})
 
     if host is not None:
@@ -474,11 +481,11 @@ def stub_instance(id=1, user_id=None, project_id=None, host=None,
 
     info_cache = create_info_cache(nw_cache)
 
-    if instance_type is None:
-        instance_type = objects.Flavor.get_by_name(
+    if flavor is None:
+        flavor = objects.Flavor.get_by_name(
             context.get_admin_context(), 'm1.small')
     flavorinfo = jsonutils.dumps({
-        'cur': instance_type.obj_to_primitive(),
+        'cur': flavor.obj_to_primitive(),
         'old': None,
         'new': None,
     })
@@ -494,62 +501,60 @@ def stub_instance(id=1, user_id=None, project_id=None, host=None,
         "image_ref": image_ref,
         "kernel_id": kernel_id,
         "ramdisk_id": ramdisk_id,
+        "hostname": display_name or server_name,
         "launch_index": launch_index,
         "key_name": key_name,
         "key_data": key_data,
-        "config_drive": config_drive,
+        "power_state": power_state,
         "vm_state": vm_state or vm_states.ACTIVE,
         "task_state": task_state,
-        "power_state": power_state,
+        "services": services,
         "memory_mb": memory_mb,
         "vcpus": vcpus,
         "root_gb": root_gb,
         "ephemeral_gb": ephemeral_gb,
         "ephemeral_key_uuid": None,
-        "hostname": display_name or server_name,
         "host": host,
         "node": node,
-        "instance_type_id": 1,
-        "instance_type": inst_type,
+        "instance_type_id": flavor.id,
         "user_data": user_data,
         "reservation_id": reservation_id,
-        "mac_address": "",
         "launched_at": launched_at,
         "terminated_at": terminated_at,
         "availability_zone": availability_zone,
         "display_name": display_name or server_name,
         "display_description": display_description,
+        "launched_on": "",
         "locked": locked_by is not None,
         "locked_by": locked_by,
-        "metadata": metadata,
+        "os_type": "",
+        "architecture": "",
+        "vm_mode": "",
+        "uuid": uuid,
+        "root_device_name": root_device_name,
+        "default_ephemeral_device": "",
+        "default_swap_device": "",
+        "config_drive": config_drive,
         "access_ip_v4": access_ipv4,
         "access_ip_v6": access_ipv6,
-        "uuid": uuid,
-        "progress": progress,
         "auto_disk_config": auto_disk_config,
-        "name": "instance-%s" % id,
+        "progress": progress,
         "shutdown_terminate": True,
         "disable_terminate": False,
-        "security_groups": security_groups,
-        "root_device_name": root_device_name,
-        "system_metadata": utils.dict_to_metadata(sys_meta),
-        "pci_devices": [],
-        "vm_mode": "",
-        "default_swap_device": "",
-        "default_ephemeral_device": "",
-        "launched_on": "",
         "cell_name": "",
-        "architecture": "",
-        "os_type": "",
+        "metadata": metadata,
+        "system_metadata": utils.dict_to_metadata(sys_meta),
+        "security_groups": security_groups,
+        "cleaned": cleaned,
+        "pci_devices": [],
         "extra": {"numa_topology": None,
                   "pci_requests": None,
                   "flavor": flavorinfo,
                   "trusted_certs": trusted_certs,
                   },
-        "cleaned": cleaned,
-        "services": services,
         "tags": [],
         "hidden": hidden,
+        "name": "instance-%s" % id,
     }
 
     instance.update(info_cache)

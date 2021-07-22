@@ -533,6 +533,7 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
         events = self._vmops._get_neutron_events(network_info)
         self.assertEqual([], events)
 
+    @mock.patch.object(vmops.version, 'product_string')
     @mock.patch.object(vmops.VMOps, '_attach_pci_devices')
     @mock.patch.object(vmops.VMOps, '_requires_secure_boot')
     @mock.patch.object(vmops.VMOps, '_requires_certificate')
@@ -554,6 +555,7 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
                               mock_requires_certificate,
                               mock_requires_secure_boot,
                               mock_attach_pci_devices,
+                              mock_product_string,
                               enable_instance_metrics,
                               vm_gen=constants.VM_GEN_1,
                               vnuma_enabled=False,
@@ -604,7 +606,8 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
             mock_instance.name, mock_instance.flavor.memory_mb, mem_per_numa,
             mock_instance.flavor.vcpus, cpus_per_numa,
             CONF.hyperv.limit_cpu_features, dynamic_memory_ratio,
-            host_shutdown_action=host_shutdown_action)
+            host_shutdown_action=host_shutdown_action,
+            chassis_asset_tag=mock_product_string.return_value)
 
         mock_configure_remotefx.assert_called_once_with(mock_instance, vm_gen)
         mock_create_scsi_ctrl = self._vmops._vmutils.create_scsi_controller
@@ -684,23 +687,27 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
                           mock_instance, image_meta)
 
     def test_get_instance_vnuma_config_bad_cpuset(self):
-        cell1 = objects.InstanceNUMACell(cpuset=set([0]), memory=1024)
-        cell2 = objects.InstanceNUMACell(cpuset=set([1, 2]), memory=1024)
+        cell1 = objects.InstanceNUMACell(
+            cpuset=set([0]), pcpuset=set(), memory=1024)
+        cell2 = objects.InstanceNUMACell(
+            cpuset=set([1, 2]), pcpuset=set(), memory=1024)
         self._check_get_instance_vnuma_config_exception(
             numa_cells=[cell1, cell2])
 
     def test_get_instance_vnuma_config_bad_memory(self):
-        cell1 = objects.InstanceNUMACell(cpuset=set([0]), memory=1024)
-        cell2 = objects.InstanceNUMACell(cpuset=set([1]), memory=2048)
+        cell1 = objects.InstanceNUMACell(
+            cpuset=set([0]), pcpuset=set(), memory=1024)
+        cell2 = objects.InstanceNUMACell(
+            cpuset=set([1]), pcpuset=set(), memory=2048)
         self._check_get_instance_vnuma_config_exception(
             numa_cells=[cell1, cell2])
 
     def test_get_instance_vnuma_config_cpu_pinning(self):
         cell1 = objects.InstanceNUMACell(
-            cpuset=set([0]), memory=1024,
+            cpuset=set([0]), pcpuset=set(), memory=1024,
             cpu_policy=fields.CPUAllocationPolicy.DEDICATED)
         cell2 = objects.InstanceNUMACell(
-            cpuset=set([1]), memory=1024,
+            cpuset=set([1]), pcpuset=set(), memory=1024,
             cpu_policy=fields.CPUAllocationPolicy.DEDICATED)
         self._check_get_instance_vnuma_config_exception(
             numa_cells=[cell1, cell2])
@@ -720,8 +727,10 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
         self.assertEqual(expected_mem_per_numa, result_memory_per_numa)
 
     def test_get_instance_vnuma_config(self):
-        cell1 = objects.InstanceNUMACell(cpuset=set([0]), memory=2048)
-        cell2 = objects.InstanceNUMACell(cpuset=set([1]), memory=2048)
+        cell1 = objects.InstanceNUMACell(
+            cpuset=set([0]), pcpuset=set(), memory=2048)
+        cell2 = objects.InstanceNUMACell(
+            cpuset=set([1]), pcpuset=set(), memory=2048)
         numa_topology = objects.InstanceNUMATopology(cells=[cell1, cell2])
         self._check_get_instance_vnuma_config(numa_topology=numa_topology,
                                               expected_cpus_per_numa=1,
@@ -980,8 +989,7 @@ class VMOpsTestCase(test_base.HyperVBaseTestCase):
             mock_InstanceMetadata.assert_called_once_with(
                 mock_instance, content=[mock.sentinel.FILE],
                 extra_md={'admin_pass': mock.sentinel.PASSWORD},
-                network_info=mock.sentinel.NET_INFO,
-                request_context=self.context)
+                network_info=mock.sentinel.NET_INFO)
             mock_get_configdrive_path.assert_has_calls(
                 expected_get_configdrive_path_calls)
             mock_ConfigDriveBuilder.assert_called_with(

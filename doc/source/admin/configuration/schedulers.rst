@@ -24,7 +24,7 @@ By default, the scheduler ``driver`` is configured as a filter scheduler, as
 described in the next section. In the default configuration, this scheduler
 considers hosts that meet all the following criteria:
 
-* Are in the requested :term:`availability zone` (``AvailabilityZoneFilter``).
+* Are in the requested :term:`Availability Zone` (``AvailabilityZoneFilter``).
 
 * Can service the request (``ComputeFilter``).
 
@@ -158,72 +158,18 @@ Compute filters
 
 The following sections describe the available compute filters.
 
-.. _AggregateCoreFilter:
-
-AggregateCoreFilter
--------------------
-
-.. deprecated:: 20.0.0
-
-  ``AggregateCoreFilter`` is deprecated since the 20.0.0 Train release.
-  As of the introduction of the placement service in Ocata, the behavior
-  of this filter :ref:`has changed <bug-1804125>` and no longer should be used.
-  In the 18.0.0 Rocky release nova `automatically mirrors`_ host aggregates
-  to placement aggregates.
-  In the 19.0.0 Stein release initial allocation ratios support was added
-  which allows management of the allocation ratios via the placement API in
-  addition to the existing capability to manage allocation ratios via the nova
-  config. See `Allocation ratios`_ for details.
-
-.. _`automatically mirrors`: https://specs.openstack.org/openstack/nova-specs/specs/rocky/implemented/placement-mirror-host-aggregates.html
-
-Filters host by CPU core count with a per-aggregate ``cpu_allocation_ratio``
-value. If the per-aggregate value is not found, the value falls back to the
-global setting.  If the host is in more than one aggregate and more than one
-value is found, the minimum value will be used.
-
-Refer to :doc:`/admin/aggregates` for more information.
-
-.. important::
-
-     Note the ``cpu_allocation_ratio`` :ref:`bug 1804125 <bug-1804125>`
-     restriction.
-
-
-.. _AggregateDiskFilter:
-
-AggregateDiskFilter
--------------------
-
-.. deprecated:: 20.0.0
-
-  ``AggregateDiskFilter`` is deprecated since the 20.0.0 Train release.
-  As of the introduction of the placement service in Ocata, the behavior
-  of this filter :ref:`has changed <bug-1804125>` and no longer should be used.
-  In the 18.0.0 Rocky release nova `automatically mirrors`_ host aggregates
-  to placement aggregates.
-  In the 19.0.0 Stein release initial allocation ratios support was added
-  which allows management of the allocation ratios via the placement API in
-  addition to the existing capability to manage allocation ratios via the nova
-  config. See `Allocation ratios`_ for details.
-
-Filters host by disk allocation with a per-aggregate ``disk_allocation_ratio``
-value. If the per-aggregate value is not found, the value falls back to the
-global setting.  If the host is in more than one aggregate and more than one
-value is found, the minimum value will be used.
-
-Refer to :doc:`/admin/aggregates` for more information.
-
-.. important::
-
-    Note the ``disk_allocation_ratio`` :ref:`bug 1804125 <bug-1804125>`
-    restriction.
-
-
 .. _AggregateImagePropertiesIsolation:
 
 AggregateImagePropertiesIsolation
 ---------------------------------
+
+.. versionchanged:: 12.0.0 (Liberty)
+
+    Prior to 12.0.0 Liberty, it was possible to specify and use arbitrary
+    metadata with this filter. Starting in Liberty, nova only parses
+    :glance-doc:`standard metadata <admin/useful-image-properties.html>`. If
+    you wish to use arbitrary metadata, consider using the
+    :ref:`AggregateInstanceExtraSpecsFilter` filter instead.
 
 Matches properties defined in an image's metadata against those of aggregates
 to determine host matches:
@@ -370,37 +316,6 @@ Refer to :doc:`/admin/aggregates` and :ref:`NumInstancesFilter` for more
 information.
 
 
-.. _AggregateRamFilter:
-
-AggregateRamFilter
-------------------
-
-.. deprecated:: 20.0.0
-
-  ``AggregateRamFilter`` is deprecated since the 20.0.0 Train release.
-  As of the introduction of the placement service in Ocata, the behavior
-  of this filter :ref:`has changed <bug-1804125>` and no longer should be used.
-  In the 18.0.0 Rocky release nova `automatically mirrors`_ host aggregates
-  to placement aggregates.
-  In the 19.0.0 Stein release initial allocation ratios support was added
-  which allows management of the allocation ratios via the placement API in
-  addition to the existing capability to manage allocation ratios via the nova
-  config. See `Allocation ratios`_ for details.
-
-Filters host by RAM allocation of instances with a per-aggregate
-``ram_allocation_ratio`` value. If the per-aggregate value is not found, the
-value falls back to the global setting.  If the host is in more than one
-aggregate and thus more than one value is found, the minimum value will be
-used.
-
-Refer to :doc:`/admin/aggregates` for more information.
-
-.. important::
-
-    Note the ``ram_allocation_ratio`` :ref:`bug 1804125 <bug-1804125>`
-    restriction.
-
-
 .. _AggregateTypeAffinityFilter:
 
 AggregateTypeAffinityFilter
@@ -507,7 +422,7 @@ ImagePropertiesFilter
 Filters hosts based on properties defined on the instance's image.  It passes
 hosts that can support the specified image properties contained in the
 instance. Properties include the architecture, hypervisor type, hypervisor
-version (for Xen hypervisor type only), and virtual machine mode.
+version, and virtual machine mode.
 
 For example, an instance might require a host that runs an ARM-based processor,
 and QEMU as the hypervisor.  You can decorate an image with these properties by
@@ -515,44 +430,59 @@ using:
 
 .. code-block:: console
 
-   $ openstack image set --architecture arm --property hypervisor_type=qemu \
+   $ openstack image set --architecture arm --property img_hv_type=qemu \
      img-uuid
 
 The image properties that the filter checks for are:
 
-``architecture``
-  describes the machine architecture required by the image.  Examples are
+``hw_architecture``
+  Describes the machine architecture required by the image.  Examples are
   ``i686``, ``x86_64``, ``arm``, and ``ppc64``.
 
-``hypervisor_type``
-  describes the hypervisor required by the image.  Examples are ``xen``,
-  ``qemu``, and ``xenapi``.
+  .. versionchanged:: 12.0.0 (Liberty)
+
+      This was previously called ``architecture``.
+
+``img_hv_type``
+  Describes the hypervisor required by the image.  Examples are ``qemu``
+  and ``hyperv``.
 
   .. note::
 
      ``qemu`` is used for both QEMU and KVM hypervisor types.
 
-``hypervisor_version_requires``
-  describes the hypervisor version required by the image.  The property is
-  supported for Xen hypervisor type only.  It can be used to enable support for
-  multiple hypervisor versions, and to prevent instances with newer Xen tools
+  .. versionchanged:: 12.0.0 (Liberty)
+
+      This was previously called ``hypervisor_type``.
+
+``img_hv_requested_version``
+  Describes the hypervisor version required by the image.  The property is
+  supported for HyperV hypervisor type only.  It can be used to enable support for
+  multiple hypervisor versions, and to prevent instances with newer HyperV tools
   from being provisioned on an older version of a hypervisor. If available, the
   property value is compared to the hypervisor version of the compute host.
 
   To filter the hosts by the hypervisor version, add the
-  ``hypervisor_version_requires`` property on the image as metadata and pass an
+  ``img_hv_requested_version`` property on the image as metadata and pass an
   operator and a required hypervisor version as its value:
 
   .. code-block:: console
 
-     $ openstack image set --property hypervisor_type=xen --property \
-       hypervisor_version_requires=">=4.3" img-uuid
+     $ openstack image set --property hypervisor_type=hyperv --property \
+       hypervisor_version_requires=">=6000" img-uuid
 
-``vm_mode``
+  .. versionchanged:: 12.0.0 (Liberty)
+
+      This was previously called ``hypervisor_version_requires``.
+
+``hw_vm_mode``
   describes the hypervisor application binary interface (ABI) required by the
   image. Examples are ``xen`` for Xen 3.0 paravirtual ABI, ``hvm`` for native
-  ABI, ``uml`` for User Mode Linux paravirtual ABI, ``exe`` for container virt
-  executable ABI.
+  ABI, and ``exe`` for container virt executable ABI.
+
+  .. versionchanged:: 12.0.0 (Liberty)
+
+      This was previously called ``vm_mode``.
 
 IsolatedHostsFilter
 -------------------
@@ -688,26 +618,6 @@ PciPassthroughFilter
 
 The filter schedules instances on a host if the host has devices that meet the
 device requests in the ``extra_specs`` attribute for the flavor.
-
-RetryFilter
------------
-
-.. deprecated:: 20.0.0
-
-   Since the 17.0.0 (Queens) release, the scheduler has provided alternate
-   hosts for rescheduling so the scheduler does not need to be called during
-   a reschedule which makes the ``RetryFilter`` useless. See the
-   `Return Alternate Hosts`_ spec for details.
-
-Filters out hosts that have already been attempted for scheduling purposes.  If
-the scheduler selects a host to respond to a service request, and the host
-fails to respond to the request, this filter prevents the scheduler from
-retrying that host for the service request.
-
-This filter is only useful if the :oslo.config:option:`scheduler.max_attempts`
-configuration option is set to a value greater than one.
-
-.. _Return Alternate Hosts: https://specs.openstack.org/openstack/nova-specs/specs/queens/implemented/return-alternate-hosts.html
 
 SameHostFilter
 --------------
@@ -971,13 +881,6 @@ file.  For example to configure metric1 with ratio1 and metric2 with ratio2:
 
    weight_setting = "metric1=ratio1, metric2=ratio2"
 
-XenServer hypervisor pools to support live migration
-----------------------------------------------------
-
-When using the XenAPI-based hypervisor, the Compute service uses host
-aggregates to manage XenServer Resource pools, which are used in supporting
-live migration.
-
 Allocation ratios
 ~~~~~~~~~~~~~~~~~
 
@@ -1012,23 +915,6 @@ The allocation ratio configuration is used both during reporting of compute
 node `resource provider inventory`_ to the placement service and during
 scheduling.
 
-.. _bug-1804125:
-
-.. note:: Regarding the `AggregateCoreFilter`_, `AggregateDiskFilter`_ and
-   `AggregateRamFilter`_, starting in 15.0.0 (Ocata) there is a behavior
-   change where aggregate-based overcommit ratios will no longer be honored
-   during scheduling for the FilterScheduler. Instead, overcommit values must
-   be set on a per-compute-node basis in the Nova configuration files.
-
-   If you have been relying on per-aggregate overcommit, during your upgrade,
-   you must change to using per-compute-node overcommit ratios in order for
-   your scheduling behavior to stay consistent. Otherwise, you may notice
-   increased NoValidHost scheduling failures as the aggregate-based overcommit
-   is no longer being considered.
-
-   See `bug 1804125 <https://bugs.launchpad.net/nova/+bug/1804125>`_ for more
-   details.
-
 .. _resource provider inventory: https://docs.openstack.org/api-ref/placement/?expanded=#resource-provider-inventories
 
 Usage scenarios
@@ -1058,9 +944,7 @@ here.
 
    .. code-block:: console
 
-     $ openstack resource provider inventory set --resource VCPU:allocation_ratio=1.0 815a5634-86fb-4e1e-8824-8a631fee3e06
-
-   Note the :ref:`bug 1804125 <bug-1804125>` restriction.
+     $ openstack resource provider inventory set --resource VCPU:allocation_ratio=1.0 --amend 815a5634-86fb-4e1e-8824-8a631fee3e06
 
 3. When the deployer wants to **always** use the placement API to set
    allocation ratios, then the deployer should ensure that
@@ -1096,19 +980,6 @@ HyperV
     :oslo.config:option:`reserved_host_disk_mb` config option to
     account for this overhead, based on the amount of memory available
     to instances.
-
-XenAPI
-    XenServer memory overhead is proportional to the size of the VM and larger
-    flavor VMs become more efficient with respect to overhead. This overhead
-    can be calculated using the following formula::
-
-      overhead (MB) = (instance.memory * 0.00781) + (instance.vcpus * 1.5) + 3
-
-    You should configure the
-    :oslo.config:option:`reserved_host_memory_mb` config option to
-    account for this overhead, based on the size of your hosts and
-    instances. For more information, refer to
-    https://wiki.openstack.org/wiki/XenServer/Overhead.
 
 Cells considerations
 ~~~~~~~~~~~~~~~~~~~~

@@ -24,7 +24,9 @@ inline callbacks.
 import nova.monkey_patch  # noqa
 
 import abc
+import builtins
 import collections
+import contextlib
 import copy
 import datetime
 import inspect
@@ -48,27 +50,21 @@ from oslo_utils import timeutils
 from oslo_versionedobjects import fixture as ovo_fixture
 from oslotest import base
 from oslotest import mock_fixture
-import six
-from six.moves import builtins
+from sqlalchemy.dialects import sqlite
 import testtools
 
+from nova.api.openstack import wsgi_app
 from nova.compute import rpcapi as compute_rpcapi
 from nova import context
+from nova.db.sqlalchemy import api as sqlalchemy_api
 from nova import exception
 from nova import objects
 from nova.objects import base as objects_base
 from nova import quota
 from nova.tests import fixtures as nova_fixtures
-from nova.tests.unit import conf_fixture
 from nova.tests.unit import matchers
-from nova.tests.unit import policy_fixture
 from nova import utils
 from nova.virt import images
-
-if six.PY2:
-    import contextlib2 as contextlib
-else:
-    import contextlib
 
 CONF = cfg.CONF
 
@@ -76,6 +72,7 @@ logging.register_options(CONF)
 CONF.set_override('use_stderr', False)
 logging.setup(CONF, 'nova')
 cache.configure(CONF)
+LOG = logging.getLogger(__name__)
 
 _TRUE_VALUES = ('True', 'true', '1', 'yes')
 CELL1_NAME = 'cell1'
@@ -96,6 +93,39 @@ class TestingException(Exception):
 mock_fixture.patch_mock_module()
 
 
+def _poison_unfair_compute_resource_semaphore_locking():
+    """Ensure that every locking on COMPUTE_RESOURCE_SEMAPHORE is called with
+    fair=True.
+    """
+    orig_synchronized = utils.synchronized
+
+    def poisoned_synchronized(*args, **kwargs):
+        # Only check fairness if the decorator is used with
+        # COMPUTE_RESOURCE_SEMAPHORE. But the name of the semaphore can be
+        # passed as args or as kwargs.
+        # Note that we cannot import COMPUTE_RESOURCE_SEMAPHORE as that would
+        # apply the decorators we want to poison here.
+        if len(args) >= 1:
+            name = args[0]
+        else:
+            name = kwargs.get("name")
+        if name == "compute_resources" and not kwargs.get("fair", False):
+            raise AssertionError(
+                'Locking on COMPUTE_RESOURCE_SEMAPHORE should always be fair. '
+                'See bug 1864122.')
+        # go and act like the original decorator
+        return orig_synchronized(*args, **kwargs)
+
+    # replace the synchronized decorator factory with our own that checks the
+    # params passed in
+    utils.synchronized = poisoned_synchronized
+
+
+# NOTE(gibi): This poisoning needs to be done in import time as decorators are
+# applied in import time on the ResourceTracker
+_poison_unfair_compute_resource_semaphore_locking()
+
+
 class NovaExceptionReraiseFormatError(object):
     real_log_exception = exception.NovaException._log_exception
 
@@ -107,7 +137,7 @@ class NovaExceptionReraiseFormatError(object):
     def _wrap_log_exception(self):
         exc_info = sys.exc_info()
         NovaExceptionReraiseFormatError.real_log_exception(self)
-        six.reraise(*exc_info)
+        raise exc_info[1]
 
 
 # NOTE(melwitt) This needs to be done at import time in order to also catch
@@ -174,7 +204,7 @@ class TestCase(base.BaseTestCase):
             self.fixture.config(lock_path=lock_path,
                                 group='oslo_concurrency')
 
-        self.useFixture(conf_fixture.ConfFixture(CONF))
+        self.useFixture(nova_fixtures.ConfFixture(CONF))
 
         if self.STUB_RPC:
             self.useFixture(nova_fixtures.RPCFixture('nova.test'))
@@ -200,6 +230,7 @@ class TestCase(base.BaseTestCase):
         context.CELL_CACHE = {}
         context.CELLS = []
 
+        self.computes = {}
         self.cell_mappings = {}
         self.host_mappings = {}
         # NOTE(danms): If the test claims to want to set up the database
@@ -231,7 +262,7 @@ class TestCase(base.BaseTestCase):
 
         self.addCleanup(self._clear_attrs)
         self.useFixture(fixtures.EnvironmentVariable('http_proxy'))
-        self.policy = self.useFixture(policy_fixture.PolicyFixture())
+        self.policy = self.useFixture(nova_fixtures.PolicyFixture())
 
         self.useFixture(nova_fixtures.PoisonFunctions())
 
@@ -249,6 +280,12 @@ class TestCase(base.BaseTestCase):
         # NOTE(melwitt): Reset the cached set of projects
         quota.UID_QFD_POPULATED_CACHE_BY_PROJECT = set()
         quota.UID_QFD_POPULATED_CACHE_ALL = False
+
+        self.useFixture(nova_fixtures.GenericPoisonFixture())
+
+        # make sure that the wsgi app is fully initialized for all testcase
+        # instead of only once initialized for test worker
+        wsgi_app.init_global_data.reset()
 
     def _setup_cells(self):
         """Setup a normal cellsv2 environment.
@@ -343,7 +380,14 @@ class TestCase(base.BaseTestCase):
         for k, v in kw.items():
             CONF.set_override(k, v, group)
 
-    def start_service(self, name, host=None, **kwargs):
+    def enforce_fk_constraints(self, engine=None):
+        if engine is None:
+            engine = sqlalchemy_api.get_engine()
+        dialect = engine.url.get_dialect()
+        if dialect == sqlite.dialect:
+            engine.connect().execute("PRAGMA foreign_keys = ON")
+
+    def start_service(self, name, host=None, cell_name=None, **kwargs):
         # Disallow starting multiple scheduler services
         if name == 'scheduler' and self._service_fixture_count[name]:
             raise TestingException("Duplicate start_service(%s)!" % name)
@@ -360,7 +404,7 @@ class TestCase(base.BaseTestCase):
             # otherwise we'll fail to update the scheduler while running
             # the compute node startup routines below.
             ctxt = context.get_context()
-            cell_name = kwargs.pop('cell', CELL1_NAME) or CELL1_NAME
+            cell_name = cell_name or CELL1_NAME
             cell = self.cell_mappings[cell_name]
             if (host or name) not in self.host_mappings:
                 # NOTE(gibi): If the HostMapping does not exists then this is
@@ -387,6 +431,36 @@ class TestCase(base.BaseTestCase):
             svc.service, 'stop', patch_stop))
 
         return svc.service
+
+    def _start_compute(self, host, cell_name=None):
+        """Start a nova compute service on the given host
+
+        :param host: the name of the host that will be associated to the
+                     compute service.
+        :param cell_name: optional name of the cell in which to start the
+                          compute service
+        :return: the nova compute service object
+        """
+        compute = self.start_service('compute', host=host, cell_name=cell_name)
+        self.computes[host] = compute
+        return compute
+
+    def _run_periodics(self):
+        """Run the update_available_resource task on every compute manager
+
+        This runs periodics on the computes in an undefined order; some child
+        class redefine this function to force a specific order.
+        """
+
+        ctx = context.get_admin_context()
+        for host, compute in self.computes.items():
+            LOG.info('Running periodic for compute (%s)', host)
+            # Make sure the context is targeted to the proper cell database
+            # for multi-cell tests.
+            with context.target_cell(
+                    ctx, self.host_mappings[host].cell_mapping) as cctxt:
+                compute.manager.update_available_resource(cctxt)
+        LOG.info('Finished with periodics')
 
     def restart_compute_service(self, compute, keep_hypervisor_state=True):
         """Stops the service and starts a new one to have realistic restart
@@ -431,10 +505,10 @@ class TestCase(base.BaseTestCase):
                     'nova.virt.driver.load_compute_driver') as load_driver:
                 load_driver.return_value = old_driver
                 new_compute = self.start_service(
-                    'compute', host=compute.host, cell=cell_name)
+                    'compute', host=compute.host, cell_name=cell_name)
         else:
             new_compute = self.start_service(
-                'compute', host=compute.host, cell=cell_name)
+                'compute', host=compute.host, cell_name=cell_name)
 
         return new_compute
 
@@ -454,9 +528,9 @@ class TestCase(base.BaseTestCase):
         matcher.
 
         """
-        if isinstance(expected, six.string_types):
+        if isinstance(expected, str):
             expected = jsonutils.loads(expected)
-        if isinstance(observed, six.string_types):
+        if isinstance(observed, str):
             observed = jsonutils.loads(observed)
 
         def sort_key(x):
@@ -486,7 +560,7 @@ class TestCase(base.BaseTestCase):
                 self.assertEqual(
                     expected_keys, observed_keys,
                     'path: %s. Dict keys are not equal' % path)
-                for key in list(six.iterkeys(expected)):
+                for key in expected:
                     inner(expected[key], observed[key], path + '.%s' % key)
             elif (isinstance(expected, (list, tuple, set)) and
                       isinstance(observed, (list, tuple, set))):
@@ -558,8 +632,9 @@ class TestCase(base.BaseTestCase):
                          baseclass)
 
         for name in sorted(implmethods.keys()):
-            baseargs = utils.getargspec(basemethods[name])
-            implargs = utils.getargspec(implmethods[name])
+            # NOTE(stephenfin): We ignore type annotations
+            baseargs = inspect.getfullargspec(basemethods[name])[:-1]
+            implargs = inspect.getfullargspec(implmethods[name])[:-1]
 
             self.assertEqual(baseargs, implargs,
                              "%s args don't match base class %s" %
@@ -581,8 +656,7 @@ class APICoverage(object):
             testtools.matchers.ContainsAll(api_methods))
 
 
-@six.add_metaclass(abc.ABCMeta)
-class SubclassSignatureTestCase(testtools.TestCase):
+class SubclassSignatureTestCase(testtools.TestCase, metaclass=abc.ABCMeta):
     """Ensure all overridden methods of all subclasses of the class
     under test exactly match the signature of the base class.
 
@@ -633,7 +707,7 @@ class SubclassSignatureTestCase(testtools.TestCase):
                 # instead.
                 method = getattr(method, '__wrapped__')
 
-            argspecs[name] = utils.getargspec(method)
+            argspecs[name] = inspect.getfullargspec(method)
 
         return argspecs
 
@@ -669,9 +743,12 @@ class SubclassSignatureTestCase(testtools.TestCase):
 class TimeOverride(fixtures.Fixture):
     """Fixture to start and remove time override."""
 
+    def __init__(self, override_time=None):
+        self.override_time = override_time
+
     def setUp(self):
         super(TimeOverride, self).setUp()
-        timeutils.set_time_override()
+        timeutils.set_time_override(override_time=self.override_time)
         self.addCleanup(timeutils.clear_time_override)
 
 
@@ -681,12 +758,6 @@ class NoDBTestCase(TestCase):
     should derive from this class.
     """
     USES_DB = False
-
-
-class BaseHookTestCase(NoDBTestCase):
-    def assert_has_hook(self, expected_name, func):
-        self.assertTrue(hasattr(func, '__hook_name__'))
-        self.assertEqual(expected_name, func.__hook_name__)
 
 
 class MatchType(object):
@@ -846,7 +917,7 @@ def patch_open(patched_path, read_data):
     selective patching based on the path.  In this case something like
     like this may be more appropriate:
 
-        @mock.patch(six.moves.builtins, 'open')
+        @mock.patch('builtins.open')
         def test_my_code(self, mock_open):
             ...
             mock_open.assert_called_once_with(path)
@@ -859,6 +930,6 @@ def patch_open(patched_path, read_data):
             return m(patched_path)
         return real_open(path, *args, **kwargs)
 
-    with mock.patch.object(builtins, 'open') as mock_open:
+    with mock.patch('builtins.open') as mock_open:
         mock_open.side_effect = selective_fake_open
         yield m

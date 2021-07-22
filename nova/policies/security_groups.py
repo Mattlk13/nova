@@ -20,56 +20,142 @@ from nova.policies import base
 
 BASE_POLICY_NAME = 'os_compute_api:os-security-groups'
 
+POLICY_NAME = 'os_compute_api:os-security-groups:%s'
+
+DEPRECATED_REASON = """
+Nova API policies are introducing new default roles with scope_type
+capabilities. Old policies are deprecated and silently going to be ignored
+in nova 23.0.0 release.
+"""
+
+DEPRECATED_POLICY = policy.DeprecatedRule(
+    BASE_POLICY_NAME,
+    base.RULE_ADMIN_OR_OWNER,
+    deprecated_reason=DEPRECATED_REASON,
+    deprecated_since='22.0.0'
+)
 
 security_groups_policies = [
     policy.DocumentedRuleDefault(
-        BASE_POLICY_NAME,
-        base.RULE_ADMIN_OR_OWNER,
-        """List, show, add, or remove security groups.
-
-APIs which are directly related to security groups resource are deprecated:
-Lists, shows information for, creates, updates and deletes
-security groups. Creates and deletes security group rules. All these
-APIs are deprecated.
-
-APIs which are related to server resource are not deprecated:
-Lists Security Groups for a server. Add Security Group to a server
-and remove security group from a server.""",
-    [
-        {
-            'method': 'GET',
-            'path': '/os-security-groups'
-        },
-        {
-            'method': 'GET',
-            'path': '/os-security-groups/{security_group_id}'
-        },
-        {
-            'method': 'POST',
-            'path': '/os-security-groups'
-        },
-        {
-            'method': 'PUT',
-            'path': '/os-security-groups/{security_group_id}'
-        },
-        {
-            'method': 'DELETE',
-            'path': '/os-security-groups/{security_group_id}'
-        },
-        {
-            'method': 'GET',
-            'path': '/servers/{server_id}/os-security-groups'
-        },
-        {
-            'method': 'POST',
-            'path': '/servers/{server_id}/action (addSecurityGroup)'
-        },
-        {
-            'method': 'POST',
-            'path': '/servers/{server_id}/action (removeSecurityGroup)'
-        },
-    ],
-    ),
+        name=POLICY_NAME % 'get',
+        check_str=base.PROJECT_READER_OR_SYSTEM_READER,
+        description="List security groups. This API is deprecated.",
+        operations=[
+            {
+                'method': 'GET',
+                'path': '/os-security-groups'
+            }
+        ],
+        scope_types=['system', 'project'],
+        deprecated_rule=DEPRECATED_POLICY),
+    policy.DocumentedRuleDefault(
+        name=POLICY_NAME % 'show',
+        check_str=base.PROJECT_READER_OR_SYSTEM_READER,
+        description="Show security group. This API is deprecated.",
+        operations=[
+            {
+                'method': 'GET',
+                'path': '/os-security-groups/{security_group_id}'
+            }
+        ],
+        scope_types=['system', 'project'],
+        deprecated_rule=DEPRECATED_POLICY),
+    policy.DocumentedRuleDefault(
+        name=POLICY_NAME % 'create',
+        check_str=base.PROJECT_MEMBER_OR_SYSTEM_ADMIN,
+        description="Create security group. This API is deprecated.",
+        operations=[
+            {
+                'method': 'POST',
+                'path': '/os-security-groups'
+            }
+        ],
+        scope_types=['system', 'project'],
+        deprecated_rule=DEPRECATED_POLICY),
+    policy.DocumentedRuleDefault(
+        name=POLICY_NAME % 'update',
+        check_str=base.PROJECT_MEMBER_OR_SYSTEM_ADMIN,
+        description="Update security group. This API is deprecated.",
+        operations=[
+            {
+                'method': 'PUT',
+                'path': '/os-security-groups/{security_group_id}'
+            }
+        ],
+        scope_types=['system', 'project'],
+        deprecated_rule=DEPRECATED_POLICY),
+    policy.DocumentedRuleDefault(
+        name=POLICY_NAME % 'delete',
+        check_str=base.PROJECT_MEMBER_OR_SYSTEM_ADMIN,
+        description="Delete security group. This API is deprecated.",
+        operations=[
+            {
+                'method': 'DELETE',
+                'path': '/os-security-groups/{security_group_id}'
+            },
+        ],
+        scope_types=['system', 'project'],
+        deprecated_rule=DEPRECATED_POLICY),
+    policy.DocumentedRuleDefault(
+        name=POLICY_NAME % 'rule:create',
+        check_str=base.PROJECT_MEMBER_OR_SYSTEM_ADMIN,
+        description="Create security group Rule. This API is deprecated.",
+        operations=[
+            {
+                'method': 'POST',
+                'path': '/os-security-group-rules'
+            }
+        ],
+        scope_types=['system', 'project'],
+        deprecated_rule=DEPRECATED_POLICY),
+    policy.DocumentedRuleDefault(
+        name=POLICY_NAME % 'rule:delete',
+        check_str=base.PROJECT_MEMBER_OR_SYSTEM_ADMIN,
+        description="Delete security group Rule. This API is deprecated.",
+        operations=[
+            {
+                'method': 'DELETE',
+                'path': '/os-security-group-rules/{security_group_id}'
+            },
+        ],
+        scope_types=['system', 'project'],
+        deprecated_rule=DEPRECATED_POLICY),
+    policy.DocumentedRuleDefault(
+        name=POLICY_NAME % 'list',
+        check_str=base.PROJECT_READER_OR_SYSTEM_READER,
+        description="List security groups of server.",
+        operations=[
+            {
+                'method': 'GET',
+                'path': '/servers/{server_id}/os-security-groups'
+            },
+        ],
+        scope_types=['system', 'project'],
+        deprecated_rule=DEPRECATED_POLICY),
+    policy.DocumentedRuleDefault(
+        name=POLICY_NAME % 'add',
+        check_str=base.PROJECT_MEMBER_OR_SYSTEM_ADMIN,
+        description="Add security groups to server.",
+        operations=[
+            {
+                'method': 'POST',
+                'path': '/servers/{server_id}/action (addSecurityGroup)'
+            },
+        ],
+        scope_types=['system', 'project'],
+        deprecated_rule=DEPRECATED_POLICY),
+    policy.DocumentedRuleDefault(
+        name=POLICY_NAME % 'remove',
+        check_str=base.PROJECT_MEMBER_OR_SYSTEM_ADMIN,
+        description="Remove security groups from server.",
+        operations=[
+            {
+                'method': 'POST',
+                'path': '/servers/{server_id}/action (removeSecurityGroup)'
+            },
+        ],
+        scope_types=['system', 'project'],
+        deprecated_rule=DEPRECATED_POLICY),
 ]
 
 

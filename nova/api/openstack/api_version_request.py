@@ -224,6 +224,22 @@ REST_API_VERSION_HISTORY = """REST API Version History:
              ``os-server-external-events`` API. This event is sent by Cyborg
              to indicate completion of ARQ binding. The ARQs can be obtained
              from Cyborg with ``GET /v2/accelerator_requests?instance={uuid}``
+    * 2.83 - Allow more filter parameters for ``GET /servers/detail`` and
+             ``GET /servers`` for non-admin.
+    * 2.84 - Adds ``details`` field to instance action events.
+    * 2.85 - Add support for
+             ``PUT /servers/{server_id}/os-volume_attachments/{volume_id}``
+             which supports specifying the ``delete_on_termination`` field in
+             the request body to change the attached volume's flag.
+    * 2.86 - Add support for validation of known extra specs to the
+             ``POST /flavors/{flavor_id}/os-extra_specs`` and
+             ``PUT /flavors/{flavor_id}/os-extra_specs/{id}`` APIs.
+    * 2.87 - Adds support for rescuing boot from volume instances when the
+             compute host reports the COMPUTE_BFV_RESCUE capability trait.
+    * 2.88 - Drop statistics-style fields from the ``/os-hypervisors/detail``
+             and ``/os-hypervisors/{hypervisor_id}`` APIs, and remove the
+             ``/os-hypervisors/statistics`` and
+             ``/os-hypervisors/{hypervisor_id}/uptime`` APIs entirely.
 """
 
 # The minimum and maximum versions of the API supported
@@ -231,8 +247,8 @@ REST_API_VERSION_HISTORY = """REST API Version History:
 # minimum version of the API supported.
 # Note(cyeoh): This only applies for the v2.1 API once microversions
 # support is fully merged. It does not affect the V2 API.
-_MIN_API_VERSION = "2.1"
-_MAX_API_VERSION = "2.82"
+_MIN_API_VERSION = '2.1'
+_MAX_API_VERSION = '2.88'
 DEFAULT_API_VERSION = _MIN_API_VERSION
 
 # Almost all proxy APIs which are related to network, images and baremetal

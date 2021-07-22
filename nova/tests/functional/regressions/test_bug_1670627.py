@@ -17,9 +17,6 @@ import time
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional.api import client
-from nova.tests.unit import cast_as_call
-import nova.tests.unit.image.fake
-from nova.tests.unit import policy_fixture
 
 
 class TestDeleteFromCell0CheckQuota(test.TestCase):
@@ -48,14 +45,13 @@ class TestDeleteFromCell0CheckQuota(test.TestCase):
 
     def setUp(self):
         super(TestDeleteFromCell0CheckQuota, self).setUp()
-        self.useFixture(policy_fixture.RealPolicyFixture())
+        self.useFixture(nova_fixtures.RealPolicyFixture())
         self.useFixture(nova_fixtures.NeutronFixture(self))
+        self.useFixture(nova_fixtures.GlanceFixture(self))
+
         api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
             api_version='v2.1'))
         self.api = api_fixture.api
-
-        # the image fake backend needed for image discovery
-        nova.tests.unit.image.fake.stub_out_image_service(self)
 
         self.start_service('conductor')
         self.start_service('scheduler')
@@ -64,7 +60,7 @@ class TestDeleteFromCell0CheckQuota(test.TestCase):
         # compute hosts to schedule the instance to and will go into error and
         # be put into cell0.
 
-        self.useFixture(cast_as_call.CastAsCall(self))
+        self.useFixture(nova_fixtures.CastAsCallFixture(self))
 
         self.image_id = self.api.get_images()[0]['id']
         self.flavor_id = self.api.get_flavors()[0]['id']

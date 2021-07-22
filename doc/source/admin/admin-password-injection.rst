@@ -10,18 +10,9 @@ command.  You can also view and set the admin password from the dashboard.
 
 .. rubric:: Password injection using the dashboard
 
-By default, the dashboard will display the ``admin`` password and allow the
-user to modify it.
-
-If you do not want to support password injection, disable the password fields
-by editing the dashboard's ``local_settings.py`` file.
-
-.. code-block:: none
-
-   OPENSTACK_HYPERVISOR_FEATURES = {
-   ...
-       'can_set_password': False,
-   }
+For password injection display in the dashboard, please refer to the setting of
+``can_set_password`` in :horizon-doc:`Horizon doc
+</configuration/settings.html#openstack-hypervisor-features>`
 
 .. rubric:: Password injection on libvirt-based hypervisors
 
@@ -52,12 +43,6 @@ the ``/etc/shadow`` file inside the virtual machine instance.
    root account, or
    `CentOS cloud images <http://cloud.centos.org/centos/>`_ which, by default,
    does not allow :command:`ssh` access to the instance with password.
-
-.. rubric:: Password injection and XenAPI (XenServer/XCP)
-
-When using the XenAPI hypervisor back end, Compute uses the XenAPI agent to
-inject passwords into guests. The virtual machine image must be configured with
-the agent for password injection to work.
 
 .. rubric:: Password injection and Windows images (all hypervisors)
 

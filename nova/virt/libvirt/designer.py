@@ -22,8 +22,6 @@ classes based on common operational needs / policies
 
 from nova.pci import utils as pci_utils
 
-MIN_LIBVIRT_ETHERNET_SCRIPT_PATH_NONE = (1, 3, 3)
-
 
 def set_vif_guest_frontend_config(conf, mac, model, driver, queues,
                                   rx_queue_size):
@@ -43,7 +41,7 @@ def set_vif_guest_frontend_config(conf, mac, model, driver, queues,
         conf.vhost_rx_queue_size = rx_queue_size
 
 
-def set_vif_host_backend_ethernet_config(conf, tapname, host):
+def set_vif_host_backend_ethernet_config(conf, tapname):
     """Populate a LibvirtConfigGuestInterface instance
     with host backend details for an externally configured
     host device.
@@ -54,16 +52,7 @@ def set_vif_host_backend_ethernet_config(conf, tapname, host):
 
     conf.net_type = "ethernet"
     conf.target_dev = tapname
-    # NOTE(mriedem): Before libvirt 1.3.3, passing script=None results
-    # in errors because /etc/qemu-ifup gets run which is blocked by
-    # AppArmor. Passing script='' between libvirt 1.3.3 and 3.1 will also
-    # result in errors. So we have to check the libvirt version and set
-    # the script value accordingly. Libvirt 3.1 allows and properly handles
-    # both None and '' as no-ops.
-    if host.has_min_version(MIN_LIBVIRT_ETHERNET_SCRIPT_PATH_NONE):
-        conf.script = None
-    else:
-        conf.script = ''
+    conf.script = None
 
 
 def set_vif_host_backend_802qbg_config(conf, devname, managerid,
@@ -144,7 +133,7 @@ def set_vif_host_backend_direct_config(conf, devname, mode="passthrough"):
 
 
 def set_vif_host_backend_vhostuser_config(conf, mode, path, rx_queue_size,
-                                          tx_queue_size):
+                                          tx_queue_size, tapname=None):
     """Populate a LibvirtConfigGuestInterface instance
     with host backend details for vhostuser socket.
 
@@ -158,6 +147,24 @@ def set_vif_host_backend_vhostuser_config(conf, mode, path, rx_queue_size,
         conf.vhost_rx_queue_size = rx_queue_size
     if tx_queue_size:
         conf.vhost_tx_queue_size = tx_queue_size
+    if tapname:
+        conf.target_dev = tapname
+
+
+def set_vif_host_backend_vdpa_config(
+    conf, dev_path, rx_queue_size=None, tx_queue_size=None,
+):
+    """Populate a LibvirtConfigGuestInterface instance
+    with host backend details for a vdpa device.
+
+    NOTE: @rx_queue_size and @tx_queue_size can be None
+    """
+    conf.net_type = "vdpa"
+    conf.source_dev = dev_path
+    if rx_queue_size:
+        conf.vhost_rx_queue_size = rx_queue_size
+    if tx_queue_size:
+        conf.vhost_tx_queue_size = tx_queue_size
 
 
 def set_vif_mtu_config(conf, mtu):
@@ -167,7 +174,7 @@ def set_vif_mtu_config(conf, mtu):
     conf.mtu = mtu
 
 
-def set_vif_bandwidth_config(conf, inst_type):
+def set_vif_bandwidth_config(conf, flavor):
     """Config vif inbound/outbound bandwidth limit. parameters are
     set in instance_type_extra_specs table, key is in  the format
     quota:vif_inbound_average.
@@ -176,7 +183,7 @@ def set_vif_bandwidth_config(conf, inst_type):
     bandwidth_items = ['vif_inbound_average', 'vif_inbound_peak',
         'vif_inbound_burst', 'vif_outbound_average', 'vif_outbound_peak',
         'vif_outbound_burst']
-    for key, value in inst_type.get('extra_specs', {}).items():
+    for key, value in flavor.get('extra_specs', {}).items():
         scope = key.split(':')
         if len(scope) > 1 and scope[0] == 'quota':
             if scope[1] in bandwidth_items:
@@ -198,7 +205,11 @@ def set_vcpu_realtime_scheduler(conf, vcpus_rt, priority):
     conf.priority = priority
 
 
-def set_driver_iommu_for_sev(conf):
+def set_driver_iommu_for_device(dev):
+    if dev.uses_virtio:
+        dev.driver_iommu = True
+
+
+def set_driver_iommu_for_all_devices(conf):
     for dev in conf.devices:
-        if dev.uses_virtio:
-            dev.driver_iommu = True
+        set_driver_iommu_for_device(dev)

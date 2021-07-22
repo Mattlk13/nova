@@ -52,36 +52,13 @@ Possible values:
   (i.e. "http://10.0.1.0:9292" or "https://my.glance.server/image").
 """),
     cfg.IntOpt('num_retries',
-        default=0,
+        default=3,
         min=0,
         help="""
 Enable glance operation retries.
 
 Specifies the number of retries when uploading / downloading
 an image to / from glance. 0 means no retries.
-"""),
-    cfg.ListOpt('allowed_direct_url_schemes',
-        default=[],
-        deprecated_for_removal=True,
-        deprecated_since='17.0.0',
-        deprecated_reason="""
-This was originally added for the 'nova.image.download.file' FileTransfer
-extension which was removed in the 16.0.0 Pike release. The
-'nova.image.download.modules' extension point is not maintained
-and there is no indication of its use in production clouds.
-""",
-        help="""
-List of url schemes that can be directly accessed.
-
-This option specifies a list of url schemes that can be downloaded
-directly via the direct_url. This direct_URL can be fetched from
-Image metadata which can be used by nova to get the
-image more efficiently. nova-compute could benefit from this by
-invoking a copy when it has access to the same file system as glance.
-
-Possible values:
-
-* [file], Empty list (default)
 """),
     cfg.BoolOpt('verify_glance_signatures',
         default=False,
@@ -148,9 +125,72 @@ Related options:
 * The value of this option may be used if both verify_glance_signatures and
   enable_certificate_validation are enabled.
 """),
+    cfg.BoolOpt('enable_rbd_download',
+        default=False,
+        help="""
+Enable Glance image downloads directly via RBD.
+
+Allow non-rbd computes using local storage to download and cache images from
+Ceph via rbd rather than the Glance API via http.
+
+.. note:: This option should only be enabled when the compute itself is not
+          also using Ceph as a backing store. For example with the libvirt
+          driver it should only be enabled when
+          :oslo.config:option:`libvirt.images_type` is not set to ``rbd``.
+
+Related options:
+
+* :oslo.config:option:`glance.rbd_user`
+* :oslo.config:option:`glance.rbd_connect_timeout`
+* :oslo.config:option:`glance.rbd_pool`
+* :oslo.config:option:`glance.rbd_ceph_conf`
+* :oslo.config:option:`libvirt.images_type`
+"""),
+    cfg.StrOpt('rbd_user',
+        default='',
+        help="""
+The RADOS client name for accessing Glance images stored as rbd volumes.
+
+Related options:
+
+* This option is only used if :oslo.config:option:`glance.enable_rbd_download`
+  is set to ``True``.
+"""),
+    cfg.IntOpt('rbd_connect_timeout',
+        default=5,
+        help="""
+The RADOS client timeout in seconds when initially connecting to the cluster.
+
+Related options:
+
+* This option is only used if :oslo.config:option:`glance.enable_rbd_download`
+  is set to ``True``.
+"""),
+    cfg.StrOpt('rbd_pool',
+        default='',
+        help="""
+The RADOS pool in which the Glance images are stored as rbd volumes.
+
+Related options:
+
+* This option is only used if :oslo.config:option:`glance.enable_rbd_download`
+  is set to ``True``.
+"""),
+    cfg.StrOpt('rbd_ceph_conf',
+        default='',
+        help="""
+Path to the ceph configuration file to use.
+
+Related options:
+
+* This option is only used if :oslo.config:option:`glance.enable_rbd_download`
+  is set to ``True``.
+
+"""),
+
     cfg.BoolOpt('debug',
-         default=False,
-         help='Enable or disable debug logging with glanceclient.')
+        default=False,
+        help='Enable or disable debug logging with glanceclient.')
 ]
 
 deprecated_ksa_opts = {

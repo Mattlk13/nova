@@ -19,7 +19,6 @@ import mock
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel
 
-import nova
 from nova.compute import vm_states
 from nova import context
 from nova import objects
@@ -144,7 +143,8 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
 
     def _create_tracker(self, fake_devs):
         self.fake_devs = fake_devs
-        self.tracker = manager.PciDevTracker(self.fake_context, 1)
+        self.tracker = manager.PciDevTracker(
+            self.fake_context, objects.ComputeNode(id=1, numa_topology=None))
 
     def setUp(self):
         super(PciDevTrackerTestCase, self).setUp()
@@ -216,25 +216,51 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         self.assertIsNone(vf.parent_device)
         self.assertEqual([], vf.child_devices)
 
-    @mock.patch.object(nova.objects.PciDeviceList, 'get_by_compute_node')
-    def test_pcidev_tracker_create_no_nodeid(self, mock_get_cn):
-        self.tracker = manager.PciDevTracker(self.fake_context)
-        self.assertEqual(len(self.tracker.pci_devs), 0)
-        self.assertFalse(mock_get_cn.called)
-
-    @mock.patch.object(nova.objects.PciDeviceList, 'get_by_compute_node')
-    def test_pcidev_tracker_create_with_nodeid(self, mock_get_cn):
-        self.tracker = manager.PciDevTracker(self.fake_context, node_id=1)
-        mock_get_cn.assert_called_once_with(self.fake_context, 1)
-
     @mock.patch('nova.pci.whitelist.Whitelist.device_assignable',
                 return_value=True)
     def test_update_devices_from_hypervisor_resources(self, _mock_dev_assign):
-        fake_pci_devs = [copy.deepcopy(fake_pci), copy.deepcopy(fake_pci_2)]
+        fake_pci_devs = [copy.deepcopy(fake_pci_4), copy.deepcopy(fake_pci_5)]
         fake_pci_devs_json = jsonutils.dumps(fake_pci_devs)
-        tracker = manager.PciDevTracker(self.fake_context)
+        tracker = manager.PciDevTracker(
+            self.fake_context, objects.ComputeNode(id=1, numa_topology=None))
         tracker.update_devices_from_hypervisor_resources(fake_pci_devs_json)
-        self.assertEqual(2, len(tracker.pci_devs))
+        self.assertEqual(5, len(tracker.pci_devs))
+
+    @mock.patch("nova.pci.manager.LOG.debug")
+    def test_update_devices_from_hypervisor_resources_32bit_domain(
+            self, mock_debug):
+        self.flags(
+            group='pci',
+            passthrough_whitelist=[
+                '{"product_id":"2032", "vendor_id":"8086"}'])
+        # There are systems where 32 bit PCI domain is used. See bug 1897528
+        # for example. While nova (and qemu) does not support assigning such
+        # devices but the existence of such device in the system should not
+        # lead to an error.
+        fake_pci = {
+            'compute_node_id': 1,
+            'address': '10000:00:02.0',
+            'product_id': '2032',
+            'vendor_id': '8086',
+            'request_id': None,
+            'status': fields.PciDeviceStatus.AVAILABLE,
+            'dev_type': fields.PciDeviceType.STANDARD,
+            'parent_addr': None,
+            'numa_node': 0}
+
+        fake_pci_devs = [fake_pci]
+        fake_pci_devs_json = jsonutils.dumps(fake_pci_devs)
+        tracker = manager.PciDevTracker(
+            self.fake_context, objects.ComputeNode(id=1, numa_topology=None))
+        # We expect that the device with 32bit PCI domain is ignored, so we'll
+        # have only the 3 original fake devs
+        tracker.update_devices_from_hypervisor_resources(fake_pci_devs_json)
+        self.assertEqual(3, len(tracker.pci_devs))
+        mock_debug.assert_called_once_with(
+            'Skipping PCI device %s reported by the hypervisor: %s',
+            {'address': '10000:00:02.0', 'parent_addr': None},
+            'The property domain (10000) is greater than the maximum '
+            'allowable value (FFFF).')
 
     def test_set_hvdev_new_dev(self):
         fake_pci_3 = dict(fake_pci, address='0000:00:00.4', vendor_id='v2')
@@ -399,7 +425,9 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         fake_db_dev_3 = dict(fake_db_dev_1, id=4, address='0000:00:00.4')
         fake_devs_numa = copy.deepcopy(fake_db_devs)
         fake_devs_numa.append(fake_db_dev_3)
-        self.tracker = manager.PciDevTracker(1)
+        self.tracker = manager.PciDevTracker(
+            mock.sentinel.context,
+            objects.ComputeNode(id=1, numa_topology=None))
         self.tracker._set_hvdevs(fake_devs_numa)
         pci_requests = copy.deepcopy(fake_pci_requests)[:1]
         pci_requests[0]['count'] = 2
@@ -420,10 +448,11 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         self.inst.numa_topology = objects.InstanceNUMATopology(
                     cells=[objects.InstanceNUMACell(
                         id=1, cpuset=set([1, 2]), memory=512)])
-        self.assertIsNone(self.tracker.claim_instance(
-                            mock.sentinel.context,
-                            pci_requests_obj,
-                            self.inst.numa_topology))
+        claims = self.tracker.claim_instance(
+            mock.sentinel.context,
+            pci_requests_obj,
+            self.inst.numa_topology)
+        self.assertEqual([], claims)
 
     def test_update_pci_for_instance_deleted(self):
         pci_requests_obj = self._create_pci_requests_object(fake_pci_requests)
@@ -473,7 +502,6 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         inst_2 = copy.copy(self.inst)
         inst_2.uuid = uuidsentinel.instance2
         migr = {'instance_uuid': 'uuid2', 'vm_state': vm_states.BUILDING}
-        orph = {'uuid': 'uuid3', 'vm_state': vm_states.BUILDING}
 
         pci_requests_obj = self._create_pci_requests_object(
             [{'count': 1, 'spec': [{'vendor_id': 'v'}]}])
@@ -490,7 +518,7 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         self.assertEqual(len(free_devs), 1)
         self.assertEqual(free_devs[0].vendor_id, 'v')
 
-        self.tracker.clean_usage([self.inst], [migr], [orph])
+        self.tracker.clean_usage([self.inst], [migr])
         free_devs = self.tracker.pci_stats.get_free_devs()
         self.assertEqual(len(free_devs), 2)
         self.assertEqual(
@@ -504,7 +532,7 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         self.tracker.update_pci_for_instance(None, self.inst, sign=1)
         free_devs = self.tracker.pci_stats.get_free_devs()
         self.assertEqual(3, len(free_devs))
-        self.tracker.clean_usage([], [], [])
+        self.tracker.clean_usage([], [])
         free_devs = self.tracker.pci_stats.get_free_devs()
         self.assertEqual(3, len(free_devs))
         self.assertEqual(

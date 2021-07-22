@@ -19,12 +19,12 @@ import re
 
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_policy import opts
 from oslo_policy import policy
 from oslo_utils import excutils
 
 
 from nova import exception
-from nova.i18n import _LE, _LW
 from nova import policies
 
 
@@ -40,6 +40,12 @@ USER_BASED_RESOURCES = ['os-keypairs']
 # rules whether were updated.
 saved_file_rules = []
 KEY_EXPR = re.compile(r'%\((\w+)\)s')
+
+# TODO(gmann): Remove setting the default value of config policy_file
+# once oslo_policy change the default value to 'policy.yaml'.
+# https://github.com/openstack/oslo.policy/blob/a626ad12fe5a3abd49d70e3e5b95589d279ab578/oslo_policy/opts.py#L49
+DEFAULT_POLICY_FILE = 'policy.yaml'
+opts.set_defaults(cfg.CONF, DEFAULT_POLICY_FILE)
 
 
 def reset():
@@ -68,11 +74,19 @@ def init(policy_file=None, rules=None, default_rule=None, use_conf=True,
     global saved_file_rules
 
     if not _ENFORCER:
-        _ENFORCER = policy.Enforcer(CONF,
-                                    policy_file=policy_file,
-                                    rules=rules,
-                                    default_rule=default_rule,
-                                    use_conf=use_conf)
+        _ENFORCER = policy.Enforcer(
+            CONF,
+            policy_file=policy_file,
+            rules=rules,
+            default_rule=default_rule,
+            use_conf=use_conf)
+        # NOTE(gmann): Explictly disable the warnings for policies
+        # changing their default check_str. During policy-defaults-refresh
+        # work, all the policy defaults have been changed and warning for
+        # each policy started filling the logs limit for various tool.
+        # Once we move to new defaults only world then we can enable these
+        # warning again.
+        _ENFORCER.suppress_default_change_warnings = True
         if suppress_deprecation_warnings:
             _ENFORCER.suppress_deprecation_warnings = True
         register_rules(_ENFORCER)
@@ -108,10 +122,12 @@ def _warning_for_deprecated_user_based_rules(rules):
                 if resource in rule[0]]:
             continue
         if 'user_id' in KEY_EXPR.findall(rule[1]):
-            LOG.warning(_LW("The user_id attribute isn't supported in the "
-                            "rule '%s'. All the user_id based policy "
-                            "enforcement will be removed in the "
-                            "future."), rule[0])
+            LOG.warning(
+                "The user_id attribute isn't supported in the rule '%s'. "
+                "All the user_id based policy enforcement will be removed in "
+                "the future.",
+                rule[0]
+            )
 
 
 def set_rules(rules, overwrite=True, use_conf=False):
@@ -171,7 +187,7 @@ def authorize(context, action, target=None, do_raise=True, exc=None):
                                      do_raise=do_raise, exc=exc, action=action)
     except policy.PolicyNotRegistered:
         with excutils.save_and_reraise_exception():
-            LOG.exception(_LE('Policy not registered'))
+            LOG.exception('Policy not registered')
     except policy.InvalidScope:
         LOG.debug('Policy check for %(action)s failed with scope check '
                   '%(credentials)s',

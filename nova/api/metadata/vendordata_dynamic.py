@@ -21,7 +21,6 @@ from keystoneauth1 import exceptions as ks_exceptions
 from keystoneauth1 import loading as ks_loading
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
-import six
 
 from nova.api.metadata import vendordata
 import nova.conf
@@ -60,12 +59,7 @@ def _load_ks_session(conf):
 
 
 class DynamicVendorData(vendordata.VendorDataDriver):
-    def __init__(self, context=None, instance=None, address=None,
-                 network_info=None):
-        # NOTE(mikal): address and network_info are unused, but can't be
-        # removed / renamed as this interface is shared with the static
-        # JSON plugin.
-        self.context = context
+    def __init__(self, instance):
         self.instance = instance
         # We only create the session if we make a request.
         self.session = None
@@ -115,7 +109,7 @@ class DynamicVendorData(vendordata.VendorDataDriver):
                          'error': e},
                         instance=self.instance)
             if CONF.api.vendordata_dynamic_failure_fatal:
-                six.reraise(type(e), e, sys.exc_info()[2])
+                raise e.with_traceback(sys.exc_info()[2])
 
             return {}
 

@@ -2,21 +2,14 @@
 nova-rootwrap
 =============
 
----------------------
-Root wrapper for Nova
----------------------
-
-:Author: openstack@lists.openstack.org
-:Copyright: OpenStack Foundation
-:Manual section: 1
-:Manual group: cloud computing
+.. program:: nova-rootwrap
 
 Synopsis
 ========
 
 ::
 
-  nova-rootwrap [options]
+  nova-rootwrap CONFIG_FILE COMMMAND
 
 Description
 ===========
@@ -42,11 +35,6 @@ To make allowed commands node-specific, your packaging should only install
    :program:`nova-rootwrap` is being slowly deprecated and replaced by
    ``oslo.privsep``, and will eventually be removed.
 
-Options
-=======
-
-**General options**
-
 Files
 =====
 
@@ -57,7 +45,7 @@ Files
 See Also
 ========
 
-* :nova-doc:`OpenStack Nova <>`
+:doc:`nova-compute(1) <nova-compute>`
 
 Bugs
 ====

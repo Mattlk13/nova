@@ -87,7 +87,8 @@ class FloatingIPController(wsgi.Controller):
     def show(self, req, id):
         """Return data about the given floating IP."""
         context = req.environ['nova.context']
-        context.can(fi_policies.BASE_POLICY_NAME)
+        context.can(fi_policies.BASE_POLICY_NAME % 'show',
+                    target={'project_id': context.project_id})
 
         try:
             floating_ip = self.network_api.get_floating_ip(context, id)
@@ -104,7 +105,8 @@ class FloatingIPController(wsgi.Controller):
     def index(self, req):
         """Return a list of floating IPs allocated to a project."""
         context = req.environ['nova.context']
-        context.can(fi_policies.BASE_POLICY_NAME)
+        context.can(fi_policies.BASE_POLICY_NAME % 'list',
+                    target={'project_id': context.project_id})
 
         floating_ips = self.network_api.get_floating_ips_by_project(context)
 
@@ -115,7 +117,8 @@ class FloatingIPController(wsgi.Controller):
     @wsgi.expected_errors((400, 403, 404))
     def create(self, req, body=None):
         context = req.environ['nova.context']
-        context.can(fi_policies.BASE_POLICY_NAME)
+        context.can(fi_policies.BASE_POLICY_NAME % 'create',
+                    target={'project_id': context.project_id})
 
         pool = None
         if body and 'pool' in body:
@@ -147,7 +150,8 @@ class FloatingIPController(wsgi.Controller):
     @wsgi.expected_errors((400, 403, 404, 409))
     def delete(self, req, id):
         context = req.environ['nova.context']
-        context.can(fi_policies.BASE_POLICY_NAME)
+        context.can(fi_policies.BASE_POLICY_NAME % 'delete',
+                    target={'project_id': context.project_id})
 
         # get the floating ip object
         try:
@@ -186,12 +190,13 @@ class FloatingIPActionController(wsgi.Controller):
     def _add_floating_ip(self, req, id, body):
         """Associate floating_ip to an instance."""
         context = req.environ['nova.context']
-        context.can(fi_policies.BASE_POLICY_NAME)
+        instance = common.get_instance(self.compute_api, context, id,
+                                       expected_attrs=['flavor'])
+        context.can(fi_policies.BASE_POLICY_NAME % 'add',
+                    target={'project_id': instance.project_id})
 
         address = body['addFloatingIp']['address']
 
-        instance = common.get_instance(self.compute_api, context, id,
-                                       expected_attrs=['flavor'])
         cached_nwinfo = instance.get_network_info()
         if not cached_nwinfo:
             LOG.warning(
@@ -265,9 +270,17 @@ class FloatingIPActionController(wsgi.Controller):
     def _remove_floating_ip(self, req, id, body):
         """Dissociate floating_ip from an instance."""
         context = req.environ['nova.context']
-        context.can(fi_policies.BASE_POLICY_NAME)
 
         address = body['removeFloatingIp']['address']
+
+        # get the associated instance object (if any)
+        instance = get_instance_by_floating_ip_addr(self, context, address)
+
+        target = {}
+        if instance:
+            target = {'project_id': instance.project_id}
+        context.can(fi_policies.BASE_POLICY_NAME % 'remove',
+                    target=target)
 
         # get the floating ip object
         try:
@@ -276,9 +289,6 @@ class FloatingIPActionController(wsgi.Controller):
         except exception.FloatingIpNotFoundForAddress:
             msg = _("floating IP not found")
             raise webob.exc.HTTPNotFound(explanation=msg)
-
-        # get the associated instance object (if any)
-        instance = get_instance_by_floating_ip_addr(self, context, address)
 
         # disassociate if associated
         if instance and floating_ip['port_id'] and instance.uuid == id:

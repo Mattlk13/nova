@@ -18,7 +18,6 @@ import pprint
 import re
 
 from oslo_serialization import jsonutils
-import six
 
 from nova import test
 from nova.tests.functional import integrated_helpers
@@ -84,7 +83,7 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
         non_strings =  \
             {k: v for k, v in value.items() if
              (not k == 'compute_host') and
-             (not isinstance(v, six.string_types))}
+             (not isinstance(v, str))}
         if len(non_strings) > 0:
             raise TypeError("subs can't contain non-string values:"
                             "\n%(non_strings)s" %
@@ -232,7 +231,7 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
             if error:
                 raise NoMatch('\n'.join(error))
         # template string
-        elif isinstance(expected, six.string_types) and '%' in expected:
+        elif isinstance(expected, str) and '%' in expected:
             # NOTE(vish): escape stuff for regex
             for char in '[]<>?':
                 expected = expected.replace(char, '\\%s' % char)
@@ -266,11 +265,11 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
                 if match.groups():
                     matched_value = match.groups()[0]
         # string
-        elif isinstance(expected, six.string_types):
+        elif isinstance(expected, str):
 
             # NOTE(danms): Ignore whitespace in this comparison
             expected = expected.strip()
-            if isinstance(result, six.string_types):
+            if isinstance(result, str):
                 result = result.strip()
 
             if expected != result:
@@ -294,7 +293,7 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
                                         'result_str': result_str,
                                         'result': result})
         # int
-        elif isinstance(expected, (six.integer_types, float)):
+        elif isinstance(expected, (int, float)):
             if expected != result:
                 raise NoMatch(
                         'Values do not match:\n'
@@ -347,14 +346,14 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
 
         url_re = self._get_host() + r"/v(2|2\.1)/" + project_id_exp
         new_url = self._get_host() + "/" + self.api_major_version
-        if self._use_project_id:
+        if self.USE_PROJECT_ID:
             new_url += "/" + self.project_id
         updated_data = re.sub(url_re, new_url, sample_data)
 
         # replace unversioned urls
         url_re = self._get_host() + "/" + project_id_exp
         new_url = self._get_host()
-        if self._use_project_id:
+        if self.USE_PROJECT_ID:
             new_url += "/" + self.project_id
         updated_data = re.sub(url_re, new_url, updated_data)
         return updated_data
@@ -489,7 +488,7 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
     def _get_compute_endpoint(self):
         # NOTE(sdague): "openstack" is stand in for project_id, it
         # should be more generic in future.
-        if self._use_project_id:
+        if self.USE_PROJECT_ID:
             return '%s/%s' % (self._get_host(), self.project_id)
         else:
             return self._get_host()
@@ -497,7 +496,7 @@ class ApiSampleTestBase(integrated_helpers._IntegratedTestBase):
     def _get_vers_compute_endpoint(self):
         # NOTE(sdague): "openstack" is stand in for project_id, it
         # should be more generic in future.
-        if self._use_project_id:
+        if self.USE_PROJECT_ID:
             return '%s/%s/%s' % (self._get_host(), self.api_major_version,
                                  self.project_id)
         else:

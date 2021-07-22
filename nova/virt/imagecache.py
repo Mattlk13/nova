@@ -47,10 +47,12 @@ class ImageCacheManager(object):
             - used_images
             - instance_names
             - used_swap_images
+            - used_ephemeral_images
         """
         used_images = {}
         instance_names = set()
         used_swap_images = set()
+        used_ephemeral_images = set()
         instance_bdms = objects.BlockDeviceMappingList.bdms_by_instance_uuid(
             context, [instance.uuid for instance in all_instances])
 
@@ -84,10 +86,21 @@ class ImageCacheManager(object):
                 if swap:
                     swap_image = 'swap_' + str(swap[0]['swap_size'])
                     used_swap_images.add(swap_image)
+                ephemeral = driver_block_device.convert_ephemerals(bdms)
+                if ephemeral:
+                    os_type = nova.privsep.fs.get_fs_type_for_os_type(
+                        instance.os_type)
+                    file_name = nova.privsep.fs.get_file_extension_for_os_type(
+                        os_type, CONF.default_ephemeral_format)
+                    ephemeral_gb = str(ephemeral[0]['size'])
+                    ephemeral_image = "ephemeral_%s_%s" % (
+                        ephemeral_gb, file_name)
+                    used_ephemeral_images.add(ephemeral_image)
 
         return {'used_images': used_images,
                 'instance_names': instance_names,
-                'used_swap_images': used_swap_images}
+                'used_swap_images': used_swap_images,
+                'used_ephemeral_images': used_ephemeral_images}
 
     def _scan_base_images(self, base_dir):
         """Scan base images present in base_dir and populate internal
@@ -106,5 +119,14 @@ class ImageCacheManager(object):
         This will invoke the cache manager. This will update the cache
         according to the defined cache management scheme. The information
         populated in the cached stats will be used for the cache management.
+        """
+        raise NotImplementedError()
+
+    def get_disk_usage(self):
+        """Return the size of the physical disk space used for the cache.
+
+        :returns: The disk space in bytes that is occupied from
+                  CONF.instances_path or zero if the cache directory is mounted
+                  to a different disk device.
         """
         raise NotImplementedError()

@@ -20,14 +20,14 @@ from lxml import etree
 import mock
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import units
-import six
 
 from nova.compute import power_state
 from nova import exception
 from nova.network import model as network_model
 from nova import objects
 from nova import test
-from nova.tests.unit.virt.libvirt import fakelibvirt
+from nova.tests import fixtures as nova_fixtures
+from nova.tests.fixtures import libvirt as fakelibvirt
 from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt import guest as libvirt_guest
 from nova.virt.libvirt import host
@@ -66,34 +66,6 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
             'vnc': '127.0.0.1',
             'spice': None}, addrs)
 
-    def test_serial_listen_addr(self):
-        data = objects.LibvirtLiveMigrateData(
-            serial_listen_addr='127.0.0.1')
-        addr = migration.serial_listen_addr(data)
-        self.assertEqual('127.0.0.1', addr)
-
-    def test_serial_listen_addr_emtpy(self):
-        data = objects.LibvirtLiveMigrateData()
-        addr = migration.serial_listen_addr(data)
-        self.assertIsNone(addr)
-
-    def test_serial_listen_addr_None(self):
-        data = objects.LibvirtLiveMigrateData()
-        data.serial_listen_addr = None
-        addr = migration.serial_listen_addr(data)
-        self.assertIsNone(addr)
-
-    def test_serial_listen_ports(self):
-        data = objects.LibvirtLiveMigrateData(
-            serial_listen_ports=[1, 2, 3])
-        ports = migration.serial_listen_ports(data)
-        self.assertEqual([1, 2, 3], ports)
-
-    def test_serial_listen_ports_emtpy(self):
-        data = objects.LibvirtLiveMigrateData()
-        ports = migration.serial_listen_ports(data)
-        self.assertEqual([], ports)
-
     @mock.patch('lxml.etree.tostring')
     @mock.patch.object(migration, '_update_memory_backing_xml')
     @mock.patch.object(migration, '_update_perf_events_xml')
@@ -108,51 +80,124 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
         get_volume_config = mock.MagicMock()
         mock_guest.get_xml_desc.return_value = '<domain></domain>'
 
-        migration.get_updated_guest_xml(mock_guest, data, get_volume_config)
+        migration.get_updated_guest_xml(
+            mock.sentinel.instance, mock_guest, data, get_volume_config)
         mock_graphics.assert_called_once_with(mock.ANY, data)
         mock_serial.assert_called_once_with(mock.ANY, data)
-        mock_volume.assert_called_once_with(mock.ANY, data, get_volume_config)
+        mock_volume.assert_called_once_with(
+            mock.ANY, data, mock.sentinel.instance, get_volume_config)
         mock_perf_events_xml.assert_called_once_with(mock.ANY, data)
         mock_memory_backing.assert_called_once_with(mock.ANY, data)
         self.assertEqual(1, mock_tostring.called)
 
-    def test_update_numa_xml(self):
-        xml = textwrap.dedent("""
+    def test_update_device_resources_xml_vpmem(self):
+        # original xml for vpmems, /dev/dax0.1 and /dev/dax0.2 here
+        # are vpmem device path on source host
+        old_xml = textwrap.dedent("""
             <domain>
-                <cputune>
-                    <vcpupin vcpu="0" cpuset="0,1,2,^2"/>
-                    <vcpupin vcpu="1" cpuset="2-4,^4"/>
-                    <emulatorpin cpuset="8-10,^8"/>
-                    <vcpusched vcpus="10-12,^12" priority="13"/>
-                </cputune>
-                <numatune>
-                    <memory nodeset="4,5,6,7"/>
-                    <memnode cellid="2" nodeset="4-6,^6"/>
-                    <memnode cellid="3" nodeset="6-8,^8"/>
-                </numatune>
+                <devices>
+                    <memory model='nvdimm'>
+                        <source>
+                            <path>/dev/dax0.1</path>
+                            <alignsize>2048</alignsize>
+                            <pmem>on</pmem>
+                        </source>
+                        <target>
+                            <size>4192256</size>
+                            <label>
+                                <size>2048</size>
+                            </label>
+                            <node>0</node>
+                        </target>
+                    </memory>
+                    <memory model='nvdimm'>
+                        <source>
+                            <path>/dev/dax0.2</path>
+                            <alignsize>2048</alignsize>
+                            <pmem>on</pmem>
+                        </source>
+                        <target>
+                            <size>4192256</size>
+                            <label>
+                                <size>2048</size>
+                            </label>
+                            <node>0</node>
+                        </target>
+                    </memory>
+                </devices>
             </domain>""")
-        doc = etree.fromstring(xml)
+        doc = etree.fromstring(old_xml)
+        vpmem_resource_0 = objects.Resource(
+            provider_uuid=uuids.rp_uuid,
+            resource_class="CUSTOM_PMEM_NAMESPACE_4GB",
+            identifier='ns_0',
+            metadata= objects.LibvirtVPMEMDevice(
+                label='4GB', name='ns_0', devpath='/dev/dax1.0',
+                size=4292870144, align=2097152))
+        vpmem_resource_1 = objects.Resource(
+            provider_uuid=uuids.rp_uuid,
+            resource_class="CUSTOM_PMEM_NAMESPACE_4GB",
+            identifier='ns_0',
+            metadata= objects.LibvirtVPMEMDevice(
+                label='4GB', name='ns_1', devpath='/dev/dax2.0',
+                size=4292870144, align=2097152))
+        # new_resources contains vpmems claimed on destination,
+        # /dev/dax1.0 and /dev/dax2.0 are where vpmem data is migrated to
+        new_resources = objects.ResourceList(
+                objects=[vpmem_resource_0, vpmem_resource_1])
+        res = etree.tostring(migration._update_device_resources_xml(
+                                copy.deepcopy(doc), new_resources),
+                             encoding='unicode')
+        # we expect vpmem info will be updated in xml after invoking
+        # _update_device_resources_xml
+        new_xml = old_xml.replace("/dev/dax0.1", "/dev/dax1.0")
+        new_xml = new_xml.replace("/dev/dax0.2", "/dev/dax2.0")
+        self.assertXmlEqual(res, new_xml)
+
+    def test_update_numa_xml(self):
+        doc = etree.fromstring("""
+            <domain>
+              <cputune>
+                <vcpupin vcpu="0" cpuset="0,1,2,^2"/>
+                <vcpupin vcpu="1" cpuset="2-4,^4"/>
+                <emulatorpin cpuset="8-10,^8"/>
+                <vcpusched vcpus="10" priority="13" scheduler="fifo"/>
+                <vcpusched vcpus="11" priority="13" scheduler="fifo"/>
+              </cputune>
+              <numatune>
+                <memory nodeset="4,5,6,7"/>
+                <memnode cellid="2" nodeset="4-6,^6"/>
+                <memnode cellid="3" nodeset="6-8,^8"/>
+              </numatune>
+            </domain>""")
         data = objects.LibvirtLiveMigrateData(
             dst_numa_info=objects.LibvirtLiveMigrateNUMAInfo(
-                cpu_pins={'0': set([10, 11]),
-                          '1': set([12, 13])},
-                cell_pins={'2': set([14, 15]),
-                           '3': set([16, 17])},
+                cpu_pins={'0': set([10, 11]), '1': set([12, 13])},
+                cell_pins={'2': set([14, 15]), '3': set([16, 17])},
                 emulator_pins=set([18, 19]),
                 sched_vcpus=set([20, 21]),
                 sched_priority=22))
-        res = etree.tostring(migration._update_numa_xml(copy.deepcopy(doc),
-                                                        data),
-                             encoding='unicode')
-        doc.find('./cputune/vcpupin/[@vcpu="0"]').set('cpuset', '10-11')
-        doc.find('./cputune/vcpupin/[@vcpu="1"]').set('cpuset', '12-13')
-        doc.find('./cputune/emulatorpin').set('cpuset', '18-19')
-        doc.find('./cputune/vcpusched').set('vcpus', '20-21')
-        doc.find('./cputune/vcpusched').set('priority', '22')
-        doc.find('./numatune/memory').set('nodeset', '14-17')
-        doc.find('./numatune/memnode/[@cellid="2"]').set('nodeset', '14-15')
-        doc.find('./numatune/memnode/[@cellid="3"]').set('nodeset', '16-17')
-        self.assertXmlEqual(res, etree.tostring(doc, encoding='unicode'))
+
+        result = etree.tostring(
+            migration._update_numa_xml(copy.deepcopy(doc), data),
+            encoding='unicode')
+
+        expected = textwrap.dedent("""
+            <domain>
+              <cputune>
+                <vcpupin vcpu="0" cpuset="10-11"/>
+                <vcpupin vcpu="1" cpuset="12-13"/>
+                <emulatorpin cpuset="18-19"/>
+                <vcpusched vcpus="20-21" priority="22" scheduler="fifo"/>
+              </cputune>
+              <numatune>
+                <memory nodeset="14-17"/>
+                <memnode cellid="2" nodeset="14-15"/>
+                <memnode cellid="3" nodeset="16-17"/>
+              </numatune>
+            </domain>""")
+
+        self.assertXmlEqual(expected, result)
 
     def test_update_numa_xml_no_updates(self):
         xml = textwrap.dedent("""
@@ -311,8 +356,15 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
 
         get_volume_config = mock.MagicMock(return_value=conf)
         doc = etree.fromstring(xml)
-        res = etree.tostring(migration._update_volume_xml(
-            doc, data, get_volume_config), encoding='unicode')
+        res = etree.tostring(
+            migration._update_volume_xml(
+                doc,
+                data,
+                mock.sentinel.instance,
+                get_volume_config
+            ),
+            encoding='unicode'
+        )
         new_xml = xml.replace('ip-1.2.3.4:3260-iqn.abc.12345.opst-lun-X',
                               'ip-1.2.3.4:3260-iqn.cde.67890.opst-lun-Z')
         self.assertXmlEqual(res, new_xml)
@@ -378,10 +430,16 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
 
         get_volume_config = mock.MagicMock(return_value=conf)
         doc = etree.fromstring(xml)
-        res = etree.tostring(migration._update_volume_xml(
-            doc, data, get_volume_config), encoding='unicode')
-        new_xml = xml.replace('sdb',
-                              'sdc')
+        res = etree.tostring(
+            migration._update_volume_xml(
+                doc,
+                data,
+                mock.sentinel.instance,
+                get_volume_config
+            ),
+            encoding='unicode'
+        )
+        new_xml = xml.replace('sdb', 'sdc')
         self.assertXmlEqual(res, new_xml)
 
     def test_update_volume_xml_add_encryption(self):
@@ -467,8 +525,15 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
 
         get_volume_config = mock.MagicMock(return_value=conf)
         doc = etree.fromstring(xml)
-        res = etree.tostring(migration._update_volume_xml(
-            doc, data, get_volume_config), encoding='unicode')
+        res = etree.tostring(
+            migration._update_volume_xml(
+                doc,
+                data,
+                mock.sentinel.instance,
+                get_volume_config
+            ),
+            encoding='unicode'
+        )
         self.assertXmlEqual(res, new_xml)
 
     def test_update_volume_xml_update_encryption(self):
@@ -535,8 +600,15 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
 
         get_volume_config = mock.MagicMock(return_value=conf)
         doc = etree.fromstring(xml)
-        res = etree.tostring(migration._update_volume_xml(
-            doc, data, get_volume_config), encoding='unicode')
+        res = etree.tostring(
+            migration._update_volume_xml(
+                doc,
+                data,
+                mock.sentinel.instance,
+                get_volume_config
+            ),
+            encoding='unicode'
+        )
         new_xml = xml.replace(uuids.encryption_secret_uuid_old,
                               uuids.encryption_secret_uuid_new)
         self.assertXmlEqual(res, new_xml)
@@ -613,6 +685,7 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
     <source type="file"/>
     <access mode="shared"/>
     <allocation mode="immediate"/>
+    <discard />
   </memoryBacking>
 </domain>"""
         doc = etree.fromstring(xml)
@@ -636,84 +709,13 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
     <source type="file"/>
     <access mode="shared"/>
     <allocation mode="immediate"/>
+    <discard />
   </memoryBacking>
 </domain>""")
 
     def test_update_memory_backing_xml_keep(self):
         data = objects.LibvirtLiveMigrateData(
             dst_wants_file_backed_memory=True)
-
-        xml = """<domain>
-  <memoryBacking>
-    <source type="file"/>
-    <access mode="shared"/>
-    <allocation mode="immediate"/>
-  </memoryBacking>
-</domain>"""
-        doc = etree.fromstring(xml)
-        res = etree.tostring(migration._update_memory_backing_xml(doc, data),
-                             encoding='unicode')
-
-        self.assertXmlEqual(res, """<domain>
-  <memoryBacking>
-    <source type="file"/>
-    <access mode="shared"/>
-    <allocation mode="immediate"/>
-  </memoryBacking>
-</domain>""")
-
-    def test_update_memory_backing_discard_add(self):
-        data = objects.LibvirtLiveMigrateData(
-            dst_wants_file_backed_memory=True, file_backed_memory_discard=True)
-
-        xml = """<domain>
-  <memoryBacking>
-    <source type="file"/>
-    <access mode="shared"/>
-    <allocation mode="immediate"/>
-  </memoryBacking>
-</domain>"""
-        doc = etree.fromstring(xml)
-        res = etree.tostring(migration._update_memory_backing_xml(doc, data),
-                             encoding='unicode')
-
-        self.assertXmlEqual(res, """<domain>
-  <memoryBacking>
-    <source type="file"/>
-    <access mode="shared"/>
-    <allocation mode="immediate"/>
-    <discard />
-  </memoryBacking>
-</domain>""")
-
-    def test_update_memory_backing_discard_remove(self):
-        data = objects.LibvirtLiveMigrateData(
-            dst_wants_file_backed_memory=True,
-            file_backed_memory_discard=False)
-
-        xml = """<domain>
-  <memoryBacking>
-    <source type="file"/>
-    <access mode="shared"/>
-    <allocation mode="immediate"/>
-    <discard />
-  </memoryBacking>
-</domain>"""
-        doc = etree.fromstring(xml)
-        res = etree.tostring(migration._update_memory_backing_xml(doc, data),
-                             encoding='unicode')
-
-        self.assertXmlEqual(res, """<domain>
-  <memoryBacking>
-    <source type="file"/>
-    <access mode="shared"/>
-    <allocation mode="immediate"/>
-  </memoryBacking>
-</domain>""")
-
-    def test_update_memory_backing_discard_keep(self):
-        data = objects.LibvirtLiveMigrateData(
-            dst_wants_file_backed_memory=True, file_backed_memory_discard=True)
 
         xml = """<domain>
   <memoryBacking>
@@ -923,8 +925,7 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
         ex = self.assertRaises(exception.NovaException,
                                migration._update_vif_xml,
                                doc, data, get_vif_config)
-        self.assertIn('Unable to find MAC address in interface XML',
-                      six.text_type(ex))
+        self.assertIn('Unable to find MAC address in interface XML', str(ex))
 
     def test_update_vif_xml_no_matching_vif(self):
         """Tests that the vif in the migrate data is not found in the existing
@@ -948,14 +949,14 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
         doc = etree.fromstring(original_xml)
         ex = self.assertRaises(KeyError, migration._update_vif_xml,
                                doc, data, get_vif_config)
-        self.assertIn("CA:FE:DE:AD:BE:EF", six.text_type(ex))
+        self.assertIn("CA:FE:DE:AD:BE:EF", str(ex))
 
 
 class MigrationMonitorTestCase(test.NoDBTestCase):
     def setUp(self):
         super(MigrationMonitorTestCase, self).setUp()
 
-        self.useFixture(fakelibvirt.FakeLibvirtFixture())
+        self.useFixture(nova_fixtures.LibvirtFixture())
 
         flavor = objects.Flavor(memory_mb=2048,
                                 swap=0,
@@ -982,12 +983,12 @@ class MigrationMonitorTestCase(test.NoDBTestCase):
             'image_ref': '155d900f-4e14-4e4c-a73d-069cbf4541e6',
             'root_gb': 10,
             'ephemeral_gb': 20,
-            'instance_type_id': '5',  # m1.small
+            'instance_type_id': flavor.id,
+            'flavor': flavor,
             'extra_specs': {},
             'system_metadata': {
                 'image_disk_format': 'raw',
             },
-            'flavor': flavor,
             'new_flavor': None,
             'old_flavor': None,
             'pci_devices': objects.PciDeviceList(),

@@ -25,7 +25,7 @@ per-aggregate basis by setting the desired ``xxx_weight_multiplier`` aggregate
 metadata.
 
 Administrators are able to optionally expose a host aggregate as an
-:term:`availability zone`. Availability zones are different from host
+:term:`Availability Zone`. Availability zones are different from host
 aggregates in that they are explicitly exposed to the user, and hosts can only
 be in a single availability zone. Administrators can configure a default
 availability zone where instances will be scheduled when the user fails to
@@ -336,14 +336,11 @@ related availability zones feature operate under the hood:
 Finally, as discussed previously, there are a number of host aggregate-specific
 scheduler filters. These are:
 
-- :ref:`AggregateCoreFilter`
-- :ref:`AggregateDiskFilter`
 - :ref:`AggregateImagePropertiesIsolation`
 - :ref:`AggregateInstanceExtraSpecsFilter`
 - :ref:`AggregateIoOpsFilter`
 - :ref:`AggregateMultiTenancyIsolation`
 - :ref:`AggregateNumInstancesFilter`
-- :ref:`AggregateRamFilter`
 - :ref:`AggregateTypeAffinityFilter`
 
 The following configuration options are applicable to the scheduler

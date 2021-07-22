@@ -2,21 +2,14 @@
 nova-status
 ===========
 
---------------------------------------
-CLI interface for nova status commands
---------------------------------------
-
-:Author: openstack@lists.openstack.org
-:Copyright: OpenStack Foundation
-:Manual section: 1
-:Manual group: cloud computing
+.. program:: nova-status
 
 Synopsis
 ========
 
 ::
 
-  nova-status <category> <action> [<args>]
+  nova-status <category> [<action> [<options>...]]
 
 Description
 ===========
@@ -141,12 +134,25 @@ Upgrade
   * The ``Request Spec Migration`` check was removed.
 
   **21.0.0 (Ussuri)**
+
   * Checks for the Placement API are modified to require version 1.35.
+  * Checks for the policy files are not automatically overwritten with
+    new defaults.
+
+  **22.0.0 (Victoria)**
+
+  * Checks for the policy files is not JSON-formatted.
+
+  **23.0.0 (Wallaby)**
+
+  * Checks for computes older than the previous major release
+  * Checks for any instances without ``hw_machine_type`` set.
 
 See Also
 ========
 
-* :nova-doc:`OpenStack Nova <>`
+:doc:`nova-manage(1) <nova-manage>`,
+:doc:`nova-policy(1) <nova-policy>`
 
 Bugs
 ====

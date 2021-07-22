@@ -53,8 +53,9 @@ class InstanceActionsController(wsgi.Controller):
             action[key] = action_raw.get(key)
         return action
 
-    def _format_event(self, event_raw, project_id, show_traceback=False,
-                      show_host=False, show_hostid=False):
+    @staticmethod
+    def _format_event(event_raw, project_id, show_traceback=False,
+                      show_host=False, show_hostid=False, show_details=False):
         event = {}
         for key in EVENT_KEYS:
             # By default, non-admins are not allowed to see traceback details.
@@ -67,6 +68,8 @@ class InstanceActionsController(wsgi.Controller):
         if show_hostid:
             event['hostId'] = utils.generate_hostid(event_raw['host'],
                                                     project_id)
+        if show_details:
+            event['details'] = event_raw['details']
         return event
 
     @wsgi.Controller.api_version("2.1", "2.20")
@@ -74,7 +77,7 @@ class InstanceActionsController(wsgi.Controller):
         return common.get_instance(self.compute_api, context, server_id)
 
     @wsgi.Controller.api_version("2.21")  # noqa
-    def _get_instance(self, req, context, server_id):
+    def _get_instance(self, req, context, server_id):  # noqa
         with utils.temporary_mutation(context, read_deleted='yes'):
             return common.get_instance(self.compute_api, context, server_id)
 
@@ -84,7 +87,7 @@ class InstanceActionsController(wsgi.Controller):
         """Returns the list of actions recorded for a given instance."""
         context = req.environ["nova.context"]
         instance = self._get_instance(req, context, server_id)
-        context.can(ia_policies.BASE_POLICY_NAME,
+        context.can(ia_policies.BASE_POLICY_NAME % 'list',
                     target={'project_id': instance.project_id})
         actions_raw = self.action_api.actions_get(context, instance)
         actions = [self._format_action(action, ACTION_KEYS)
@@ -97,11 +100,11 @@ class InstanceActionsController(wsgi.Controller):
                              "2.66")
     @validation.query_schema(schema_instance_actions.list_query_params_v258,
                              "2.58", "2.65")
-    def index(self, req, server_id):
+    def index(self, req, server_id):  # noqa
         """Returns the list of actions recorded for a given instance."""
         context = req.environ["nova.context"]
         instance = self._get_instance(req, context, server_id)
-        context.can(ia_policies.BASE_POLICY_NAME,
+        context.can(ia_policies.BASE_POLICY_NAME % 'list',
                     target={'project_id': instance.project_id})
         search_opts = {}
         search_opts.update(req.GET)
@@ -140,7 +143,7 @@ class InstanceActionsController(wsgi.Controller):
         """Return data about the given instance action."""
         context = req.environ['nova.context']
         instance = self._get_instance(req, context, server_id)
-        context.can(ia_policies.BASE_POLICY_NAME,
+        context.can(ia_policies.BASE_POLICY_NAME % 'show',
                     target={'project_id': instance.project_id})
         action = self.action_api.action_get_by_request_id(context, instance,
                                                           id)
@@ -161,7 +164,7 @@ class InstanceActionsController(wsgi.Controller):
         show_events = False
         show_traceback = False
         show_host = False
-        if context.can(ia_policies.POLICY_ROOT % 'events',
+        if context.can(ia_policies.BASE_POLICY_NAME % 'events',
                        target={'project_id': instance.project_id},
                        fatal=False):
             # For all microversions, the user can see all event details
@@ -178,6 +181,15 @@ class InstanceActionsController(wsgi.Controller):
         show_hostid = api_version_request.is_supported(req, '2.62')
 
         if show_events:
+            # NOTE(brinzhang): Event details are shown since microversion
+            # 2.84.
+            show_details = False
+            support_v284 = api_version_request.is_supported(req, '2.84')
+            if support_v284:
+                show_details = context.can(
+                    ia_policies.BASE_POLICY_NAME % 'events:details',
+                    target={'project_id': instance.project_id}, fatal=False)
+
             events_raw = self.action_api.action_events_get(context, instance,
                                                            action_id)
             # NOTE(takashin): The project IDs of instance action events
@@ -189,6 +201,7 @@ class InstanceActionsController(wsgi.Controller):
             action['events'] = [self._format_event(
                 evt, action['project_id'] or instance.project_id,
                 show_traceback=show_traceback,
-                show_host=show_host, show_hostid=show_hostid
+                show_host=show_host, show_hostid=show_hostid,
+                show_details=show_details
             ) for evt in events_raw]
         return {'instanceAction': action}

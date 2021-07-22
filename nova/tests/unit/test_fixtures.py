@@ -15,6 +15,8 @@
 # under the License.
 
 import copy
+import datetime
+import io
 
 import fixtures as fx
 import futurist
@@ -40,7 +42,6 @@ from nova.objects import base as obj_base
 from nova.objects import service as service_obj
 from nova import test
 from nova.tests import fixtures
-from nova.tests.unit import conf_fixture
 from nova.tests.unit import fake_instance
 from nova import utils
 
@@ -88,11 +89,12 @@ class TestLogging(testtools.TestCase):
 class TestOSAPIFixture(testtools.TestCase):
     @mock.patch('nova.objects.Service.get_by_host_and_binary')
     @mock.patch('nova.objects.Service.create')
+    @mock.patch('nova.utils.raise_if_old_compute', new=mock.Mock())
     def test_responds_to_version(self, mock_service_create, mock_get):
         """Ensure the OSAPI server responds to calls sensibly."""
         self.useFixture(output.CaptureOutput())
         self.useFixture(fixtures.StandardLogging())
-        self.useFixture(conf_fixture.ConfFixture())
+        self.useFixture(fixtures.ConfFixture())
         self.useFixture(fixtures.RPCFixture('nova.test'))
         api = self.useFixture(fixtures.OSAPIFixture()).api
 
@@ -117,7 +119,7 @@ class TestOSAPIFixture(testtools.TestCase):
 class TestDatabaseFixture(testtools.TestCase):
     def test_fixture_reset(self):
         # because this sets up reasonable db connection strings
-        self.useFixture(conf_fixture.ConfFixture())
+        self.useFixture(fixtures.ConfFixture())
         self.useFixture(fixtures.Database())
         engine = session.get_engine()
         conn = engine.connect()
@@ -148,7 +150,7 @@ class TestDatabaseFixture(testtools.TestCase):
 
     def test_api_fixture_reset(self):
         # This sets up reasonable db connection strings
-        self.useFixture(conf_fixture.ConfFixture())
+        self.useFixture(fixtures.ConfFixture())
         self.useFixture(fixtures.Database(database='api'))
         engine = session.get_api_engine()
         conn = engine.connect()
@@ -176,7 +178,7 @@ class TestDatabaseFixture(testtools.TestCase):
 
     def test_fixture_cleanup(self):
         # because this sets up reasonable db connection strings
-        self.useFixture(conf_fixture.ConfFixture())
+        self.useFixture(fixtures.ConfFixture())
         fix = fixtures.Database()
         self.useFixture(fix)
 
@@ -191,7 +193,7 @@ class TestDatabaseFixture(testtools.TestCase):
 
     def test_api_fixture_cleanup(self):
         # This sets up reasonable db connection strings
-        self.useFixture(conf_fixture.ConfFixture())
+        self.useFixture(fixtures.ConfFixture())
         fix = fixtures.Database(database='api')
         self.useFixture(fix)
 
@@ -215,37 +217,10 @@ class TestDatabaseFixture(testtools.TestCase):
         self.assertEqual("BEGIN TRANSACTION;COMMIT;", schema)
 
 
-class TestDatabaseAtVersionFixture(testtools.TestCase):
-    def test_fixture_schema_version(self):
-        self.useFixture(conf_fixture.ConfFixture())
-
-        # In/after 317 aggregates did have uuid
-        self.useFixture(fixtures.DatabaseAtVersion(318))
-        engine = session.get_engine()
-        engine.connect()
-        meta = sqlalchemy.MetaData(engine)
-        aggregate = sqlalchemy.Table('aggregates', meta, autoload=True)
-        self.assertTrue(hasattr(aggregate.c, 'uuid'))
-
-        # Before 317, aggregates had no uuid
-        self.useFixture(fixtures.DatabaseAtVersion(316))
-        engine = session.get_engine()
-        engine.connect()
-        meta = sqlalchemy.MetaData(engine)
-        aggregate = sqlalchemy.Table('aggregates', meta, autoload=True)
-        self.assertFalse(hasattr(aggregate.c, 'uuid'))
-        engine.dispose()
-
-    def test_fixture_after_database_fixture(self):
-        self.useFixture(conf_fixture.ConfFixture())
-        self.useFixture(fixtures.Database())
-        self.useFixture(fixtures.DatabaseAtVersion(318))
-
-
 class TestDefaultFlavorsFixture(testtools.TestCase):
     @mock.patch("nova.objects.flavor.Flavor._send_notification")
     def test_flavors(self, mock_send_notification):
-        self.useFixture(conf_fixture.ConfFixture())
+        self.useFixture(fixtures.ConfFixture())
         self.useFixture(fixtures.Database())
         self.useFixture(fixtures.Database(database='api'))
 
@@ -566,3 +541,101 @@ class TestNeutronFixture(test.NoDBTestCase):
         port_id = self.neutron.port_with_resource_request['id']
         ports = [port for port in ports if port_id == port['id']]
         self.assertIsNotNone(ports[0]['resource_request'])
+
+
+class TestGlanceFixture(test.NoDBTestCase):
+    def setUp(self):
+        super().setUp()
+        self.image_service = self.useFixture(fixtures.GlanceFixture(self))
+        self.context = context.get_admin_context()
+
+    def test_detail(self):
+        res = self.image_service.detail(self.context)
+        for image in res:
+            self.assertEqual(
+                set(image.keys()),
+                {
+                    'id', 'name', 'created_at', 'updated_at', 'deleted_at',
+                    'deleted', 'status', 'is_public', 'properties',
+                    'disk_format', 'container_format', 'size', 'min_disk',
+                    'min_ram', 'protected', 'tags', 'visibility',
+                },
+            )
+            self.assertIsInstance(image['created_at'], datetime.datetime)
+            self.assertIsInstance(image['updated_at'], datetime.datetime)
+
+            if not (
+                isinstance(image['deleted_at'], datetime.datetime) or
+                image['deleted_at'] is None
+            ):
+                self.fail(
+                    "image's 'deleted_at' attribute was neither a datetime "
+                    "object nor None"
+                )
+
+            def check_is_bool(image, key):
+                val = image.get('deleted')
+                if not isinstance(val, bool):
+                    self.fail(
+                        "image's '%s' attribute wasn't a bool: %r" % (key, val)
+                    )
+
+            check_is_bool(image, 'deleted')
+            check_is_bool(image, 'is_public')
+
+    def test_show_raises_imagenotfound_for_invalid_id(self):
+        self.assertRaises(
+            exception.ImageNotFound,
+            self.image_service.show,
+            self.context, 'this image does not exist')
+
+    def test_create_adds_id(self):
+        index = self.image_service.detail(self.context)
+        image_count = len(index)
+
+        self.image_service.create(self.context, {})
+
+        index = self.image_service.detail(self.context)
+        self.assertEqual(len(index), image_count + 1)
+        self.assertTrue(index[0]['id'])
+
+    def test_create_keeps_id(self):
+        self.image_service.create(self.context, {'id': '34'})
+        self.image_service.show(self.context, '34')
+
+    def test_create_rejects_duplicate_ids(self):
+        self.image_service.create(self.context, {'id': '34'})
+        self.assertRaises(
+            exception.CouldNotUploadImage,
+            self.image_service.create,
+            self.context, {'id': '34'})
+
+        # Make sure there's still one left
+        self.image_service.show(self.context, '34')
+
+    def test_update(self):
+        self.image_service.create(
+            self.context, {'id': '34', 'foo': 'bar'})
+
+        self.image_service.update(
+            self.context, '34', {'id': '34', 'foo': 'baz'})
+
+        img = self.image_service.show(self.context, '34')
+        self.assertEqual(img['foo'], 'baz')
+
+    def test_delete(self):
+        self.image_service.create(self.context, {'id': '34', 'foo': 'bar'})
+        self.image_service.delete(self.context, '34')
+        self.assertRaises(
+            exception.NotFound,
+            self.image_service.show,
+            self.context, '34')
+
+    def test_create_then_get(self):
+        blob = 'some data'
+        s1 = io.StringIO(blob)
+        self.image_service.create(
+            self.context, {'id': '32', 'foo': 'bar'}, data=s1)
+        s2 = io.StringIO()
+        self.image_service.download(self.context, '32', data=s2)
+        self.assertEqual(s2.getvalue(), blob, 'Did not get blob back intact')

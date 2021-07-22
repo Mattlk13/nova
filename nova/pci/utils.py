@@ -14,15 +14,18 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-
 import glob
 import os
 import re
+import typing as ty
 
 from oslo_log import log as logging
-import six
 
 from nova import exception
+
+if ty.TYPE_CHECKING:
+    # avoid circular import
+    from nova.pci import stats
 
 LOG = logging.getLogger(__name__)
 
@@ -31,11 +34,12 @@ _PCI_ADDRESS_PATTERN = ("^(hex{4}):(hex{2}):(hex{2}).(oct{1})$".
                                              replace("hex", r"[\da-fA-F]").
                                              replace("oct", "[0-7]"))
 _PCI_ADDRESS_REGEX = re.compile(_PCI_ADDRESS_PATTERN)
-
 _SRIOV_TOTALVFS = "sriov_totalvfs"
 
 
-def pci_device_prop_match(pci_dev, specs):
+def pci_device_prop_match(
+    pci_dev: 'stats.Pool', specs: ty.List[ty.Dict[str, str]],
+) -> bool:
     """Check if the pci_dev meet spec requirement
 
     Specs is a list of PCI device property requirements.
@@ -48,7 +52,8 @@ def pci_device_prop_match(pci_dev, specs):
       "capabilities_network": ["rx", "tx", "tso", "gso"]}]
 
     """
-    def _matching_devices(spec):
+
+    def _matching_devices(spec: ty.Dict[str, str]) -> bool:
         for k, v in spec.items():
             pci_dev_v = pci_dev.get(k)
             if isinstance(v, list) and isinstance(pci_dev_v, list):
@@ -59,9 +64,9 @@ def pci_device_prop_match(pci_dev, specs):
                 # mismatch with the tags provided by users for port
                 # binding profile and the ones configured by operators
                 # with pci whitelist option.
-                if isinstance(v, six.string_types):
+                if isinstance(v, str):
                     v = v.lower()
-                if isinstance(pci_dev_v, six.string_types):
+                if isinstance(pci_dev_v, str):
                     pci_dev_v = pci_dev_v.lower()
                 if pci_dev_v != v:
                     return False
@@ -70,8 +75,10 @@ def pci_device_prop_match(pci_dev, specs):
     return any(_matching_devices(spec) for spec in specs)
 
 
-def parse_address(address):
-    """Returns (domain, bus, slot, function) from PCI address that is stored in
+def parse_address(address: str) -> ty.Sequence[str]:
+    """Parse a PCI address.
+
+    Returns (domain, bus, slot, function) from PCI address that is stored in
     PciDevice DB table.
     """
     m = _PCI_ADDRESS_REGEX.match(address)
@@ -80,7 +87,7 @@ def parse_address(address):
     return m.groups()
 
 
-def get_pci_address_fields(pci_addr):
+def get_pci_address_fields(pci_addr: str) -> ty.Tuple[str, str, str, str]:
     """Parse a fully-specified PCI device address.
 
     Does not validate that the components are valid hex or wildcard values.
@@ -93,7 +100,7 @@ def get_pci_address_fields(pci_addr):
     return domain, bus, slot, func
 
 
-def get_pci_address(domain, bus, slot, func):
+def get_pci_address(domain: str, bus: str, slot: str, func: str) -> str:
     """Assembles PCI address components into a fully-specified PCI address.
 
     Does not validate that the components are valid hex or wildcard values.
@@ -104,7 +111,7 @@ def get_pci_address(domain, bus, slot, func):
     return '%s:%s:%s.%s' % (domain, bus, slot, func)
 
 
-def get_function_by_ifname(ifname):
+def get_function_by_ifname(ifname: str) -> ty.Tuple[ty.Optional[str], bool]:
     """Given the device name, returns the PCI address of a device
     and returns True if the address is in a physical function.
     """
@@ -122,7 +129,9 @@ def get_function_by_ifname(ifname):
     return None, False
 
 
-def is_physical_function(domain, bus, slot, function):
+def is_physical_function(
+    domain: str, bus: str, slot: str, function: str,
+) -> bool:
     dev_path = "/sys/bus/pci/devices/%(d)s:%(b)s:%(s)s.%(f)s/" % {
         "d": domain, "b": bus, "s": slot, "f": function}
     if os.path.isdir(dev_path):
@@ -135,7 +144,7 @@ def is_physical_function(domain, bus, slot, function):
     return False
 
 
-def _get_sysfs_netdev_path(pci_addr, pf_interface):
+def _get_sysfs_netdev_path(pci_addr: str, pf_interface: bool) -> str:
     """Get the sysfs path based on the PCI address of the device.
 
     Assumes a networking device - will not check for the existence of the path.
@@ -145,7 +154,9 @@ def _get_sysfs_netdev_path(pci_addr, pf_interface):
     return "/sys/bus/pci/devices/%s/net" % pci_addr
 
 
-def get_ifname_by_pci_address(pci_addr, pf_interface=False):
+def get_ifname_by_pci_address(
+    pci_addr: str, pf_interface: bool = False,
+) -> str:
     """Get the interface name based on a VF's pci address.
 
     The returned interface name is either the parent PF's or that of the VF
@@ -159,7 +170,7 @@ def get_ifname_by_pci_address(pci_addr, pf_interface=False):
         raise exception.PciDeviceNotFoundById(id=pci_addr)
 
 
-def get_mac_by_pci_address(pci_addr, pf_interface=False):
+def get_mac_by_pci_address(pci_addr: str, pf_interface: bool = False) -> str:
     """Get the MAC address of the nic based on its PCI address.
 
     Raises PciDeviceNotFoundById in case the pci device is not a NIC
@@ -180,7 +191,7 @@ def get_mac_by_pci_address(pci_addr, pf_interface=False):
         raise exception.PciDeviceNotFoundById(id=pci_addr)
 
 
-def get_vf_num_by_pci_address(pci_addr):
+def get_vf_num_by_pci_address(pci_addr: str) -> str:
     """Get the VF number based on a VF's pci address
 
     A VF is associated with an VF number, which ip link command uses to
@@ -189,38 +200,14 @@ def get_vf_num_by_pci_address(pci_addr):
     VIRTFN_RE = re.compile(r"virtfn(\d+)")
     virtfns_path = "/sys/bus/pci/devices/%s/physfn/virtfn*" % (pci_addr)
     vf_num = None
-    try:
-        for vf_path in glob.iglob(virtfns_path):
-            if re.search(pci_addr, os.readlink(vf_path)):
-                t = VIRTFN_RE.search(vf_path)
+
+    for vf_path in glob.iglob(virtfns_path):
+        if re.search(pci_addr, os.readlink(vf_path)):
+            t = VIRTFN_RE.search(vf_path)
+            if t:
                 vf_num = t.group(1)
                 break
-    except Exception:
-        pass
-    if vf_num is None:
+    else:
         raise exception.PciDeviceNotFoundById(id=pci_addr)
+
     return vf_num
-
-
-def get_net_name_by_vf_pci_address(vfaddress):
-    """Given the VF PCI address, returns the net device name.
-
-    Every VF is associated to a PCI network device. This function
-    returns the libvirt name given to this network device; e.g.:
-
-        <device>
-            <name>net_enp8s0f0_90_e2_ba_5e_a6_40</name>
-        ...
-
-    In the libvirt parser information tree, the network device stores the
-    network capabilities associated to this device.
-    """
-    try:
-        mac = get_mac_by_pci_address(vfaddress).split(':')
-        ifname = get_ifname_by_pci_address(vfaddress)
-        return ("net_%(ifname)s_%(mac)s" %
-                {'ifname': ifname, 'mac': '_'.join(mac)})
-    except Exception:
-        LOG.warning("No net device was found for VF %(vfaddress)s",
-                    {'vfaddress': vfaddress})
-        return

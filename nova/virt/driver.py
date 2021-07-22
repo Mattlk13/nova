@@ -26,10 +26,11 @@ import os_resource_classes as orc
 import os_traits
 from oslo_log import log as logging
 from oslo_utils import importutils
-import six
 
 import nova.conf
+from nova import context as nova_context
 from nova.i18n import _
+from nova import objects
 from nova.virt import event as virtevent
 
 CONF = nova.conf.CONF
@@ -100,7 +101,6 @@ def block_device_info_get_mapping(block_device_info):
 # trait, it needs to be (made) standard, and must be prefixed with
 # "COMPUTE_".
 CAPABILITY_TRAITS_MAP = {
-    # Added in os-traits 0.7.0.
     "supports_attach_interface": os_traits.COMPUTE_NET_ATTACH_INTERFACE,
     "supports_device_tagging": os_traits.COMPUTE_DEVICE_TAGGING,
     "supports_tagged_attach_interface":
@@ -108,10 +108,8 @@ CAPABILITY_TRAITS_MAP = {
     "supports_tagged_attach_volume": os_traits.COMPUTE_VOLUME_ATTACH_WITH_TAG,
     "supports_extend_volume": os_traits.COMPUTE_VOLUME_EXTEND,
     "supports_multiattach": os_traits.COMPUTE_VOLUME_MULTI_ATTACH,
-    # Added in os-traits 0.8.0.
     "supports_trusted_certs": os_traits.COMPUTE_TRUSTED_CERTS,
-
-    # Image type support flags, added in os-traits 0.12.0
+    "supports_accelerators": os_traits.COMPUTE_ACCELERATORS,
     "supports_image_type_aki": os_traits.COMPUTE_IMAGE_TYPE_AKI,
     "supports_image_type_ami": os_traits.COMPUTE_IMAGE_TYPE_AMI,
     "supports_image_type_ari": os_traits.COMPUTE_IMAGE_TYPE_ARI,
@@ -122,20 +120,33 @@ CAPABILITY_TRAITS_MAP = {
     "supports_image_type_vhd": os_traits.COMPUTE_IMAGE_TYPE_VHD,
     "supports_image_type_vhdx": os_traits.COMPUTE_IMAGE_TYPE_VHDX,
     "supports_image_type_vmdk": os_traits.COMPUTE_IMAGE_TYPE_VMDK,
-    # Added in os-traits 2.0.0
     "supports_image_type_ploop": os_traits.COMPUTE_IMAGE_TYPE_PLOOP,
-
-    # Added in os-traits 2.1.0.
     "supports_migrate_to_same_host": os_traits.COMPUTE_SAME_HOST_COLD_MIGRATE,
+    "supports_bfv_rescue": os_traits.COMPUTE_RESCUE_BFV,
+    "supports_secure_boot": os_traits.COMPUTE_SECURITY_UEFI_SECURE_BOOT,
 }
+
+
+def _check_image_type_exclude_list(capability, supported):
+    """Enforce the exclusion list on image_type capabilites.
+
+    :param capability: The supports_image_type_foo capability being checked
+    :param supported: The flag indicating whether the virt driver *can*
+                      support the given image type.
+    :returns: True if the virt driver *can* support the image type and
+              if it is not listed in the config to be excluded.
+    """
+    image_type = capability.replace('supports_image_type_', '')
+    return (supported and
+            image_type not in CONF.compute.image_type_exclude_list)
 
 
 class ComputeDriver(object):
     """Base class for compute drivers.
 
     The interface to this class talks in terms of 'instances' (Amazon EC2 and
-    internal Nova terminology), by which we mean 'running virtual machine'
-    (XenAPI terminology) or domain (Xen or libvirt terminology).
+    internal Nova terminology), by which we mean 'running virtual machine' or
+    domain (libvirt terminology).
 
     An instance has an ID, which is the identifier chosen by Nova to represent
     the instance further up the stack.  This is unfortunately also called a
@@ -176,6 +187,10 @@ class ComputeDriver(object):
         "supports_multiattach": False,
         "supports_trusted_certs": False,
         "supports_pcpus": False,
+        "supports_accelerators": False,
+        "supports_bfv_rescue": False,
+        "supports_vtpm": False,
+        "supports_secure_boot": False,
 
         # Image type support flags
         "supports_image_type_aki": False,
@@ -279,7 +294,7 @@ class ComputeDriver(object):
                 admin_password, allocations, bdms, detach_block_devices,
                 attach_block_devices, network_info=None,
                 evacuate=False, block_device_info=None,
-                preserve_ephemeral=False):
+                preserve_ephemeral=False, accel_uuids=None):
         """Destroy and re-make this instance.
 
         A 'rebuild' effectively purges all existing data from the system and
@@ -316,6 +331,7 @@ class ComputeDriver(object):
                                   attached to the instance.
         :param preserve_ephemeral: True if the default ephemeral storage
                                    partition must be preserved on rebuild
+        :param accel_uuids: Accelerator UUIDs.
         """
         raise NotImplementedError()
 
@@ -349,7 +365,7 @@ class ComputeDriver(object):
 
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
-              block_device_info=None, power_on=True):
+              block_device_info=None, power_on=True, accel_info=None):
         """Create a new instance/VM/domain on the virtualization platform.
 
         Once this successfully completes, the instance should be
@@ -376,11 +392,27 @@ class ComputeDriver(object):
                                   attached to the instance.
         :param power_on: True if the instance should be powered on, False
                          otherwise
+        :param arqs: List of bound accelerator requests for this instance.
+            [
+             {'uuid': $arq_uuid,
+              'device_profile_name': $dp_name,
+              'device_profile_group_id': $dp_request_group_index,
+              'state': 'Bound',
+              'device_rp_uuid': $resource_provider_uuid,
+              'hostname': $host_nodename,
+              'instance_uuid': $instance_uuid,
+              'attach_handle_info': {  # PCI bdf
+                'bus': '0c', 'device': '0', 'domain': '0000', 'function': '0'},
+              'attach_handle_type': 'PCI'
+                   # or 'TEST_PCI' for Cyborg fake driver
+             }
+            ]
+            Also doc'd in nova/accelerator/cyborg.py::get_arqs_for_instance()
         """
         raise NotImplementedError()
 
     def destroy(self, context, instance, network_info, block_device_info=None,
-                destroy_disks=True):
+                destroy_disks=True, destroy_secrets=True):
         """Destroy the specified instance from the Hypervisor.
 
         If the instance is not found (for example if networking failed), this
@@ -393,11 +425,13 @@ class ComputeDriver(object):
         :param block_device_info: Information about block devices that should
                                   be detached from the instance.
         :param destroy_disks: Indicates if disks should be destroyed
+        :param destroy_secrets: Indicates if secrets should be destroyed
         """
         raise NotImplementedError()
 
     def cleanup(self, context, instance, network_info, block_device_info=None,
-                destroy_disks=True, migrate_data=None, destroy_vifs=True):
+                destroy_disks=True, migrate_data=None, destroy_vifs=True,
+                destroy_secrets=True):
         """Cleanup the instance resources .
 
         Instance should have been destroyed from the Hypervisor before calling
@@ -410,11 +444,14 @@ class ComputeDriver(object):
                                   be detached from the instance.
         :param destroy_disks: Indicates if disks should be destroyed
         :param migrate_data: implementation specific params
+        :param destroy_vifs: Indicates if vifs should be unplugged
+        :param destroy_secrets: Indicates if secrets should be destroyed
         """
         raise NotImplementedError()
 
     def reboot(self, context, instance, network_info, reboot_type,
-               block_device_info=None, bad_volumes_callback=None):
+               block_device_info=None, bad_volumes_callback=None,
+               accel_info=None):
         """Reboot the specified instance.
 
         After this is called successfully, the instance's state
@@ -429,11 +466,9 @@ class ComputeDriver(object):
         :param block_device_info: Info pertaining to attached volumes
         :param bad_volumes_callback: Function to handle any bad volumes
             encountered
+        :param accel_info: List of accelerator request dicts. The exact
+            data struct is doc'd in nova/virt/driver.py::spawn().
         """
-        raise NotImplementedError()
-
-    def get_console_pool_info(self, console_type):
-        # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
     def get_console_output(self, context, instance):
@@ -519,14 +554,6 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
-    def get_all_bw_counters(self, instances):
-        """Return bandwidth usage counters for each interface on each
-           running VM.
-
-        :param instances: nova.objects.instance.InstanceList
-        """
-        raise NotImplementedError()
-
     def get_all_volume_usage(self, context, compute_host_bdms):
         """Return usage info for volumes attached to vms on
            a given host.-
@@ -577,9 +604,11 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
-    def extend_volume(self, connection_info, instance, requested_size):
+    def extend_volume(self, context, connection_info, instance,
+                      requested_size):
         """Extend the disk attached to the instance.
 
+        :param context: The request context.
         :param dict connection_info:
             The connection for the extended volume.
         :param nova.objects.instance.Instance instance:
@@ -697,17 +726,9 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
-    def post_interrupted_snapshot_cleanup(self, context, instance):
-        """Cleans up any resources left after an interrupted snapshot.
-
-        :param context: security context
-        :param instance: nova.objects.instance.Instance
-        """
-        pass
-
     def finish_migration(self, context, migration, instance, disk_info,
                          network_info, image_meta, resize_instance,
-                         block_device_info=None, power_on=True):
+                         allocations, block_device_info=None, power_on=True):
         """Completes a resize/migration.
 
         :param context: the context for the migration/resize
@@ -719,6 +740,9 @@ class ComputeDriver(object):
             The metadata of the image of the instance.
         :param resize_instance: True if the instance is being resized,
                                 False otherwise
+        :param allocations: Information about resources allocated to the
+                            instance via placement, of the form returned by
+                            SchedulerReportClient.get_allocs_for_consumer.
         :param block_device_info: instance volume block device info
         :param power_on: True if the instance should be powered on, False
                          otherwise
@@ -827,7 +851,7 @@ class ComputeDriver(object):
         raise NotImplementedError()
 
     def rescue(self, context, instance, network_info, image_meta,
-               rescue_password):
+               rescue_password, block_device_info):
         """Rescue the specified instance.
 
         :param nova.context.RequestContext context:
@@ -839,22 +863,21 @@ class ComputeDriver(object):
         :param nova.objects.ImageMeta image_meta:
             The metadata of the image of the instance.
         :param rescue_password: new root password to set for rescue.
+        :param dict block_device_info:
+            The block device mapping of the instance.
         """
         raise NotImplementedError()
 
-    def set_bootable(self, instance, is_bootable):
-        """Set the ability to power on/off an instance.
-
-        :param instance: nova.objects.instance.Instance
-        """
-        raise NotImplementedError()
-
-    def unrescue(self, instance, network_info):
+    def unrescue(
+        self,
+        context: nova_context.RequestContext,
+        instance: 'objects.Instance',
+    ):
         """Unrescue the specified instance.
 
+        :param context: security context
         :param instance: nova.objects.instance.Instance
         """
-        # TODO(Vek): Need to pass context in for access to auth_token
         raise NotImplementedError()
 
     def power_off(self, instance, timeout=0, retry_interval=0):
@@ -868,10 +891,14 @@ class ComputeDriver(object):
         raise NotImplementedError()
 
     def power_on(self, context, instance, network_info,
-                 block_device_info=None):
+                 block_device_info=None, accel_info=None):
         """Power on the specified instance.
 
         :param instance: nova.objects.instance.Instance
+        :param network_info: instance network information
+        :param block_device_info: instance volume block device info
+        :param accel_info: List of accelerator request dicts. The exact
+            data struct is doc'd in nova/virt/driver.py::spawn().
         """
         raise NotImplementedError()
 
@@ -1063,6 +1090,10 @@ class ComputeDriver(object):
         """
         traits = {}
         for capability, supported in self.capabilities.items():
+            if capability.startswith('supports_image_type_'):
+                supported = _check_image_type_exclude_list(capability,
+                                                           supported)
+
             if capability in CAPABILITY_TRAITS_MAP:
                 traits[CAPABILITY_TRAITS_MAP[capability]] = supported
 
@@ -1304,11 +1335,6 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
-    def reset_network(self, instance):
-        """reset networking for specified instance."""
-        # TODO(Vek): Need to pass context in for access to auth_token
-        pass
-
     def set_admin_password(self, instance, new_pass):
         """Set the root password on the specified instance.
 
@@ -1316,34 +1342,6 @@ class ComputeDriver(object):
         :param new_pass: the new password
         """
         raise NotImplementedError()
-
-    def inject_file(self, instance, b64_path, b64_contents):
-        """Writes a file on the specified instance.
-
-        The first parameter is an instance of nova.compute.service.Instance,
-        and so the instance is being specified as instance.name. The second
-        parameter is the base64-encoded path to which the file is to be
-        written on the instance; the third is the contents of the file, also
-        base64-encoded.
-
-        NOTE(russellb) This method is deprecated and will be removed once it
-        can be removed from nova.compute.manager.
-        """
-        # TODO(Vek): Need to pass context in for access to auth_token
-        raise NotImplementedError()
-
-    def change_instance_metadata(self, context, instance, diff):
-        """Applies a diff to the instance metadata.
-
-        This is an optional driver method which is used to publish
-        changes to the instance's metadata to the hypervisor.  If the
-        hypervisor has no means of publishing the instance metadata to
-        the instance, then this method should not be implemented.
-
-        :param context: security context
-        :param instance: nova.objects.instance.Instance
-        """
-        pass
 
     def inject_network_info(self, instance, nw_info):
         """inject network info for specified instance."""
@@ -1487,10 +1485,9 @@ class ComputeDriver(object):
 
         All counters are long integers.
 
-        This method is optional.  On some platforms (e.g. XenAPI) performance
-        statistics can be retrieved directly in aggregate form, without Nova
-        having to do the aggregation.  On those platforms, this method is
-        unused.
+        This method is optional.  On some platforms performance statistics can
+        be retrieved directly in aggregate form, without Nova having to do the
+        aggregation.  On those platforms, this method is unused.
 
         Note that this function takes an instance ID.
 
@@ -1531,48 +1528,6 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
-    def add_to_aggregate(self, context, aggregate, host, **kwargs):
-        """Add a compute host to an aggregate.
-
-        The counter action to this is :func:`remove_from_aggregate`
-
-        :param nova.context.RequestContext context:
-            The security context.
-        :param nova.objects.aggregate.Aggregate aggregate:
-            The aggregate which should add the given `host`
-        :param str host:
-            The name of the host to add to the given `aggregate`.
-        :param dict kwargs:
-            A free-form thingy...
-
-        :return: None
-        """
-        # NOTE(jogo) Currently only used for XenAPI-Pool
-        raise NotImplementedError()
-
-    def remove_from_aggregate(self, context, aggregate, host, **kwargs):
-        """Remove a compute host from an aggregate.
-
-        The counter action to this is :func:`add_to_aggregate`
-
-        :param nova.context.RequestContext context:
-            The security context.
-        :param nova.objects.aggregate.Aggregate aggregate:
-            The aggregate which should remove the given `host`
-        :param str host:
-            The name of the host to remove from the given `aggregate`.
-        :param dict kwargs:
-            A free-form thingy...
-
-        :return: None
-        """
-        raise NotImplementedError()
-
-    def undo_aggregate_operation(self, context, op, aggregate,
-                                  host, set_error=True):
-        """Undo for Resource Pools."""
-        raise NotImplementedError()
-
     def get_volume_connector(self, instance):
         """Get connector information for the instance for attaching to volumes.
 
@@ -1605,13 +1560,6 @@ class ComputeDriver(object):
             return True
         # Refresh and check again.
         return nodename in self.get_available_nodes(refresh=True)
-
-    def get_per_instance_usage(self):
-        """Get information about instance resource usage.
-
-        :returns: dict of  nova uuid => dict of usage info
-        """
-        return {}
 
     def instance_on_disk(self, instance):
         """Checks access of instance files on the host.
@@ -1647,7 +1595,7 @@ class ComputeDriver(object):
         """
 
         if not self._compute_event_callback:
-            LOG.debug("Discarding event %s", six.text_type(event))
+            LOG.debug("Discarding event %s", str(event))
             return
 
         if not isinstance(event, virtevent.Event):
@@ -1655,7 +1603,7 @@ class ComputeDriver(object):
                 _("Event must be an instance of nova.virt.event.Event"))
 
         try:
-            LOG.debug("Emitting event %s", six.text_type(event))
+            LOG.debug("Emitting event %s", str(event))
             self._compute_event_callback(event)
         except Exception as ex:
             LOG.error("Exception dispatching event %(event)s: %(ex)s",
@@ -1829,6 +1777,17 @@ class ComputeDriver(object):
         """
         return False
 
+    def cleanup_lingering_instance_resources(self, instance):
+        """Cleanup resources occupied by lingering instance.
+
+        For example, cleanup other specific resources or whatever we
+        add in the future.
+
+        :param instance: nova.objects.instance.Instance
+        :returns: True if the cleanup is successful, else false.
+        """
+        return True
+
 
 def load_compute_driver(virtapi, compute_driver=None):
     """Load a compute driver module.
@@ -1860,13 +1819,9 @@ def load_compute_driver(virtapi, compute_driver=None):
             return driver
         raise ValueError()
     except ImportError:
-        LOG.exception(_("Unable to load the virtualization driver"))
+        LOG.exception("Unable to load the virtualization driver")
         sys.exit(1)
     except ValueError:
         LOG.exception("Compute driver '%s' from 'nova.virt' is not of type "
                       "'%s'", compute_driver, str(ComputeDriver))
         sys.exit(1)
-
-
-def is_xenapi():
-    return CONF.compute_driver == 'xenapi.XenAPIDriver'

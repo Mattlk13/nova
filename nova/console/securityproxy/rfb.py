@@ -16,7 +16,6 @@
 import struct
 
 from oslo_log import log as logging
-import six
 
 from nova.console.rfb import auth
 from nova.console.rfb import auths
@@ -53,7 +52,7 @@ class RFBSecurityProxy(base.SecurityProxy):
         self.auth_schemes = auths.RFBAuthSchemeList()
 
     def _make_var_str(self, message):
-        message_str = six.text_type(message)
+        message_str = str(message)
         message_bytes = message_str.encode('utf-8')
         message_len = struct.pack("!I", len(message_bytes))
         return message_len + message_bytes
@@ -123,7 +122,7 @@ class RFBSecurityProxy(base.SecurityProxy):
             raise exception.SecurityProxyNegotiationFailed(reason=reason)
 
         # Negotiate security with server
-        permitted_auth_types_cnt = six.byte2int(recv(compute_sock, 1))
+        permitted_auth_types_cnt = recv(compute_sock, 1)[0]
 
         if permitted_auth_types_cnt == 0:
             # Decode the reason why the request failed
@@ -139,7 +138,7 @@ class RFBSecurityProxy(base.SecurityProxy):
         f = recv(compute_sock, permitted_auth_types_cnt)
         permitted_auth_types = []
         for auth_type in f:
-            if isinstance(auth_type, six.string_types):
+            if isinstance(auth_type, str):
                 auth_type = ord(auth_type)
             permitted_auth_types.append(auth_type)
 
@@ -148,8 +147,8 @@ class RFBSecurityProxy(base.SecurityProxy):
         # Negotiate security with client before we say "ok" to the server
         # send 1:[None]
         tenant_sock.sendall(auth.AUTH_STATUS_PASS +
-                            six.int2byte(auth.AuthType.NONE))
-        client_auth = six.byte2int(recv(tenant_sock, 1))
+                            bytes((auth.AuthType.NONE,)))
+        client_auth = recv(tenant_sock, 1)[0]
 
         if client_auth != auth.AuthType.NONE:
             self._fail(tenant_sock, compute_sock,
@@ -170,9 +169,9 @@ class RFBSecurityProxy(base.SecurityProxy):
             self._fail(tenant_sock, compute_sock,
                        _("Unable to negotiate security with server"))
             raise exception.SecurityProxyNegotiationFailed(
-                reason=_("No compute auth available: %s") % six.text_type(e))
+                reason=_("No compute auth available: %s") % str(e))
 
-        compute_sock.sendall(six.int2byte(scheme.security_type()))
+        compute_sock.sendall(bytes((scheme.security_type(),)))
 
         LOG.debug("Using security type %d with server, None with client",
                   scheme.security_type())
@@ -184,7 +183,7 @@ class RFBSecurityProxy(base.SecurityProxy):
             # as that's information leakage
             self._fail(tenant_sock, None,
                        _("Unable to negotiate security with server"))
-            LOG.debug("Auth failed %s", six.text_type(e))
+            LOG.debug("Auth failed %s", str(e))
             raise exception.SecurityProxyNegotiationFailed(
                 reason=_("Auth handshake failed"))
 

@@ -271,6 +271,89 @@ Related options:
 * ``compute_driver`` (libvirt)
 * ``[libvirt]/images_type`` (rbd)
 """),
+    cfg.BoolOpt(
+        'disable_native_luksv1',
+        default=False,
+        deprecated_for_removal=True,
+        deprecated_since='23.0.0',
+        deprecated_reason="""
+The underlying performance regression within libgcrypt that prompted this
+workaround has been resolved as of 1.8.5
+""",
+        help="""
+When attaching encrypted LUKSv1 Cinder volumes to instances the Libvirt driver
+configures the encrypted disks to be natively decrypted by QEMU.
+
+A performance issue has been discovered in the libgcrypt library used by QEMU
+that serverly limits the I/O performance in this scenario.
+
+For more information please refer to the following bug report:
+
+RFE: hardware accelerated AES-XTS mode
+https://bugzilla.redhat.com/show_bug.cgi?id=1762765
+
+Enabling this workaround option will cause Nova to use the legacy dm-crypt
+based os-brick encryptor to decrypt the LUKSv1 volume.
+
+Note that enabling this option while using volumes that do not provide a host
+block device such as Ceph will result in a failure to boot from or attach the
+volume to an instance. See the ``[workarounds]/rbd_block_device`` option for a
+way to avoid this for RBD.
+
+Related options:
+
+* ``compute_driver`` (libvirt)
+* ``rbd_block_device`` (workarounds)
+"""),
+    cfg.BoolOpt(
+        'rbd_volume_local_attach',
+        default=False,
+        deprecated_for_removal=True,
+        deprecated_since='23.0.0',
+        deprecated_reason="""
+The underlying performance regression within libgcrypt that prompted this
+workaround has been resolved as of 1.8.5
+""",
+        help="""
+Attach RBD Cinder volumes to the compute as host block devices.
+
+When enabled this option instructs os-brick to connect RBD volumes locally on
+the compute host as block devices instead of natively through QEMU.
+
+This workaround does not currently support extending attached volumes.
+
+This can be used with the disable_native_luksv1 workaround configuration
+option to avoid the recently discovered performance issues found within the
+libgcrypt library.
+
+This workaround is temporary and will be removed during the W release once
+all impacted distributions have been able to update their versions of the
+libgcrypt library.
+
+Related options:
+
+* ``compute_driver`` (libvirt)
+* ``disable_qemu_native_luksv1`` (workarounds)
+"""),
+    cfg.BoolOpt('reserve_disk_resource_for_image_cache',
+               default=False,
+               help="""
+If it is set to True then the libvirt driver will reserve DISK_GB resource for
+the images stored in the image cache. If the
+:oslo.config:option:`DEFAULT.instances_path` is on different disk partition
+than the image cache directory then the driver will not reserve resource for
+the cache.
+
+Such disk reservation is done by a periodic task in the resource tracker that
+runs every :oslo.config:option:`update_resources_interval` seconds. So the
+reservation is not updated immediately when an image is cached.
+
+Related options:
+
+* :oslo.config:option:`DEFAULT.instances_path`
+* :oslo.config:option:`image_cache.subdirectory_name`
+* :oslo.config:option:`update_resources_interval`
+"""),
 ]
 
 

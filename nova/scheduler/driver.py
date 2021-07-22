@@ -21,15 +21,12 @@ Scheduler base class that all Schedulers should inherit from
 
 import abc
 
-import six
-
 from nova import objects
 from nova.scheduler import host_manager
 from nova import servicegroup
 
 
-@six.add_metaclass(abc.ABCMeta)
-class Scheduler(object):
+class Scheduler(metaclass=abc.ABCMeta):
     """The base class that all Scheduler classes should inherit from."""
 
     # TODO(mriedem): We should remove this flag now so that all scheduler
@@ -47,10 +44,6 @@ class Scheduler(object):
     def __init__(self):
         self.host_manager = host_manager.HostManager()
         self.servicegroup_api = servicegroup.API()
-
-    def run_periodic_tasks(self, context):
-        """Manager calls this so drivers can perform periodic tasks."""
-        pass
 
     def hosts_up(self, context, topic):
         """Return the list of hosts that have a running service for topic."""

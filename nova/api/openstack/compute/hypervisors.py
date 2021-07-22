@@ -49,56 +49,84 @@ class HypervisorsController(wsgi.Controller):
         self.host_api = compute.HostAPI()
         self.servicegroup_api = servicegroup.API()
 
-    def _view_hypervisor(self, hypervisor, service, detail, req, servers=None,
-                         with_servers=False, **kwargs):
+    def _view_hypervisor(
+        self, hypervisor, service, detail, req, servers=None,
+        with_servers=False,
+    ):
         alive = self.servicegroup_api.service_is_up(service)
         # The 2.53 microversion returns the compute node uuid rather than id.
         uuid_for_id = api_version_request.is_supported(
             req, min_version=UUID_FOR_ID_MIN_VERSION)
+
         hyp_dict = {
             'id': hypervisor.uuid if uuid_for_id else hypervisor.id,
             'hypervisor_hostname': hypervisor.hypervisor_hostname,
             'state': 'up' if alive else 'down',
-            'status': ('disabled' if service.disabled
-                       else 'enabled'),
-            }
+            'status': 'disabled' if service.disabled else 'enabled',
+        }
 
         if detail:
-            for field in ('vcpus', 'memory_mb', 'local_gb', 'vcpus_used',
-                          'memory_mb_used', 'local_gb_used',
-                          'hypervisor_type', 'hypervisor_version',
-                          'free_ram_mb', 'free_disk_gb', 'current_workload',
-                          'running_vms', 'disk_available_least', 'host_ip'):
+            for field in (
+                'hypervisor_type', 'hypervisor_version', 'host_ip',
+            ):
                 hyp_dict[field] = getattr(hypervisor, field)
 
-            service_id = service.uuid if uuid_for_id else service.id
             hyp_dict['service'] = {
-                'id': service_id,
+                'id': service.uuid if uuid_for_id else service.id,
                 'host': hypervisor.host,
                 'disabled_reason': service.disabled_reason,
-                }
+            }
 
-            if api_version_request.is_supported(req, min_version='2.28'):
+        # The 2.88 microversion removed these fields, so only add them on older
+        # microversions
+        if detail and api_version_request.is_supported(
+            req, max_version='2.87',
+        ):
+            for field in (
+                'vcpus', 'memory_mb', 'local_gb', 'vcpus_used',
+                'memory_mb_used', 'local_gb_used', 'free_ram_mb',
+                'free_disk_gb', 'current_workload', 'running_vms',
+                'disk_available_least',
+            ):
+                hyp_dict[field] = getattr(hypervisor, field)
+
+            if api_version_request.is_supported(req, max_version='2.27'):
+                hyp_dict['cpu_info'] = hypervisor.cpu_info
+            else:
                 if hypervisor.cpu_info:
                     hyp_dict['cpu_info'] = jsonutils.loads(hypervisor.cpu_info)
                 else:
                     hyp_dict['cpu_info'] = {}
-            else:
-                hyp_dict['cpu_info'] = hypervisor.cpu_info
+
+        # The 2.88 microversion also *added* the 'uptime' field to the response
+        if detail and api_version_request.is_supported(
+            req, min_version='2.88',
+        ):
+            try:
+                hyp_dict['uptime'] = self.host_api.get_host_uptime(
+                    req.environ['nova.context'], hypervisor.host)
+            except (
+                NotImplementedError,
+                exception.ComputeServiceUnavailable,
+                exception.HostMappingNotFound,
+                exception.HostNotFound,
+            ):
+                # Not all virt drivers support this, and it's not generally
+                # possible to get uptime for a down host
+                hyp_dict['uptime'] = None
 
         if servers:
-            hyp_dict['servers'] = [dict(name=serv['name'], uuid=serv['uuid'])
-                                   for serv in servers]
+            hyp_dict['servers'] = [
+                {'name': serv['name'], 'uuid': serv['uuid']}
+                for serv in servers
+            ]
         # The 2.75 microversion adds 'servers' field always in response.
         # Empty list if there are no servers on hypervisors and it is
         # requested in request.
         elif with_servers and api_version_request.is_supported(
-                req, min_version='2.75'):
+            req, min_version='2.75',
+        ):
             hyp_dict['servers'] = []
-
-        # Add any additional info
-        if kwargs:
-            hyp_dict.update(kwargs)
 
         return hyp_dict
 
@@ -122,7 +150,6 @@ class HypervisorsController(wsgi.Controller):
         :param links: If True, return links in the response for paging.
         """
         context = req.environ['nova.context']
-        context.can(hv_policies.BASE_POLICY_NAME)
 
         # The 2.53 microversion moves the search and servers routes into
         # GET /os-hypervisors and GET /os-hypervisors/detail with query
@@ -173,18 +200,23 @@ class HypervisorsController(wsgi.Controller):
                         context, hyp.host)
                 service = self.host_api.service_get_by_compute_host(
                     context, hyp.host)
-                hypervisors_list.append(
-                    self._view_hypervisor(
-                        hyp, service, detail, req, servers=instances,
-                        with_servers=with_servers))
-            except (exception.ComputeHostNotFound,
-                    exception.HostMappingNotFound):
+            except (
+                exception.ComputeHostNotFound,
+                exception.HostMappingNotFound,
+            ):
                 # The compute service could be deleted which doesn't delete
                 # the compute node record, that has to be manually removed
                 # from the database so we just ignore it when listing nodes.
                 LOG.debug('Unable to find service for compute node %s. The '
                           'service may be deleted and compute nodes need to '
                           'be manually cleaned up.', hyp.host)
+                continue
+
+            hypervisor = self._view_hypervisor(
+                hyp, service, detail, req, servers=instances,
+                with_servers=with_servers,
+            )
+            hypervisors_list.append(hypervisor)
 
         hypervisors_dict = dict(hypervisors=hypervisors_list)
         if links:
@@ -211,16 +243,18 @@ class HypervisorsController(wsgi.Controller):
     @wsgi.Controller.api_version("2.33", "2.52")  # noqa
     @validation.query_schema(hyper_schema.list_query_schema_v233)
     @wsgi.expected_errors(400)
-    def index(self, req):
+    def index(self, req):  # noqa
         limit, marker = common.get_limit_and_marker(req)
         return self._index(req, limit=limit, marker=marker, links=True)
 
     @wsgi.Controller.api_version("2.1", "2.32")  # noqa
     @wsgi.expected_errors(())
-    def index(self, req):
+    def index(self, req):  # noqa
         return self._index(req)
 
     def _index(self, req, limit=None, marker=None, links=False):
+        context = req.environ['nova.context']
+        context.can(hv_policies.BASE_POLICY_NAME % 'list', target={})
         return self._get_hypervisors(req, detail=False, limit=limit,
                                      marker=marker, links=links)
 
@@ -241,16 +275,18 @@ class HypervisorsController(wsgi.Controller):
     @wsgi.Controller.api_version("2.33", "2.52")  # noqa
     @validation.query_schema(hyper_schema.list_query_schema_v233)
     @wsgi.expected_errors((400))
-    def detail(self, req):
+    def detail(self, req):  # noqa
         limit, marker = common.get_limit_and_marker(req)
         return self._detail(req, limit=limit, marker=marker, links=True)
 
     @wsgi.Controller.api_version("2.1", "2.32")  # noqa
     @wsgi.expected_errors(())
-    def detail(self, req):
+    def detail(self, req):  # noqa
         return self._detail(req)
 
     def _detail(self, req, limit=None, marker=None, links=False):
+        context = req.environ['nova.context']
+        context.can(hv_policies.BASE_POLICY_NAME % 'list-detail', target={})
         return self._get_hypervisors(req, detail=True, limit=limit,
                                      marker=marker, links=links)
 
@@ -297,51 +333,87 @@ class HypervisorsController(wsgi.Controller):
 
     @wsgi.Controller.api_version("2.1", "2.52")     # noqa F811
     @wsgi.expected_errors(404)
-    def show(self, req, id):
+    def show(self, req, id):  # noqa
         return self._show(req, id)
 
     def _show(self, req, id, with_servers=False):
         context = req.environ['nova.context']
-        context.can(hv_policies.BASE_POLICY_NAME)
+        context.can(hv_policies.BASE_POLICY_NAME % 'show', target={})
 
         self._validate_id(req, id)
 
         try:
             hyp = self.host_api.compute_node_get(context, id)
-            instances = None
-            if with_servers:
-                instances = self.host_api.instance_get_all_by_host(
-                    context, hyp.host)
-            service = self.host_api.service_get_by_compute_host(
-                context, hyp.host)
-        except (ValueError, exception.ComputeHostNotFound,
-                exception.HostMappingNotFound):
+        except exception.ComputeHostNotFound:
+            # If the ComputeNode is missing, that's a straight up 404
             msg = _("Hypervisor with ID '%s' could not be found.") % id
             raise webob.exc.HTTPNotFound(explanation=msg)
-        return dict(hypervisor=self._view_hypervisor(
-            hyp, service, True, req, instances, with_servers))
 
+        instances = None
+        if with_servers:
+            try:
+                instances = self.host_api.instance_get_all_by_host(
+                    context, hyp.host)
+            except exception.HostMappingNotFound:
+                msg = _("Hypervisor with ID '%s' could not be found.") % id
+                raise webob.exc.HTTPNotFound(explanation=msg)
+
+        try:
+            service = self.host_api.service_get_by_compute_host(
+                context, hyp.host)
+        except (
+            exception.ComputeHostNotFound,
+            exception.HostMappingNotFound,
+        ):
+            msg = _("Hypervisor with ID '%s' could not be found.") % id
+            raise webob.exc.HTTPNotFound(explanation=msg)
+
+        return {
+            'hypervisor': self._view_hypervisor(
+                hyp, service, detail=True, req=req, servers=instances,
+                with_servers=with_servers,
+            ),
+        }
+
+    @wsgi.Controller.api_version('2.1', '2.87')
     @wsgi.expected_errors((400, 404, 501))
     def uptime(self, req, id):
+        """Prior to microversion 2.88, you could retrieve a special version of
+        the hypervisor detail view that included uptime. Starting in 2.88, this
+        field is now included in the standard detail view, making this API
+        unnecessary.
+        """
         context = req.environ['nova.context']
-        context.can(hv_policies.BASE_POLICY_NAME)
+        context.can(hv_policies.BASE_POLICY_NAME % 'uptime', target={})
 
         self._validate_id(req, id)
 
         try:
             hyp = self.host_api.compute_node_get(context, id)
-        except (ValueError, exception.ComputeHostNotFound):
+        except exception.ComputeHostNotFound:
+            # If the ComputeNode is missing, that's a straight up 404
+            msg = _("Hypervisor with ID '%s' could not be found.") % id
+            raise webob.exc.HTTPNotFound(explanation=msg)
+
+        try:
+            service = self.host_api.service_get_by_compute_host(
+                context, hyp.host)
+        except (
+            exception.ComputeHostNotFound,
+            exception.HostMappingNotFound,
+        ):
             msg = _("Hypervisor with ID '%s' could not be found.") % id
             raise webob.exc.HTTPNotFound(explanation=msg)
 
         # Get the uptime
         try:
-            host = hyp.host
-            uptime = self.host_api.get_host_uptime(context, host)
-            service = self.host_api.service_get_by_compute_host(context, host)
+            uptime = self.host_api.get_host_uptime(context, hyp.host)
         except NotImplementedError:
             common.raise_feature_not_supported()
-        except exception.ComputeServiceUnavailable as e:
+        except (
+            exception.ComputeServiceUnavailable,
+            exception.HostNotFound,
+        ) as e:
             raise webob.exc.HTTPBadRequest(explanation=e.format_message())
         except exception.HostMappingNotFound:
             # NOTE(danms): This mirrors the compute_node_get() behavior
@@ -350,8 +422,10 @@ class HypervisorsController(wsgi.Controller):
             msg = _("Hypervisor with ID '%s' could not be found.") % id
             raise webob.exc.HTTPNotFound(explanation=msg)
 
-        return dict(hypervisor=self._view_hypervisor(hyp, service, False, req,
-                                                     uptime=uptime))
+        hypervisor = self._view_hypervisor(hyp, service, False, req)
+        hypervisor['uptime'] = uptime
+
+        return {'hypervisor': hypervisor}
 
     @wsgi.Controller.api_version('2.1', '2.52')
     @wsgi.expected_errors(404)
@@ -362,19 +436,34 @@ class HypervisorsController(wsgi.Controller):
         index and detail methods.
         """
         context = req.environ['nova.context']
-        context.can(hv_policies.BASE_POLICY_NAME)
-        hypervisors = self._get_compute_nodes_by_name_pattern(context, id)
-        try:
-            return dict(hypervisors=[
-                self._view_hypervisor(
-                    hyp,
-                    self.host_api.service_get_by_compute_host(context,
-                                                              hyp.host),
-                    False, req)
-                for hyp in hypervisors])
-        except exception.HostMappingNotFound:
-            msg = _("No hypervisor matching '%s' could be found.") % id
-            raise webob.exc.HTTPNotFound(explanation=msg)
+        context.can(hv_policies.BASE_POLICY_NAME % 'search', target={})
+
+        # Get all compute nodes with a hypervisor_hostname that matches
+        # the given pattern. If none are found then it's a 404 error.
+        compute_nodes = self._get_compute_nodes_by_name_pattern(context, id)
+
+        hypervisors = []
+        for compute_node in compute_nodes:
+            try:
+                service = self.host_api.service_get_by_compute_host(
+                    context, compute_node.host)
+            except exception.ComputeHostNotFound:
+                # The compute service could be deleted which doesn't delete
+                # the compute node record, that has to be manually removed
+                # from the database so we just ignore it when listing nodes.
+                LOG.debug(
+                    'Unable to find service for compute node %s. The '
+                    'service may be deleted and compute nodes need to '
+                    'be manually cleaned up.', compute_node.host)
+                continue
+            except exception.HostMappingNotFound as e:
+                raise webob.exc.HTTPNotFound(explanation=e.format_message())
+
+            hypervisor = self._view_hypervisor(
+                compute_node, service, False, req)
+            hypervisors.append(hypervisor)
+
+        return {'hypervisors': hypervisors}
 
     @wsgi.Controller.api_version('2.1', '2.52')
     @wsgi.expected_errors(404)
@@ -386,25 +475,49 @@ class HypervisorsController(wsgi.Controller):
         GET /os-hypervisors index and detail methods.
         """
         context = req.environ['nova.context']
-        context.can(hv_policies.BASE_POLICY_NAME)
+        context.can(hv_policies.BASE_POLICY_NAME % 'servers', target={})
+
+        # Get all compute nodes with a hypervisor_hostname that matches
+        # the given pattern. If none are found then it's a 404 error.
         compute_nodes = self._get_compute_nodes_by_name_pattern(context, id)
+
         hypervisors = []
         for compute_node in compute_nodes:
             try:
                 instances = self.host_api.instance_get_all_by_host(context,
                     compute_node.host)
-                service = self.host_api.service_get_by_compute_host(
-                    context, compute_node.host)
             except exception.HostMappingNotFound as e:
                 raise webob.exc.HTTPNotFound(explanation=e.format_message())
-            hyp = self._view_hypervisor(compute_node, service, False, req,
-                                        instances)
-            hypervisors.append(hyp)
-        return dict(hypervisors=hypervisors)
 
+            try:
+                service = self.host_api.service_get_by_compute_host(
+                    context, compute_node.host)
+            except exception.ComputeHostNotFound:
+                # The compute service could be deleted which doesn't delete
+                # the compute node record, that has to be manually removed
+                # from the database so we just ignore it when listing nodes.
+                LOG.debug(
+                    'Unable to find service for compute node %s. The '
+                    'service may be deleted and compute nodes need to '
+                    'be manually cleaned up.', compute_node.host)
+                continue
+            except exception.HostMappingNotFound as e:
+                raise webob.exc.HTTPNotFound(explanation=e.format_message())
+
+            hypervisor = self._view_hypervisor(
+                compute_node, service, False, req, instances)
+            hypervisors.append(hypervisor)
+
+        return {'hypervisors': hypervisors}
+
+    @wsgi.Controller.api_version('2.1', '2.87')
     @wsgi.expected_errors(())
     def statistics(self, req):
+        """Prior to microversion 2.88, you could get statistics for the
+        hypervisor. Most of these are now accessible from placement and the few
+        that aren't as misleading and frequently misunderstood.
+        """
         context = req.environ['nova.context']
-        context.can(hv_policies.BASE_POLICY_NAME)
+        context.can(hv_policies.BASE_POLICY_NAME % 'statistics', target={})
         stats = self.host_api.compute_node_statistics(context)
         return dict(hypervisor_statistics=stats)

@@ -10,15 +10,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
-
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional.api import client as api_client
 from nova.tests.functional import fixtures as func_fixtures
 from nova.tests.functional import integrated_helpers
-from nova.tests.unit.image import fake as fake_image
-from nova.tests.unit import policy_fixture
 
 
 class CrossAZAttachTestCase(test.TestCase,
@@ -32,12 +28,11 @@ class CrossAZAttachTestCase(test.TestCase,
     def setUp(self):
         super(CrossAZAttachTestCase, self).setUp()
         # Use the standard fixtures.
-        self.useFixture(policy_fixture.RealPolicyFixture())
+        self.useFixture(nova_fixtures.RealPolicyFixture())
         self.useFixture(nova_fixtures.CinderFixture(self, az=self.az))
+        self.useFixture(nova_fixtures.GlanceFixture(self))
         self.useFixture(nova_fixtures.NeutronFixture(self))
         self.useFixture(func_fixtures.PlacementFixture())
-        fake_image.stub_out_image_service(self)
-        self.addCleanup(fake_image.FakeImageService_reset)
         # Start nova controller services.
         self.api = self.useFixture(nova_fixtures.OSAPIFixture(
             api_version='v2.1')).admin_api
@@ -134,7 +129,7 @@ class CrossAZAttachTestCase(test.TestCase,
         self.assertEqual(400, ex.response.status_code)
         self.assertIn('Server and volumes are not in the same availability '
                       'zone. Server is in: london. Volumes are in: %s' %
-                      self.az, six.text_type(ex))
+                      self.az, str(ex))
 
     def test_cross_az_attach_false_no_volumes(self):
         """A simple test to make sure cross_az_attach=False API validation is

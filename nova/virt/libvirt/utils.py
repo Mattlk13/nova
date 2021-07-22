@@ -18,9 +18,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import errno
+import grp
 import os
+import pwd
 import re
+import typing as ty
 import uuid
 
 import os_traits
@@ -29,16 +31,20 @@ from oslo_log import log as logging
 from oslo_utils import fileutils
 
 import nova.conf
+from nova import context as nova_context
+from nova import exception
 from nova.i18n import _
 from nova import objects
 from nova.objects import fields as obj_fields
 import nova.privsep.fs
 import nova.privsep.idmapshift
 import nova.privsep.libvirt
+import nova.privsep.path
 from nova.scheduler import utils as scheduler_utils
 from nova import utils
 from nova.virt import images
 from nova.virt.libvirt import config as vconfig
+from nova.virt.libvirt import guest as libvirt_guest
 from nova.virt.libvirt.volume import remotefs
 
 CONF = nova.conf.CONF
@@ -62,6 +68,14 @@ CPU_TRAITS_MAPPING = {
     'avx512pf': os_traits.HW_CPU_X86_AVX512PF,
     'avx512vl': os_traits.HW_CPU_X86_AVX512VL,
     'avx512vnni': os_traits.HW_CPU_X86_AVX512VNNI,
+    'avx512vbmi': os_traits.HW_CPU_X86_AVX512VBMI,
+    'avx512ifma': os_traits.HW_CPU_X86_AVX512IFMA,
+    'avx512vbmi2': os_traits.HW_CPU_X86_AVX512VBMI2,
+    'avx512bitalg': os_traits.HW_CPU_X86_AVX512BITALG,
+    'vaes': os_traits.HW_CPU_X86_AVX512VAES,
+    'gfni': os_traits.HW_CPU_X86_AVX512GFNI,
+    'vpclmulqdq': os_traits.HW_CPU_X86_AVX512VPCLMULQDQ,
+    'avx512-vpopcntdq': os_traits.HW_CPU_X86_AVX512VPOPCNTDQ,
     'bmi1': os_traits.HW_CPU_X86_BMI,
     'bmi2': os_traits.HW_CPU_X86_BMI2,
     'pclmuldq': os_traits.HW_CPU_X86_CLMUL,
@@ -78,17 +92,26 @@ CPU_TRAITS_MAPPING = {
     'sse4.2': os_traits.HW_CPU_X86_SSE42,
     'sse4a': os_traits.HW_CPU_X86_SSE4A,
     'ssse3': os_traits.HW_CPU_X86_SSSE3,
-    'svm': os_traits.HW_CPU_X86_SVM,
+    # We have to continue to support the old (generic) trait for the
+    # AMD-specific svm feature.
+    'svm': (os_traits.HW_CPU_X86_SVM, os_traits.HW_CPU_X86_AMD_SVM),
     'tbm': os_traits.HW_CPU_X86_TBM,
-    'vmx': os_traits.HW_CPU_X86_VMX,
+    # We have to continue to support the old (generic) trait for the
+    # Intel-specific vmx feature.
+    'vmx': (os_traits.HW_CPU_X86_VMX, os_traits.HW_CPU_X86_INTEL_VMX),
     'xop': os_traits.HW_CPU_X86_XOP
 }
 
 # Reverse CPU_TRAITS_MAPPING
 TRAITS_CPU_MAPPING = {v: k for k, v in CPU_TRAITS_MAPPING.items()}
 
+# global directory for emulated TPM
+VTPM_DIR = '/var/lib/libvirt/swtpm/'
 
-def create_image(disk_format, path, size):
+
+def create_image(
+    disk_format: str, path: str, size: ty.Union[str, int],
+) -> None:
     """Create a disk image
 
     :param disk_format: Disk image format (as known by qemu-img)
@@ -103,7 +126,9 @@ def create_image(disk_format, path, size):
     processutils.execute('qemu-img', 'create', '-f', disk_format, path, size)
 
 
-def create_cow_image(backing_file, path, size=None):
+def create_cow_image(
+    backing_file: ty.Optional[str], path: str, size: ty.Optional[int] = None,
+) -> None:
     """Create COW image
 
     Creates a COW image with the given backing file
@@ -136,7 +161,9 @@ def create_cow_image(backing_file, path, size=None):
     processutils.execute(*cmd)
 
 
-def create_ploop_image(disk_format, path, size, fs_type):
+def create_ploop_image(
+    disk_format: str, path: str, size: ty.Union[int, str], fs_type: str,
+) -> None:
     """Create ploop image
 
     :param disk_format: Disk image format (as known by ploop)
@@ -157,63 +184,7 @@ def create_ploop_image(disk_format, path, size, fs_type):
     nova.privsep.libvirt.ploop_init(size, disk_format, fs_type, disk_path)
 
 
-def pick_disk_driver_name(hypervisor_version, is_block_dev=False):
-    """Pick the libvirt primary backend driver name
-
-    If the hypervisor supports multiple backend drivers we have to tell libvirt
-    which one should be used.
-
-    Xen supports the following drivers: "tap", "tap2", "phy", "file", or
-    "qemu", being "qemu" the preferred one. Qemu only supports "qemu".
-
-    :param is_block_dev:
-    :returns: driver_name or None
-    """
-    if CONF.libvirt.virt_type == "xen":
-        if is_block_dev:
-            return "phy"
-        else:
-            # 4002000 == 4.2.0
-            if hypervisor_version >= 4002000:
-                try:
-                    nova.privsep.libvirt.xend_probe()
-                except OSError as exc:
-                    if exc.errno == errno.ENOENT:
-                        LOG.debug("xend is not found")
-                        # libvirt will try to use libxl toolstack
-                        return 'qemu'
-                    else:
-                        raise
-                except processutils.ProcessExecutionError:
-                    LOG.debug("xend is not started")
-                    # libvirt will try to use libxl toolstack
-                    return 'qemu'
-            # libvirt will use xend/xm toolstack
-            try:
-                out, err = processutils.execute('tap-ctl', 'check',
-                                                check_exit_code=False)
-                if out == 'ok\n':
-                    # 4000000 == 4.0.0
-                    if hypervisor_version > 4000000:
-                        return "tap2"
-                    else:
-                        return "tap"
-                else:
-                    LOG.info("tap-ctl check: %s", out)
-            except OSError as exc:
-                if exc.errno == errno.ENOENT:
-                    LOG.debug("tap-ctl tool is not installed")
-                else:
-                    raise
-            return "file"
-    elif CONF.libvirt.virt_type in ('kvm', 'qemu'):
-        return "qemu"
-    else:
-        # UML doesn't want a driver_name set
-        return None
-
-
-def get_disk_size(path, format=None):
+def get_disk_size(path: str, format: ty.Optional[str] = None) -> int:
     """Get the (virtual) size of a disk image
 
     :param path: Path to the disk image
@@ -225,7 +196,9 @@ def get_disk_size(path, format=None):
     return int(size)
 
 
-def get_disk_backing_file(path, basename=True, format=None):
+def get_disk_backing_file(
+    path: str, basename: bool = True, format: ty.Optional[str] = None,
+) -> ty.Optional[str]:
     """Get the backing file of a disk image
 
     :param path: Path to the disk image
@@ -238,9 +211,15 @@ def get_disk_backing_file(path, basename=True, format=None):
     return backing_file
 
 
-def copy_image(src, dest, host=None, receive=False,
-               on_execute=None, on_completion=None,
-               compression=True):
+def copy_image(
+    src: str,
+    dest: str,
+    host: ty.Optional[str] = None,
+    receive: bool = False,
+    on_execute: ty.Callable = None,
+    on_completion: ty.Callable = None,
+    compression: bool = True,
+) -> None:
     """Copy a disk image to an existing directory
 
     :param src: Source image
@@ -272,17 +251,9 @@ def copy_image(src, dest, host=None, receive=False,
             compression=compression)
 
 
-def write_to_file(path, contents):
-    """Write the given contents to a file
-
-    :param path: Destination file
-    :param contents: Desired contents of the file
-    """
-    with open(path, 'w') as f:
-        f.write(contents)
-
-
-def chown_for_id_maps(path, id_maps):
+def chown_for_id_maps(
+    path: str, id_maps: ty.List[vconfig.LibvirtConfigGuestIDMap],
+) -> None:
     """Change ownership of file or directory for an id mapped
     environment
 
@@ -296,7 +267,9 @@ def chown_for_id_maps(path, id_maps):
     nova.privsep.idmapshift.shift(path, uid_maps, gid_maps)
 
 
-def extract_snapshot(disk_path, source_fmt, out_path, dest_fmt):
+def extract_snapshot(
+    disk_path: str, source_fmt: str, out_path: str, dest_fmt: str,
+) -> None:
     """Extract a snapshot from a disk image.
     Note that nobody should write to the disk image during this operation.
 
@@ -314,7 +287,8 @@ def extract_snapshot(disk_path, source_fmt, out_path, dest_fmt):
                          compress=compress)
 
 
-def load_file(path):
+# TODO(stephenfin): This is dumb; remove it.
+def load_file(path: str) -> str:
     """Read contents of file
 
     :param path: File to read
@@ -323,6 +297,8 @@ def load_file(path):
         return fp.read()
 
 
+# TODO(stephenfin): Remove this; we have suitably powerful mocking abilities
+# nowadays
 def file_open(*args, **kwargs):
     """Open file
 
@@ -335,7 +311,7 @@ def file_open(*args, **kwargs):
     return open(*args, **kwargs)
 
 
-def find_disk(guest):
+def find_disk(guest: libvirt_guest.Guest) -> ty.Tuple[str, ty.Optional[str]]:
     """Find root device path for instance
 
     May be file or device
@@ -369,14 +345,10 @@ def find_disk(guest):
         raise RuntimeError(_("Can't retrieve root device path "
                              "from instance libvirt configuration"))
 
-    # This is a legacy quirk of libvirt/xen. Everything else should
-    # report the on-disk format in type.
-    if disk_format == 'aio':
-        disk_format = 'raw'
-    return (disk_path, disk_format)
+    return disk_path, disk_format
 
 
-def get_disk_type_from_path(path):
+def get_disk_type_from_path(path: str) -> ty.Optional[str]:
     """Retrieve disk type (raw, qcow2, lvm, ploop) for given file."""
     if path.startswith('/dev'):
         return 'lvm'
@@ -390,7 +362,7 @@ def get_disk_type_from_path(path):
     return None
 
 
-def get_fs_info(path):
+def get_fs_info(path: str) -> ty.Dict[str, int]:
     """Get free/used/total space info for a filesystem
 
     :param path: Any dirent on the filesystem
@@ -404,12 +376,15 @@ def get_fs_info(path):
     total = hddinfo.f_frsize * hddinfo.f_blocks
     free = hddinfo.f_frsize * hddinfo.f_bavail
     used = hddinfo.f_frsize * (hddinfo.f_blocks - hddinfo.f_bfree)
-    return {'total': total,
-            'free': free,
-            'used': used}
+    return {'total': total, 'free': free, 'used': used}
 
 
-def fetch_image(context, target, image_id, trusted_certs=None):
+def fetch_image(
+    context: nova_context.RequestContext,
+    target: str,
+    image_id: str,
+    trusted_certs: ty.Optional['objects.TrustedCerts'] = None,
+) -> None:
     """Grab image.
 
     :param context: nova.context.RequestContext auth request context
@@ -420,7 +395,12 @@ def fetch_image(context, target, image_id, trusted_certs=None):
     images.fetch_to_raw(context, image_id, target, trusted_certs)
 
 
-def fetch_raw_image(context, target, image_id, trusted_certs=None):
+def fetch_raw_image(
+    context: nova_context.RequestContext,
+    target: str,
+    image_id: str,
+    trusted_certs: ty.Optional['objects.TrustedCerts'] = None,
+) -> None:
     """Grab initrd or kernel image.
 
     This function does not attempt raw conversion, as these images will
@@ -434,7 +414,9 @@ def fetch_raw_image(context, target, image_id, trusted_certs=None):
     images.fetch(context, image_id, target, trusted_certs)
 
 
-def get_instance_path(instance, relative=False):
+def get_instance_path(
+    instance: 'objects.Instance', relative: bool = False,
+) -> str:
     """Determine the correct path for instance storage.
 
     This method determines the directory name for instance storage.
@@ -449,7 +431,10 @@ def get_instance_path(instance, relative=False):
     return os.path.join(CONF.instances_path, instance.uuid)
 
 
-def get_instance_path_at_destination(instance, migrate_data=None):
+def get_instance_path_at_destination(
+    instance: 'objects.Instance',
+    migrate_data: ty.Optional['objects.LibvirtLiveMigrateData'] = None,
+) -> str:
     """Get the instance path on destination node while live migration.
 
     This method determines the directory name for instance storage on
@@ -476,7 +461,7 @@ def get_instance_path_at_destination(instance, migrate_data=None):
     return instance_dir
 
 
-def get_arch(image_meta):
+def get_arch(image_meta: 'objects.ImageMeta') -> str:
     """Determine the architecture of the guest (or host).
 
     This method determines the CPU architecture that must be supported by
@@ -496,7 +481,7 @@ def get_arch(image_meta):
     return obj_fields.Architecture.from_host()
 
 
-def is_mounted(mount_path, source=None):
+def is_mounted(mount_path: str, source: ty.Optional[str] = None) -> bool:
     """Check if the given source is mounted at given destination point."""
     if not os.path.ismount(mount_path):
         return False
@@ -509,38 +494,46 @@ def is_mounted(mount_path, source=None):
         return any(mnt[0] == source and mnt[1] == mount_path for mnt in mounts)
 
 
-def is_valid_hostname(hostname):
-    return re.match(r"^[\w\-\.:]+$", hostname)
+def is_valid_hostname(hostname: str) -> bool:
+    return bool(re.match(r"^[\w\-\.:]+$", hostname))
 
 
-def version_to_string(version):
+def version_to_string(version: ty.Tuple[int, int, int]) -> str:
     """Returns string version based on tuple"""
     return '.'.join([str(x) for x in version])
 
 
-def cpu_features_to_traits(features):
+def cpu_features_to_traits(features: ty.Set[str]) -> ty.Dict[str, bool]:
     """Returns this driver's CPU traits dict where keys are trait names from
     CPU_TRAITS_MAPPING, values are boolean indicates whether the trait should
     be set in the provider tree.
+
+    :param features: A set of feature names (short, lowercase,
+            CPU_TRAITS_MAPPING's keys).
     """
-    traits = {trait_name: False for trait_name in CPU_TRAITS_MAPPING.values()}
-    for f in features:
-        if f in CPU_TRAITS_MAPPING:
-            traits[CPU_TRAITS_MAPPING[f]] = True
+    traits = {}
+    for feature_name, val in CPU_TRAITS_MAPPING.items():
+        trait_tuple = val if isinstance(val, tuple) else (val,)
+        for trait_name in trait_tuple:
+            traits[trait_name] = feature_name in features
 
     return traits
 
 
-def get_cpu_model_from_arch(arch):
+def get_cpu_model_from_arch(arch: str) -> str:
     mode = 'qemu64'
     if arch == obj_fields.Architecture.I686:
         mode = 'qemu32'
     elif arch == obj_fields.Architecture.PPC64LE:
         mode = 'POWER8'
+    # NOTE(kevinz): In aarch64, cpu model 'max' will offer the capabilities
+    # that all the stuff it can currently emulate, both for "TCG" and "KVM"
+    elif arch == obj_fields.Architecture.AARCH64:
+        mode = 'max'
     return mode
 
 
-def get_machine_type(image_meta):
+def get_machine_type(image_meta: 'objects.ImageMeta') -> ty.Optional[str]:
     """The guest machine type can be set as an image metadata property, or
     otherwise based on architecture-specific defaults. If no defaults are
     found then None will be returned. This will ultimately lead to QEMU using
@@ -553,7 +546,7 @@ def get_machine_type(image_meta):
     return get_default_machine_type(get_arch(image_meta))
 
 
-def get_default_machine_type(arch):
+def get_default_machine_type(arch: str) -> ty.Optional[str]:
     # NOTE(lyarwood): Values defined in [libvirt]/hw_machine_type take
     # precedence here if available for the provided arch.
     for mapping in CONF.libvirt.hw_machine_type or {}:
@@ -583,26 +576,101 @@ def get_default_machine_type(arch):
     return default_mtypes.get(arch)
 
 
-def mdev_name2uuid(mdev_name):
+def mdev_name2uuid(mdev_name: str) -> str:
     """Convert an mdev name (of the form mdev_<uuid_with_underscores>) to a
     uuid (of the form 8-4-4-4-12).
     """
     return str(uuid.UUID(mdev_name[5:].replace('_', '-')))
 
 
-def mdev_uuid2name(mdev_uuid):
+def mdev_uuid2name(mdev_uuid: str) -> str:
     """Convert an mdev uuid (of the form 8-4-4-4-12) to a name (of the form
     mdev_<uuid_with_underscores>).
     """
     return "mdev_" + mdev_uuid.replace('-', '_')
 
 
-def get_flags_by_flavor_specs(flavor):
+def get_flags_by_flavor_specs(flavor: 'objects.Flavor') -> ty.Set[str]:
     req_spec = objects.RequestSpec(flavor=flavor)
-    resource_request = scheduler_utils.ResourceRequest(req_spec)
+    resource_request = scheduler_utils.ResourceRequest.from_request_spec(
+        req_spec)
     required_traits = resource_request.all_required_traits
 
     flags = [TRAITS_CPU_MAPPING[trait] for trait in required_traits
              if trait in TRAITS_CPU_MAPPING]
 
     return set(flags)
+
+
+def save_and_migrate_vtpm_dir(
+    instance_uuid: str,
+    inst_base_resize: str,
+    inst_base: str,
+    dest: str,
+    on_execute: ty.Callable,
+    on_completion: ty.Callable,
+) -> None:
+    """Save vTPM data to instance directory and migrate to the destination.
+
+    If the instance has vTPM enabled, then we need to save its vTPM data
+    locally (to allow for revert) and then migrate the data to the dest node.
+    Do so by copying vTPM data from the swtpm data directory to a resize
+    working directory, $inst_base_resize, and then copying this to the remote
+    directory at $dest:$inst_base.
+
+    :param instance_uuid: The instance's UUID.
+    :param inst_base_resize: The instance's base resize working directory.
+    :param inst_base: The instances's base directory on the destination host.
+    :param dest: Destination host.
+    :param on_execute: Callback method to store PID of process in cache.
+    :param on_completion: Callback method to remove PID of process from cache.
+    :returns: None.
+    """
+    vtpm_dir = os.path.join(VTPM_DIR, instance_uuid)
+    if not os.path.exists(vtpm_dir):
+        return
+
+    # We likely need to create the instance swtpm directory on the dest node
+    # with ownership that is not the user running nova. We only have
+    # permissions to copy files to <instance_path> on the dest node so we need
+    # to get creative.
+
+    # First, make a new directory in the local instance directory
+    swtpm_dir = os.path.join(inst_base_resize, 'swtpm')
+    fileutils.ensure_tree(swtpm_dir)
+    # Now move the per-instance swtpm persistent files into the
+    # local instance directory.
+    nova.privsep.path.move_tree(vtpm_dir, swtpm_dir)
+    # Now adjust ownership.
+    nova.privsep.path.chown(
+        swtpm_dir, os.geteuid(), os.getegid(), recursive=True)
+    # Copy the swtpm subtree to the remote instance directory
+    copy_image(
+        swtpm_dir, inst_base, host=dest, on_execute=on_execute,
+        on_completion=on_completion)
+
+
+def restore_vtpm_dir(swtpm_dir: str) -> None:
+    """Given a saved TPM directory, restore it where libvirt can find it.
+
+    :path swtpm_dir: Path to swtpm directory.
+    :returns: None
+    """
+    # Ensure global swtpm dir exists with suitable
+    # permissions/ownership
+    if not os.path.exists(VTPM_DIR):
+        nova.privsep.path.makedirs(VTPM_DIR)
+        nova.privsep.path.chmod(VTPM_DIR, 0o711)
+    elif not os.path.isdir(VTPM_DIR):
+        msg = _(
+            'Guest wants emulated TPM but host path %s is not a directory.')
+        raise exception.Invalid(msg % VTPM_DIR)
+
+    # These can raise KeyError but they're validated by the driver on startup.
+    uid = pwd.getpwnam(CONF.libvirt.swtpm_user).pw_uid
+    gid = grp.getgrnam(CONF.libvirt.swtpm_group).gr_gid
+
+    # Set ownership of instance-specific files
+    nova.privsep.path.chown(swtpm_dir, uid, gid, recursive=True)
+    # Move instance-specific directory to global dir
+    nova.privsep.path.move_tree(swtpm_dir, VTPM_DIR)

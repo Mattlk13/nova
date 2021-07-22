@@ -15,11 +15,10 @@
 
 import collections
 import datetime
+from urllib import parse as urlparse
 
 import iso8601
 from oslo_utils import timeutils
-import six
-import six.moves.urllib.parse as urlparse
 from webob import exc
 
 from nova.api.openstack import common
@@ -41,7 +40,7 @@ def parse_strtime(dstr, fmt):
     try:
         return timeutils.parse_strtime(dstr, fmt)
     except (TypeError, ValueError) as e:
-        raise exception.InvalidStrTime(reason=six.text_type(e))
+        raise exception.InvalidStrTime(reason=str(e))
 
 
 class SimpleTenantUsageController(wsgi.Controller):
@@ -273,7 +272,7 @@ class SimpleTenantUsageController(wsgi.Controller):
     @wsgi.Controller.api_version("2.1", "2.39")  # noqa
     @validation.query_schema(schema.index_query)
     @wsgi.expected_errors(400)
-    def index(self, req):
+    def index(self, req):  # noqa
         """Retrieve tenant_usage for all tenants."""
         return self._index(req)
 
@@ -288,7 +287,7 @@ class SimpleTenantUsageController(wsgi.Controller):
     @wsgi.Controller.api_version("2.1", "2.39")  # noqa
     @validation.query_schema(schema.show_query)
     @wsgi.expected_errors(400)
-    def show(self, req, id):
+    def show(self, req, id):  # noqa
         """Retrieve tenant_usage for a specified tenant."""
         return self._show(req, id)
 

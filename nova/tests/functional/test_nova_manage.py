@@ -9,16 +9,17 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-from __future__ import absolute_import
-
 import collections
+import datetime
+from io import StringIO
 import mock
 
 import fixtures
 from neutronclient.common import exceptions as neutron_client_exc
 import os_resource_classes as orc
+from oslo_utils import fixture as osloutils_fixture
 from oslo_utils.fixture import uuidsentinel
-from six.moves import StringIO
+from oslo_utils import timeutils
 
 from nova.cmd import manage
 from nova import config
@@ -31,7 +32,7 @@ from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional import fixtures as func_fixtures
 from nova.tests.functional import integrated_helpers
 from nova.tests.functional import test_servers
-from nova.tests.unit.image import fake as image_fake
+from nova import utils as nova_utils
 
 CONF = config.CONF
 INCOMPLETE_CONSUMER_ID = '00000000-0000-0000-0000-000000000000'
@@ -166,125 +167,6 @@ class NovaManageDBIronicTest(test.TestCase):
                              if i.node != self.cn4.hypervisor_hostname]
         self.virt_insts = [i for i in self.insts
                            if i.node == self.cn4.hypervisor_hostname]
-
-    def test_ironic_flavor_migration_by_host_and_node(self):
-        ret = self.commands.ironic_flavor_migration('test', 'fake-host1',
-                                                    'fake-node2', False, False)
-        self.assertEqual(0, ret)
-        k = 'resources:CUSTOM_TEST'
-
-        for inst in self.ironic_insts:
-            inst.refresh()
-            if inst.node == 'fake-node2':
-                self.assertIn(k, inst.flavor.extra_specs)
-                self.assertEqual('1', inst.flavor.extra_specs[k])
-            else:
-                self.assertNotIn(k, inst.flavor.extra_specs)
-
-        for inst in self.virt_insts:
-            inst.refresh()
-            self.assertNotIn(k, inst.flavor.extra_specs)
-
-    def test_ironic_flavor_migration_by_host(self):
-        ret = self.commands.ironic_flavor_migration('test', 'fake-host1', None,
-                                                    False, False)
-        self.assertEqual(0, ret)
-        k = 'resources:CUSTOM_TEST'
-
-        for inst in self.ironic_insts:
-            inst.refresh()
-            if inst.node in ('fake-node1', 'fake-node2'):
-                self.assertIn(k, inst.flavor.extra_specs)
-                self.assertEqual('1', inst.flavor.extra_specs[k])
-            else:
-                self.assertNotIn(k, inst.flavor.extra_specs)
-
-        for inst in self.virt_insts:
-            inst.refresh()
-            self.assertNotIn(k, inst.flavor.extra_specs)
-
-    def test_ironic_flavor_migration_by_host_not_ironic(self):
-        ret = self.commands.ironic_flavor_migration('test', 'fake-host3', None,
-                                                    False, False)
-        self.assertEqual(1, ret)
-        k = 'resources:CUSTOM_TEST'
-
-        for inst in self.ironic_insts:
-            inst.refresh()
-            self.assertNotIn(k, inst.flavor.extra_specs)
-
-        for inst in self.virt_insts:
-            inst.refresh()
-            self.assertNotIn(k, inst.flavor.extra_specs)
-
-    def test_ironic_flavor_migration_all_hosts(self):
-        ret = self.commands.ironic_flavor_migration('test', None, None,
-                                                    True, False)
-        self.assertEqual(0, ret)
-        k = 'resources:CUSTOM_TEST'
-
-        for inst in self.ironic_insts:
-            inst.refresh()
-            self.assertIn(k, inst.flavor.extra_specs)
-            self.assertEqual('1', inst.flavor.extra_specs[k])
-
-        for inst in self.virt_insts:
-            inst.refresh()
-            self.assertNotIn(k, inst.flavor.extra_specs)
-
-    def test_ironic_flavor_migration_invalid(self):
-        # No host or node and not "all"
-        ret = self.commands.ironic_flavor_migration('test', None, None,
-                                                    False, False)
-        self.assertEqual(3, ret)
-
-        # No host, only node
-        ret = self.commands.ironic_flavor_migration('test', None, 'fake-node',
-                                                    False, False)
-        self.assertEqual(3, ret)
-
-        # Asked for all but provided a node
-        ret = self.commands.ironic_flavor_migration('test', None, 'fake-node',
-                                                    True, False)
-        self.assertEqual(3, ret)
-
-        # Asked for all but provided a host
-        ret = self.commands.ironic_flavor_migration('test', 'fake-host', None,
-                                                    True, False)
-        self.assertEqual(3, ret)
-
-        # Asked for all but provided a host and node
-        ret = self.commands.ironic_flavor_migration('test', 'fake-host',
-                                                    'fake-node', True, False)
-        self.assertEqual(3, ret)
-
-        # Did not provide a resource_class
-        ret = self.commands.ironic_flavor_migration(None, 'fake-host',
-                                                    'fake-node', False, False)
-        self.assertEqual(3, ret)
-
-    def test_ironic_flavor_migration_no_match(self):
-        ret = self.commands.ironic_flavor_migration('test', 'fake-nonexist',
-                                                    None, False, False)
-        self.assertEqual(1, ret)
-
-        ret = self.commands.ironic_flavor_migration('test', 'fake-nonexist',
-                                                    'fake-node', False, False)
-        self.assertEqual(1, ret)
-
-    def test_ironic_two_instances(self):
-        # NOTE(danms): This shouldn't be possible, but simulate it like
-        # someone hacked the database, which should also cover any other
-        # way this could happen.
-
-        # Since we created two instances on cn4 in setUp() we can convert that
-        # to an ironic host and cause the two-instances-on-one-ironic paradox
-        # to happen.
-        self.cn4.hypervisor_type = 'ironic'
-        self.cn4.save()
-        ret = self.commands.ironic_flavor_migration('test', 'fake-host3',
-                                                    'fake-node4', False, False)
-        self.assertEqual(2, ret)
 
 
 class NovaManageCellV2Test(test.TestCase):
@@ -642,10 +524,10 @@ class TestNovaManagePlacementHealAllocations(
                 }
             ]
         }
-        self.placement_api.put('/allocations/%s' % server['id'], alloc_body)
+        self.placement.put('/allocations/%s' % server['id'], alloc_body)
         # Make sure we did that correctly. Use version 1.12 so we can assert
         # the project_id and user_id are based on the sentinel values.
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id'], version='1.12').body
         self.assertEqual(INCOMPLETE_CONSUMER_ID, allocations['project_id'])
         self.assertEqual(INCOMPLETE_CONSUMER_ID, allocations['user_id'])
@@ -668,7 +550,7 @@ class TestNovaManagePlacementHealAllocations(
             'Successfully updated allocations for', output)
         self.assertIn('Processed 1 instances.', output)
         # Now assert that the consumer was actually updated.
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id'], version='1.12').body
         self.assertEqual(server['tenant_id'], allocations['project_id'])
         self.assertEqual(server['user_id'], allocations['user_id'])
@@ -746,6 +628,160 @@ class TestNovaManagePlacementHealAllocations(
         self.assertIn('Unable to find cell for instance %s, is it mapped?' %
                       server['id'], output)
 
+    def test_heal_allocations_specific_cell(self):
+        """Tests the case that a specific cell is processed and only that
+        cell even though there are two which require processing.
+        """
+        # Create one that we won't process.
+        server1, rp_uuid1 = self._boot_and_assert_no_allocations(
+            self.flavor, 'cell1')
+        # Create another that we will process specifically.
+        server2, rp_uuid2 = self._boot_and_assert_no_allocations(
+            self.flavor, 'cell2')
+
+        # Get Cell_id of cell2
+        cell2_id = self.cell_mappings['cell2'].uuid
+
+        # First do a dry run to make sure two instances need processing.
+        result = self.cli.heal_allocations(
+            max_count=2, verbose=True, dry_run=True)
+        # Nothing changed so the return code should be 4.
+        self.assertEqual(4, result, self.output.getvalue())
+        output = self.output.getvalue()
+        self.assertIn('Found 1 candidate instances', output)
+
+        # Now run with our specific cell and it should be the only one
+        # processed.
+        result = self.cli.heal_allocations(verbose=True,
+                                           cell_uuid=cell2_id)
+        output = self.output.getvalue()
+        self.assertEqual(0, result, self.output.getvalue())
+        self.assertIn('Found 1 candidate instances', output)
+        self.assertIn('Processed 1 instances.', output)
+
+        # Now run it again on the specific cell and it should be done.
+        result = self.cli.heal_allocations(
+            verbose=True, cell_uuid=cell2_id)
+        output = self.output.getvalue()
+        self.assertEqual(4, result, self.output.getvalue())
+        self.assertIn('Found 1 candidate instances', output)
+        self.assertIn('Processed 0 instances.', output)
+
+    def test_heal_allocations_force_allocation(self):
+        """Tests the case that a specific instance allocations are
+        forcefully changed.
+        1. create server without allocations
+        2. heal allocations without forcing them.
+           Assert the allocations match the flavor
+        3. update the allocations to change MEMORY_MB to not match the flavor
+        4. run heal allocations without --force.
+           Assert the allocations still have the bogus
+           MEMORY_MB value since they were not forcefully updated.
+        5. run heal allocations with --force.
+           Assert the allocations match the flavor again
+        6. run heal allocations again.
+           You should get rc=4 back since nothing changed.
+        """
+        # 1. Create server that we will forcefully heal specifically.
+        server, rp_uuid = self._boot_and_assert_no_allocations(
+            self.flavor, 'cell1', volume_backed=True)
+
+        # 2. heal allocations without forcing them
+        result = self.cli.heal_allocations(
+            verbose=True, instance_uuid=server['id']
+        )
+        self.assertEqual(0, result, self.output.getvalue())
+
+        # assert the allocations match the flavor
+        allocs = self._get_allocations_by_server_uuid(
+          server['id'])[rp_uuid]['resources']
+        self.assertEqual(self.flavor['vcpus'], allocs['VCPU'])
+        self.assertEqual(self.flavor['ram'], allocs['MEMORY_MB'])
+
+        # 3. update the allocations to change MEMORY_MB
+        # to not match the flavor
+        alloc_body = {
+            "allocations": [
+                {
+                    "resource_provider": {
+                        "uuid": rp_uuid
+                    },
+                    "resources": {
+                        "MEMORY_MB": 1024,
+                        "VCPU": self.flavor['vcpus'],
+                        "DISK_GB": self.flavor['disk']
+                    }
+                }
+            ]
+        }
+        self.placement.put('/allocations/%s' % server['id'], alloc_body)
+
+        # Check allocation to see if memory has changed
+        allocs = self._get_allocations_by_server_uuid(
+            server['id'])[rp_uuid]['resources']
+        self.assertEqual(self.flavor['vcpus'], allocs['VCPU'])
+        self.assertEqual(1024, allocs['MEMORY_MB'])
+
+        # 4. run heal allocations without --force
+        result = self.cli.heal_allocations(
+            verbose=True, instance_uuid=server['id']
+        )
+        self.assertEqual(0, result, self.output.getvalue())
+        self.assertIn(
+            'Successfully updated allocations for',
+            self.output.getvalue())
+
+        # assert the allocations still have the bogus memory
+        allocs = self._get_allocations_by_server_uuid(
+          server['id'])[rp_uuid]['resources']
+        self.assertEqual(1024, allocs['MEMORY_MB'])
+
+        # call heal without force flag
+        # rc should be 4 since force flag was not used.
+        result = self.cli.heal_allocations(
+            verbose=True, instance_uuid=server['id']
+        )
+        self.assertEqual(4, result, self.output.getvalue())
+
+        # call heal with force flag and dry run
+        result = self.cli.heal_allocations(
+            dry_run=True, verbose=True,
+            instance_uuid=server['id'],
+            force=True
+        )
+        self.assertEqual(4, result, self.output.getvalue())
+        self.assertIn(
+            '[dry-run] Update allocations for instance',
+            self.output.getvalue())
+
+        # assert nothing has changed after dry run
+        allocs = self._get_allocations_by_server_uuid(
+          server['id'])[rp_uuid]['resources']
+        self.assertEqual(1024, allocs['MEMORY_MB'])
+
+        # 5. run heal allocations with --force
+        result = self.cli.heal_allocations(
+            verbose=True, instance_uuid=server['id'],
+            force=True
+        )
+        self.assertEqual(0, result, self.output.getvalue())
+        self.assertIn('Force flag passed for instance',
+                      self.output.getvalue())
+        self.assertIn('Successfully updated allocations',
+                      self.output.getvalue())
+
+        # assert the allocations match the flavor again
+        allocs = self._get_allocations_by_server_uuid(
+            server['id'])[rp_uuid]['resources']
+        self.assertEqual(self.flavor['ram'], allocs['MEMORY_MB'])
+
+        # 6. run heal allocations again and you should get rc=4
+        # back since nothing changed
+        result = self.cli.heal_allocations(
+            verbose=True, instance_uuid=server['id']
+        )
+        self.assertEqual(4, result, self.output.getvalue())
+
 
 class TestNovaManagePlacementHealPortAllocations(
         test_servers.PortResourceRequestBasedSchedulingTestBase):
@@ -799,7 +835,7 @@ class TestNovaManagePlacementHealPortAllocations(
         return server, updated_ports
 
     def _assert_placement_updated(self, server, ports):
-        rsp = self.placement_api.get(
+        rsp = self.placement.get(
             '/allocations/%s' % server['id'],
             version=1.28).body
 
@@ -839,7 +875,7 @@ class TestNovaManagePlacementHealPortAllocations(
             self._assert_port_updated(port['id'])
 
     def _assert_placement_not_updated(self, server):
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
         self.assertEqual(1, len(allocations))
         self.assertIn(self.compute1_rp_uuid, allocations)
@@ -959,10 +995,10 @@ class TestNovaManagePlacementHealPortAllocations(
 
         # NOTE(gibi): putting empty allocation will delete the consumer in
         # placement
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id'], version=1.28).body
         allocations['allocations'] = {}
-        self.placement_api.put(
+        self.placement.put(
             '/allocations/%s' % server['id'], allocations, version=1.28)
 
         # let's trigger a heal
@@ -1002,7 +1038,7 @@ class TestNovaManagePlacementHealPortAllocations(
                 }
             ]
         }
-        self.placement_api.put('/allocations/%s' % server['id'], alloc_body)
+        self.placement.put('/allocations/%s' % server['id'], alloc_body)
 
         # let's trigger a heal
         result = self.cli.heal_allocations(verbose=True, max_count=2)
@@ -1030,10 +1066,10 @@ class TestNovaManagePlacementHealPortAllocations(
 
         # NOTE(gibi): putting empty allocation will delete the consumer in
         # placement
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id'], version=1.28).body
         allocations['allocations'] = {}
-        self.placement_api.put(
+        self.placement.put(
             '/allocations/%s' % server['id'], allocations, version=1.28)
 
         # let's trigger a heal
@@ -1393,14 +1429,227 @@ class TestNovaManagePlacementSyncAggregates(
                              '%s should be in two provider aggregates' % host)
 
 
+class TestNovaManagePlacementAudit(
+        integrated_helpers.ProviderUsageBaseTestCase):
+    """Functional tests for nova-manage placement audit"""
+
+    # Let's just use a simple fake driver
+    compute_driver = 'fake.SmallFakeDriver'
+
+    def setUp(self):
+        super(TestNovaManagePlacementAudit, self).setUp()
+        self.cli = manage.PlacementCommands()
+        # Make sure we have two computes for migrations
+        self.compute1 = self._start_compute('host1')
+        self.compute2 = self._start_compute('host2')
+
+        # Make sure we have two hypervisors reported in the API.
+        hypervisors = self.admin_api.api_get(
+            '/os-hypervisors').body['hypervisors']
+        self.assertEqual(2, len(hypervisors))
+
+        self.output = StringIO()
+        self.useFixture(fixtures.MonkeyPatch('sys.stdout', self.output))
+
+        self.flavor = self.api.get_flavors()[0]
+
+    def test_audit_orphaned_allocation_from_instance_delete(self):
+        """Creates a server and deletes it by retaining its allocations so the
+           audit command can find it.
+        """
+        target_hostname = self.compute1.host
+        rp_uuid = self._get_provider_uuid_by_host(target_hostname)
+
+        server = self._boot_and_check_allocations(self.flavor, target_hostname)
+
+        # let's mock the allocation delete call to placement
+        with mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
+                        'delete_allocation_for_instance'):
+            self.api.delete_server(server['id'])
+            self._wait_until_deleted(server)
+
+        # make sure the allocation is still around
+        self.assertFlavorMatchesUsage(rp_uuid, self.flavor)
+
+        # Don't ask to delete the orphaned allocations, just audit them
+        ret = self.cli.audit(verbose=True)
+        # The allocation should still exist
+        self.assertFlavorMatchesUsage(rp_uuid, self.flavor)
+
+        output = self.output.getvalue()
+        self.assertIn(
+            'Allocations for consumer UUID %(consumer_uuid)s on '
+            'Resource Provider %(rp_uuid)s can be deleted' %
+            {'consumer_uuid': server['id'],
+             'rp_uuid': rp_uuid},
+            output)
+        self.assertIn('Processed 1 allocation.', output)
+        # Here we don't want to delete the found allocations
+        self.assertNotIn(
+            'Deleted allocations for consumer UUID %s' % server['id'], output)
+        self.assertEqual(3, ret)
+
+        # Now ask the audit command to delete the rogue allocations.
+        ret = self.cli.audit(delete=True, verbose=True)
+
+        # The allocations are now deleted
+        self.assertRequestMatchesUsage(
+            {'VCPU': 0, 'MEMORY_MB': 0, 'DISK_GB': 0}, rp_uuid)
+
+        output = self.output.getvalue()
+        self.assertIn(
+            'Deleted allocations for consumer UUID %s' % server['id'], output)
+        self.assertIn('Processed 1 allocation.', output)
+        self.assertEqual(4, ret)
+
+    def test_audit_orphaned_allocations_from_confirmed_resize(self):
+        """Resize a server but when confirming it, leave the migration
+           allocation there so the audit command can find it.
+        """
+        source_hostname = self.compute1.host
+        dest_hostname = self.compute2.host
+
+        source_rp_uuid = self._get_provider_uuid_by_host(source_hostname)
+        dest_rp_uuid = self._get_provider_uuid_by_host(dest_hostname)
+
+        old_flavor = self.flavor
+        new_flavor = self.api.get_flavors()[1]
+        # we want to make sure we resize to compute2
+        self.flags(allow_resize_to_same_host=False)
+
+        server = self._boot_and_check_allocations(self.flavor, source_hostname)
+
+        # Do a resize
+        post = {
+            'resize': {
+                'flavorRef': new_flavor['id']
+            }
+        }
+        self._move_and_check_allocations(
+            server, request=post, old_flavor=old_flavor,
+            new_flavor=new_flavor, source_rp_uuid=source_rp_uuid,
+            dest_rp_uuid=dest_rp_uuid)
+
+        # Retain the migration UUID record for later usage
+        migration_uuid = self.get_migration_uuid_for_instance(server['id'])
+
+        # Confirm the resize so it should in theory delete the source
+        # allocations but mock out the allocation delete for the source
+        post = {'confirmResize': None}
+        with mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
+                        'delete_allocation_for_instance'):
+            self.api.post_server_action(
+                server['id'], post, check_response_status=[204])
+            self._wait_for_state_change(server, 'ACTIVE')
+
+        # The target host usage should be according to the new flavor...
+        self.assertFlavorMatchesUsage(dest_rp_uuid, new_flavor)
+        # ...but we should still see allocations for the source compute
+        self.assertFlavorMatchesUsage(source_rp_uuid, old_flavor)
+
+        # Now, run the audit command that will find this orphaned allocation
+        ret = self.cli.audit(verbose=True)
+        output = self.output.getvalue()
+        self.assertIn(
+            'Allocations for consumer UUID %(consumer_uuid)s on '
+            'Resource Provider %(rp_uuid)s can be deleted' %
+            {'consumer_uuid': migration_uuid, 'rp_uuid': source_rp_uuid},
+            output)
+        self.assertIn('Processed 1 allocation.', output)
+        self.assertEqual(3, ret)
+
+        # Now we want to delete the orphaned allocation that is duplicate
+        ret = self.cli.audit(delete=True, verbose=True)
+
+        # There should be no longer usage for the source host since the
+        # allocation disappeared
+        self.assertRequestMatchesUsage({'VCPU': 0,
+                                        'MEMORY_MB': 0,
+                                        'DISK_GB': 0}, source_rp_uuid)
+
+        output = self.output.getvalue()
+        self.assertIn(
+            'Deleted allocations for consumer UUID %(consumer_uuid)s on '
+            'Resource Provider %(rp_uuid)s' %
+            {'consumer_uuid': migration_uuid,
+             'rp_uuid': source_rp_uuid},
+            output)
+        self.assertIn('Processed 1 allocation.', output)
+        self.assertEqual(4, ret)
+
+    # TODO(sbauza): Remove this test once bug #1829479 is fixed
+    def test_audit_orphaned_allocations_from_deleted_compute_evacuate(self):
+        """Evacuate a server and the delete the source node so that it will
+           leave a source allocation that the audit command will find.
+        """
+
+        source_hostname = self.compute1.host
+        dest_hostname = self.compute2.host
+
+        source_rp_uuid = self._get_provider_uuid_by_host(source_hostname)
+        dest_rp_uuid = self._get_provider_uuid_by_host(dest_hostname)
+
+        server = self._boot_and_check_allocations(self.flavor, source_hostname)
+
+        # Stop the service and fake it down
+        self.compute1.stop()
+        source_service_id = self.admin_api.get_services(
+            host=source_hostname, binary='nova-compute')[0]['id']
+        self.admin_api.put_service(source_service_id, {'forced_down': 'true'})
+
+        # evacuate the instance to the target
+        self._evacuate_server(
+            server, {'host': dest_hostname}, expected_host=dest_hostname)
+
+        # Now the instance is gone, we can delete the compute service
+        self.admin_api.api_delete('/os-services/%s' % source_service_id)
+
+        # Since the compute is deleted, we should have in theory a single
+        # allocation against the destination resource provider, but evacuated
+        # instances are not having their allocations deleted. See bug #1829479.
+        # We have two allocations for the same consumer, source and destination
+        self._check_allocation_during_evacuate(
+            self.flavor, server['id'], source_rp_uuid, dest_rp_uuid)
+
+        # Now, run the audit command that will find this orphaned allocation
+        ret = self.cli.audit(verbose=True)
+        output = self.output.getvalue()
+        self.assertIn(
+            'Allocations for consumer UUID %(consumer_uuid)s on '
+            'Resource Provider %(rp_uuid)s can be deleted' %
+            {'consumer_uuid': server['id'],
+             'rp_uuid': source_rp_uuid},
+            output)
+        self.assertIn('Processed 1 allocation.', output)
+        self.assertEqual(3, ret)
+
+        # Now we want to delete the orphaned allocation that is duplicate
+        ret = self.cli.audit(delete=True, verbose=True)
+
+        # We finally should only have the target allocations
+        self.assertFlavorMatchesUsage(dest_rp_uuid, self.flavor)
+        self.assertRequestMatchesUsage({'VCPU': 0,
+                                        'MEMORY_MB': 0,
+                                        'DISK_GB': 0}, source_rp_uuid)
+
+        output = self.output.getvalue()
+        self.assertIn(
+            'Deleted allocations for consumer UUID %(consumer_uuid)s on '
+            'Resource Provider %(rp_uuid)s' %
+            {'consumer_uuid': server['id'],
+             'rp_uuid': source_rp_uuid},
+            output)
+        self.assertIn('Processed 1 allocation.', output)
+        self.assertEqual(4, ret)
+
+
 class TestDBArchiveDeletedRows(integrated_helpers._IntegratedTestBase):
     """Functional tests for the "nova-manage db archive_deleted_rows" CLI."""
     api_major_version = 'v2.1'
-    _image_ref_parameter = 'imageRef'
-    _flavor_ref_parameter = 'flavorRef'
 
     def setUp(self):
         super(TestDBArchiveDeletedRows, self).setUp()
+        self.enforce_fk_constraints()
         self.cli = manage.DbCommands()
         self.output = StringIO()
         self.useFixture(fixtures.MonkeyPatch('sys.stdout', self.output))
@@ -1419,7 +1668,7 @@ class TestDBArchiveDeletedRows(integrated_helpers._IntegratedTestBase):
         server_req = {
             'server': server, 'os:scheduler_hints': {'group': group['id']}}
         # Since we don't pass return_reservation_id=True we get the first
-        # server back in the response. We're also using the CastAsCall fixture
+        # server back in the response. We're also using the CastAsCallFixture
         # (from the base class) fixture so we don't have to worry about the
         # server being ACTIVE.
         server = self.api.post_server(server_req)
@@ -1439,6 +1688,99 @@ class TestDBArchiveDeletedRows(integrated_helpers._IntegratedTestBase):
             1, len(self.api.get_server_group(group['id'])['members']))
 
 
+class TestDBArchiveDeletedRowsTaskLog(integrated_helpers._IntegratedTestBase):
+    """Functional tests for the
+    "nova-manage db archive_deleted_rows --task-log" CLI.
+    """
+    api_major_version = 'v2.1'
+
+    def setUp(self):
+        # Override time to ensure we cross audit period boundaries in a
+        # predictable way.
+        faketoday = datetime.datetime(2021, 7, 1)
+        # This needs to be done before setUp() starts services, else they will
+        # be considered "down" by the ComputeFilter.
+        self.useFixture(test.TimeOverride(override_time=faketoday))
+        super(TestDBArchiveDeletedRowsTaskLog, self).setUp()
+        self.enforce_fk_constraints()
+        self.cli = manage.DbCommands()
+        self.output = StringIO()
+        self.useFixture(fixtures.MonkeyPatch('sys.stdout', self.output))
+
+    def test_archive_task_logs(self):
+        # Enable the generation of task_log records by the instance usage audit
+        # nova-compute periodic task.
+        self.flags(instance_usage_audit=True)
+        compute = self.computes['compute']
+
+        # Create a few servers so the for the periodic task to process.
+        for i in range(0, 3):
+            self._create_server()
+
+        ctxt = context.get_admin_context()
+
+        # The instance usage audit periodic task only processes servers that
+        # were active during the last audit period. The audit period defaults
+        # to 1 month, so the last audit period would be the previous calendar
+        # month. Advance time one month, two months, and three months to
+        # generate a task_log record for the servers we created, for each of
+        # three audit periods.
+        # July has 31 days, August has 31 days, September has 30 days.
+        for days in (31, 31 + 31, 31 + 31 + 30):
+            future = timeutils.utcnow() + datetime.timedelta(days=days)
+            with osloutils_fixture.TimeFixture(future):
+                # task_log records are generated by the _instance_usage_audit
+                # periodic task.
+                compute.manager._instance_usage_audit(ctxt)
+                # Audit period defaults to 1 month, the last audit period will
+                # be the previous calendar month.
+                begin, end = nova_utils.last_completed_audit_period()
+                # Verify that we have 1 task_log record per audit period.
+                task_logs = objects.TaskLogList.get_all(
+                    ctxt, 'instance_usage_audit', begin, end)
+                self.assertEqual(1, len(task_logs))
+
+        # First try archiving without --task-log. Expect no task_log entries in
+        # the results.
+        self.cli.archive_deleted_rows(verbose=True)
+        self.assertNotIn('task_log', self.output.getvalue())
+        # Next try archiving with --task-log and --before.
+        # We'll archive records that were last updated before the second audit
+        # period.
+        before = timeutils.utcnow() + datetime.timedelta(days=31)
+        self.cli.archive_deleted_rows(
+            task_log=True, before=before.isoformat(), verbose=True)
+        # Verify that only 1 task_log record was archived.
+        self.assertRegex(self.output.getvalue(), r'\| task_log\s+\| 1')
+        # Now archive all of the rest, there should be 2 left.
+        self.cli.archive_deleted_rows(task_log=True, verbose=True)
+        self.assertRegex(self.output.getvalue(), r'\| task_log\s+\| 2')
+
+    def test_archive_before(self):
+        """Test that no records are left over after archiving with --before"""
+        # Create and delete a server so we can archive.
+        server = self._build_server()
+        server = self.api.post_server({'server': server})
+        server = self.api.get_server(server['id'])
+        self._delete_server(server)
+        # First try archiving records before a past datetime. Nothing should be
+        # archived.
+        past = timeutils.utcnow() - datetime.timedelta(hours=1)
+        ret = self.cli.archive_deleted_rows(before=past.isoformat())
+        # Return code 0 means nothing was archived.
+        self.assertEqual(0, ret)
+        # Now try archiving records before a future datetime. Everything should
+        # have been archived.
+        future = timeutils.utcnow() + datetime.timedelta(hours=1)
+        ret = self.cli.archive_deleted_rows(before=future.isoformat())
+        # Return code 1 means something was archived.
+        self.assertEqual(1, ret)
+        # Now archive everything without specifying --before.
+        ret = self.cli.archive_deleted_rows()
+        # Return code 0 means nothing was archived.
+        self.assertEqual(0, ret)
+
+
 class TestDBArchiveDeletedRowsMultiCell(integrated_helpers.InstanceHelperMixin,
                                         test.TestCase):
 
@@ -1446,16 +1788,15 @@ class TestDBArchiveDeletedRowsMultiCell(integrated_helpers.InstanceHelperMixin,
 
     def setUp(self):
         super(TestDBArchiveDeletedRowsMultiCell, self).setUp()
+        self.enforce_fk_constraints()
         self.useFixture(nova_fixtures.NeutronFixture(self))
+        self.useFixture(nova_fixtures.GlanceFixture(self))
         self.useFixture(func_fixtures.PlacementFixture())
 
         api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
             api_version='v2.1'))
         # We need the admin api to forced_host for server create
         self.api = api_fixture.admin_api
-
-        image_fake.stub_out_image_service(self)
-        self.addCleanup(image_fake.FakeImageService_reset)
 
         self.start_service('conductor')
         self.start_service('scheduler')
@@ -1467,9 +1808,9 @@ class TestDBArchiveDeletedRowsMultiCell(integrated_helpers.InstanceHelperMixin,
 
         # Start two compute services, one per cell
         self.compute1 = self.start_service('compute', host='host1',
-                                           cell='cell1')
+                                           cell_name='cell1')
         self.compute2 = self.start_service('compute', host='host2',
-                                           cell='cell2')
+                                           cell_name='cell2')
 
     def test_archive_deleted_rows(self):
         admin_context = context.get_admin_context(read_deleted='yes')
@@ -1524,3 +1865,111 @@ class TestDBArchiveDeletedRowsMultiCell(integrated_helpers.InstanceHelperMixin,
                 self.assertRaises(exception.InstanceNotFound,
                                   objects.Instance.get_by_uuid,
                                   cctxt, server_id)
+
+
+class TestDBArchiveDeletedRowsMultiCellTaskLog(
+        integrated_helpers.InstanceHelperMixin, test.TestCase):
+    """Functional tests for the "nova-manage db archive_deleted_rows
+    --all-cells --task-log" CLI.
+    """
+    NUMBER_OF_CELLS = 2
+
+    def setUp(self):
+        # Override time to ensure we cross audit period boundaries in a
+        # predictable way.
+        faketoday = datetime.datetime(2021, 7, 1)
+        # This needs to be done before setUp() starts services, else they will
+        # be considered "down" by the ComputeFilter.
+        self.useFixture(test.TimeOverride(override_time=faketoday))
+        super(TestDBArchiveDeletedRowsMultiCellTaskLog, self).setUp()
+        self.enforce_fk_constraints()
+        self.useFixture(nova_fixtures.NeutronFixture(self))
+        self.useFixture(nova_fixtures.GlanceFixture(self))
+        self.useFixture(func_fixtures.PlacementFixture())
+
+        api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
+            api_version='v2.1'))
+        # We need the admin api to forced_host for server create
+        self.api = api_fixture.admin_api
+
+        self.start_service('conductor')
+        self.start_service('scheduler')
+
+        self.context = context.RequestContext('fake-user', 'fake-project')
+        self.cli = manage.DbCommands()
+        self.output = StringIO()
+        self.useFixture(fixtures.MonkeyPatch('sys.stdout', self.output))
+
+        # Start two compute services, one per cell
+        self.compute1 = self.start_service('compute', host='host1',
+                                           cell_name='cell1')
+        self.compute2 = self.start_service('compute', host='host2',
+                                           cell_name='cell2')
+
+    def test_archive_task_logs(self):
+        # Enable the generation of task_log records by the instance usage audit
+        # nova-compute periodic task.
+        self.flags(instance_usage_audit=True)
+
+        # Create servers so the for the periodic task to process.
+        # Boot a server to cell1
+        server = self._build_server(az='nova:host1')
+        created_server = self.api.post_server({'server': server})
+        self._wait_for_state_change(created_server, 'ACTIVE')
+        # Boot a server to cell2
+        server = self._build_server(az='nova:host2')
+        created_server = self.api.post_server({'server': server})
+        self._wait_for_state_change(created_server, 'ACTIVE')
+
+        ctxt = context.get_admin_context()
+
+        # The instance usage audit periodic task only processes servers that
+        # were active during the last audit period. The audit period defaults
+        # to 1 month, so the last audit period would be the previous calendar
+        # month. Advance time one month, two months, and three months to
+        # generate a task_log record for the servers we created, for each of
+        # three audit periods.
+        # July has 31 days, August has 31 days, September has 30 days.
+        for days in (31, 31 + 31, 31 + 31 + 30):
+            future = timeutils.utcnow() + datetime.timedelta(days=days)
+            with osloutils_fixture.TimeFixture(future):
+                # task_log records are generated by the _instance_usage_audit
+                # periodic task.
+                with context.target_cell(
+                        ctxt, self.cell_mappings['cell1']) as cctxt:
+                    self.compute1.manager._instance_usage_audit(cctxt)
+                with context.target_cell(
+                        ctxt, self.cell_mappings['cell2']) as cctxt:
+                    self.compute2.manager._instance_usage_audit(ctxt)
+                # Audit period defaults to 1 month, the last audit period will
+                # be the previous calendar month.
+                begin, end = nova_utils.last_completed_audit_period()
+
+            for cell_name in ('cell1', 'cell2'):
+                with context.target_cell(
+                        ctxt, self.cell_mappings[cell_name]) as cctxt:
+                    task_logs = objects.TaskLogList.get_all(
+                        cctxt, 'instance_usage_audit', begin, end)
+                    self.assertEqual(1, len(task_logs))
+
+        # First try archiving without --task-log. Expect no task_log entries in
+        # the results.
+        self.cli.archive_deleted_rows(all_cells=True, verbose=True)
+        self.assertNotIn('task_log', self.output.getvalue())
+        # Next try archiving with --task-log and --before.
+        # We'll archive records that were last updated before the second audit
+        # period.
+        before = timeutils.utcnow() + datetime.timedelta(days=31)
+        self.cli.archive_deleted_rows(
+            all_cells=True, task_log=True, before=before.isoformat(),
+            verbose=True)
+        # Verify that only 2 task_log records were archived, 1 in each cell.
+        for cell_name in ('cell1', 'cell2'):
+            self.assertRegex(
+                self.output.getvalue(), r'\| %s.task_log\s+\| 1' % cell_name)
+        # Now archive all of the rest, there should be 4 left, 2 in each cell.
+        self.cli.archive_deleted_rows(
+            all_cells=True, task_log=True, verbose=True)
+        for cell_name in ('cell1', 'cell2'):
+            self.assertRegex(
+                self.output.getvalue(), r'\| %s.task_log\s+\| 2' % cell_name)

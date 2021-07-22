@@ -16,6 +16,7 @@ import collections
 import contextlib
 import copy
 import datetime
+import inspect
 import os
 import pprint
 
@@ -25,16 +26,15 @@ from oslo_utils import timeutils
 from oslo_versionedobjects import base as ovo_base
 from oslo_versionedobjects import exception as ovo_exc
 from oslo_versionedobjects import fixture
-import six
 
 from nova import context
+from nova import exception
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
 from nova.objects import virt_device_metadata
 from nova import test
 from nova.tests import fixtures as nova_fixtures
-from nova.tests.unit import fake_notifier
 from nova import utils
 
 
@@ -211,8 +211,8 @@ class _BaseTestCase(test.TestCase):
         self.user_id = 'fake-user'
         self.project_id = 'fake-project'
         self.context = context.RequestContext(self.user_id, self.project_id)
-        fake_notifier.stub_notifier(self)
-        self.addCleanup(fake_notifier.reset)
+        self.notifier = self.useFixture(
+            nova_fixtures.NotificationFixture(self))
 
         # NOTE(danms): register these here instead of at import time
         # so that they're not always present
@@ -256,7 +256,7 @@ class FakeIndirectionHack(fixture.FakeIndirectionAPI):
         objinst = self._ser.deserialize_entity(
             context, self._ser.serialize_entity(
                 context, objinst))
-        objmethod = six.text_type(objmethod)
+        objmethod = str(objmethod)
         args = self._ser.deserialize_entity(
             None, self._ser.serialize_entity(None, args))
         kwargs = self._ser.deserialize_entity(
@@ -271,9 +271,9 @@ class FakeIndirectionHack(fixture.FakeIndirectionAPI):
 
     def object_class_action(self, context, objname, objmethod, objver,
                             args, kwargs):
-        objname = six.text_type(objname)
-        objmethod = six.text_type(objmethod)
-        objver = six.text_type(objver)
+        objname = str(objname)
+        objmethod = str(objmethod)
+        objver = str(objver)
         args = self._ser.deserialize_entity(
             None, self._ser.serialize_entity(None, args))
         kwargs = self._ser.deserialize_entity(
@@ -291,9 +291,9 @@ class FakeIndirectionHack(fixture.FakeIndirectionAPI):
 
     def object_class_action_versions(self, context, objname, objmethod,
                                      object_versions, args, kwargs):
-        objname = six.text_type(objname)
-        objmethod = six.text_type(objmethod)
-        object_versions = {six.text_type(o): six.text_type(v)
+        objname = str(objname)
+        objmethod = str(objmethod)
+        object_versions = {str(o): str(v)
                            for o, v in object_versions.items()}
         args, kwargs = self._canonicalize_args(context, args, kwargs)
         objver = object_versions[objname]
@@ -880,7 +880,7 @@ class TestObjectSerializer(_BaseTestCase):
             }
 
         @base.NovaObjectRegistry.register  # noqa
-        class Parent(base.NovaObject):
+        class Parent(base.NovaObject):  # noqa
             VERSION = '1.1'
 
             fields = {
@@ -955,11 +955,11 @@ class TestObjectSerializer(_BaseTestCase):
         thing = {'key': obj}
         primitive = ser.serialize_entity(self.context, thing)
         self.assertEqual(1, len(primitive))
-        for item in six.itervalues(primitive):
+        for item in primitive.values():
             self.assertNotIsInstance(item, base.NovaObject)
         thing2 = ser.deserialize_entity(self.context, primitive)
         self.assertEqual(1, len(thing2))
-        for item in six.itervalues(thing2):
+        for item in thing2.values():
             self.assertIsInstance(item, MyObj)
 
         # object-action updates dict case
@@ -975,7 +975,7 @@ class TestArgsSerializer(test.NoDBTestCase):
         super(TestArgsSerializer, self).setUp()
         self.now = timeutils.utcnow()
         self.str_now = utils.strtime(self.now)
-        self.unicode_str = u'\xF0\x9F\x92\xA9'
+        self.exc = exception.NotFound()
 
     @base.serialize_args
     def _test_serialize_args(self, *args, **kwargs):
@@ -984,14 +984,26 @@ class TestArgsSerializer(test.NoDBTestCase):
             self.assertEqual(expected_args[index], val)
 
         expected_kwargs = {'a': 'untouched', 'b': self.str_now,
-                           'c': self.str_now, 'exc_val': self.unicode_str}
+                           'c': self.str_now}
+
+        nonnova = kwargs.pop('nonnova', None)
+        if nonnova:
+            expected_kwargs['exc_val'] = 'TestingException'
+        else:
+            expected_kwargs['exc_val'] = self.exc.format_message()
         for key, val in kwargs.items():
             self.assertEqual(expected_kwargs[key], val)
 
     def test_serialize_args(self):
         self._test_serialize_args('untouched', self.now, self.now,
                                   a='untouched', b=self.now, c=self.now,
-                                  exc_val=self.unicode_str)
+                                  exc_val=self.exc)
+
+    def test_serialize_args_non_nova_exception(self):
+        self._test_serialize_args('untouched', self.now, self.now,
+                                  a='untouched', b=self.now, c=self.now,
+                                  exc_val=test.TestingException('foo'),
+                                  nonnova=True)
 
 
 class TestRegistry(test.NoDBTestCase):
@@ -1032,14 +1044,12 @@ class TestRegistry(test.NoDBTestCase):
 # they come with a corresponding version bump in the affected
 # objects
 object_data = {
-    'Agent': '1.0-c0c092abaceb6f51efe5d82175f15eba',
-    'AgentList': '1.0-5a7380d02c3aaf2a32fc8115ae7ca98c',
     'Aggregate': '1.3-f315cb68906307ca2d1cca84d4753585',
     'AggregateList': '1.3-3ea55a050354e72ef3306adefa553957',
     'BandwidthUsage': '1.2-c6e4c779c7f40f2407e3d70022e3cd1c',
     'BandwidthUsageList': '1.2-5fe7475ada6fe62413cbfcc06ec70746',
     'BlockDeviceMapping': '1.20-45a6ad666ddf14bbbedece2293af77e2',
-    'BlockDeviceMappingList': '1.17-1e568eecb91d06d4112db9fd656de235',
+    'BlockDeviceMappingList': '1.18-73bcbbae5ef5e8adcedbc821db869306',
     'BuildRequest': '1.3-077dee42bed93f8a5b62be77657b7152',
     'BuildRequestList': '1.0-cd95608eccb89fbc702c8b52f38ec738',
     'CellMapping': '1.1-5d652928000a5bc369d79d5bde7e497d',
@@ -1064,10 +1074,10 @@ object_data = {
     'HyperVLiveMigrateData': '1.4-e265780e6acfa631476c8170e8d6fce0',
     'IDEDeviceBus': '1.0-29d4c9f27ac44197f01b6ac1b7e16502',
     'ImageMeta': '1.8-642d1b2eb3e880a367f37d72dd76162d',
-    'ImageMetaProps': '1.25-66fc973af215eb5701ed4034bb6f0685',
+    'ImageMetaProps': '1.29-5c02bd7b1e050ef39513d3fca728e543',
     'Instance': '2.7-d187aec68cad2e4d8b8a03a68e4739ce',
     'InstanceAction': '1.2-9a5abc87fdd3af46f45731960651efb5',
-    'InstanceActionEvent': '1.3-c749e1b3589e7117c81cb2aa6ac438d5',
+    'InstanceActionEvent': '1.4-5b1f361bd81989f8bb2c20bb7e8a4cb4',
     'InstanceActionEventList': '1.1-13d92fb953030cdbfee56481756e02be',
     'InstanceActionList': '1.1-a2b2fb6006b47c27076d3a1d48baa759',
     'InstanceDeviceMetadata': '1.0-74d78dd36aa32d26d2769a1b57caf186',
@@ -1080,9 +1090,9 @@ object_data = {
     'InstanceList': '2.6-238f125650c25d6d12722340d726f723',
     'InstanceMapping': '1.2-3bd375e65c8eb9c45498d2f87b882e03',
     'InstanceMappingList': '1.3-d34b6ebb076d542ae0f8b440534118da',
-    'InstanceNUMACell': '1.4-b68e13eacba363ae8f196abf0ffffb5b',
+    'InstanceNUMACell': '1.6-25d9120d83a18356f4146f2a6fe2cc8d',
     'InstanceNUMATopology': '1.3-ec0030cb0402a49c96da7051c037082a',
-    'InstancePCIRequest': '1.3-f6d324f1c337fad4f34892ed5f484c9a',
+    'InstancePCIRequest': '1.4-b27808ae189699df27f8f5b908b6393e',
     'InstancePCIRequests': '1.1-65e38083177726d806684cb1cc0136d2',
     'KeyPair': '1.4-1244e8d1b103cc69d038ed78ab3a8cc6',
     'KeyPairList': '1.3-94aad3ac5c938eef4b5e83da0212f506',
@@ -1090,12 +1100,12 @@ object_data = {
     'LibvirtLiveMigrateData': '1.10-348cf70ea44d3b985f45f64725d6f6a7',
     'LibvirtLiveMigrateNUMAInfo': '1.0-0e777677f3459d0ed1634eabbdb6c22f',
     'MemoryDiagnostics': '1.0-2c995ae0f2223bb0f8e523c5cc0b83da',
-    'Migration': '1.7-b77066a88d08bdb0b05d7bc18780c55a',
+    'Migration': '1.7-bd45b232fd7c95cd79ae9187e10ef582',
     'MigrationContext': '1.2-89f10a83999f852a489962ae37d8a026',
-    'MigrationList': '1.4-983a9c29d4f1e747ce719dc9063b729b',
+    'MigrationList': '1.5-36793f8d65bae421bd5564d09a4de7be',
     'MonitorMetric': '1.1-53b1db7c4ae2c531db79761e7acc52ba',
     'MonitorMetricList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
-    'NUMACell': '1.4-7695303e820fa855d76954be2eb2680e',
+    'NUMACell': '1.5-2592de3c926a7840d763bcc85f81afa7',
     'NUMAPagesTopology': '1.1-edab9fa2dc43c117a38d600be54b4542',
     'NUMATopology': '1.2-c63fad38be73b6afd04715c9c1b29220',
     'NUMATopologyLimits': '1.1-4235c5da7a76c7e36075f0cd2f5cf922',
@@ -1105,7 +1115,7 @@ object_data = {
     'NetworkRequestList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
     'NicDiagnostics': '1.0-895e9ad50e0f56d5258585e3e066aea5',
     'PCIDeviceBus': '1.0-2b891cb77e42961044689f3dc2718995',
-    'PciDevice': '1.6-25ca0542a22bc25386a72c0065a79c01',
+    'PciDevice': '1.7-680e4c590aae154958ccf9677774413b',
     'PciDeviceList': '1.3-52ff14355491c8c580bdc0ba34c26210',
     'PciDevicePool': '1.1-3f5ddc3ff7bfa14da7f6c7e9904cc000',
     'PciDevicePoolList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
@@ -1114,7 +1124,7 @@ object_data = {
     'QuotasNoOp': '1.3-d1593cf969c81846bc8192255ea95cce',
     'RequestGroup': '1.3-0458d350a8ec9d0673f9be5640a990ce',
     'RequestLevelParams': '1.0-1e5c8c18bd44cd233c8b32509c99d06f',
-    'RequestSpec': '1.13-e1aa38b2bf3f8547474ee9e4c0aa2745',
+    'RequestSpec': '1.14-2cdbda368ca07e10905dc5fe96908a58',
     'Resource': '1.0-d8a2abbb380da583b995fd118f6a8953',
     'ResourceList': '1.0-4a53826625cc280e15fae64a575e0879',
     'ResourceMetadata': '1.0-77509ea1ea0dd750d5864b9bd87d3f9d',
@@ -1142,7 +1152,6 @@ object_data = {
     'VirtualInterfaceList': '1.0-9750e2074437b3077e46359102779fc6',
     'VolumeUsage': '1.0-6c8190c46ce1469bb3286a1f21c2e475',
     'XenDeviceBus': '1.0-272a4f899b24e31e42b2b9a7ed7e9194',
-    'XenapiLiveMigrateData': '1.4-7dc9417e921b2953faa6751f18785f3f',
     # TODO(efried): re-alphabetize this
     'LibvirtVPMEMDevice': '1.0-17ffaf47585199eeb9a2b83d6bde069f',
 }
@@ -1309,12 +1318,12 @@ class TestObjEqualPrims(_BaseTestCase):
 
 class TestObjMethodOverrides(test.NoDBTestCase):
     def test_obj_reset_changes(self):
-        args = utils.getargspec(base.NovaObject.obj_reset_changes)
+        args = inspect.getfullargspec(base.NovaObject.obj_reset_changes)
         obj_classes = base.NovaObjectRegistry.obj_classes()
         for obj_name in obj_classes:
             obj_class = obj_classes[obj_name][0]
             self.assertEqual(args,
-                utils.getargspec(obj_class.obj_reset_changes))
+                inspect.getfullargspec(obj_class.obj_reset_changes))
 
 
 class TestObjectsDefaultingOnInit(test.NoDBTestCase):

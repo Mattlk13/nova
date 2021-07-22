@@ -17,8 +17,6 @@
 
 """Utility methods for working with WSGI servers."""
 
-from __future__ import print_function
-
 import os.path
 import socket
 import ssl
@@ -32,7 +30,7 @@ from oslo_utils import excutils
 
 import nova.conf
 from nova import exception
-from nova.i18n import _, _LE, _LI
+from nova.i18n import _
 from nova import utils
 
 CONF = nova.conf.CONF
@@ -94,12 +92,12 @@ class Server(service.ServiceBase):
         try:
             self._socket = eventlet.listen(bind_addr, family, backlog=backlog)
         except EnvironmentError:
-            LOG.error(_LE("Could not bind to %(host)s:%(port)s"),
+            LOG.error("Could not bind to %(host)s:%(port)s",
                       {'host': host, 'port': port})
             raise
 
         (self.host, self.port) = self._socket.getsockname()[0:2]
-        LOG.info(_LI("%(name)s listening on %(host)s:%(port)s"),
+        LOG.info("%(name)s listening on %(host)s:%(port)s",
                  {'name': self.name, 'host': self.host, 'port': self.port})
 
     def start(self):
@@ -163,10 +161,11 @@ class Server(service.ServiceBase):
                                                **ssl_kwargs)
             except Exception:
                 with excutils.save_and_reraise_exception():
-                    LOG.error(_LE("Failed to start %(name)s on %(host)s"
-                                  ":%(port)s with SSL support"),
-                              {'name': self.name, 'host': self.host,
-                               'port': self.port})
+                    LOG.error(
+                        "Failed to start %(name)s on %(host)s:%(port)s with "
+                        "SSL support",
+                        {'name': self.name, 'host': self.host,
+                         'port': self.port})
 
         wsgi_kwargs = {
             'func': eventlet.wsgi.server,
@@ -203,7 +202,7 @@ class Server(service.ServiceBase):
         :returns: None
 
         """
-        LOG.info(_LI("Stopping WSGI server."))
+        LOG.info("Stopping WSGI server.")
 
         if self._server is not None:
             # Resize pool to stop new requests from being processed
@@ -223,4 +222,4 @@ class Server(service.ServiceBase):
                 self._pool.waitall()
                 self._server.wait()
         except greenlet.GreenletExit:
-            LOG.info(_LI("WSGI server has stopped."))
+            LOG.info("WSGI server has stopped.")

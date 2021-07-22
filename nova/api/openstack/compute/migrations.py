@@ -23,6 +23,7 @@ from nova.compute import api as compute
 from nova import exception
 from nova.i18n import _
 from nova.objects import base as obj_base
+from nova.objects import fields
 from nova.policies import migrations as migrations_policies
 
 
@@ -72,7 +73,9 @@ class MigrationsController(wsgi.Controller):
             # NOTE(Shaohe Feng) above version 2.23, add migration_type for all
             # kinds of migration, but we only add links just for in-progress
             # live-migration.
-            if add_link and obj['migration_type'] == "live-migration" and (
+            if (add_link and
+                    obj['migration_type'] ==
+                        fields.MigrationType.LIVE_MIGRATION and
                     obj["status"] in live_migration_in_progress):
                 obj["links"] = self._view_builder._get_links(
                     req, obj["id"],
@@ -86,7 +89,7 @@ class MigrationsController(wsgi.Controller):
                sort_dirs=None, sort_keys=None, limit=None, marker=None,
                allow_changes_since=False, allow_changes_before=False):
         context = req.environ['nova.context']
-        context.can(migrations_policies.POLICY_ROOT % 'index')
+        context.can(migrations_policies.POLICY_ROOT % 'index', target={})
         search_opts = {}
         search_opts.update(req.GET)
         if 'changes-since' in search_opts:
@@ -153,7 +156,7 @@ class MigrationsController(wsgi.Controller):
     @wsgi.expected_errors(())
     @validation.query_schema(schema_migrations.list_query_schema_v20,
                              "2.23", "2.58")
-    def index(self, req):
+    def index(self, req):  # noqa
         """Return all migrations using the query parameters as filters."""
         return self._index(req, add_link=True)
 
@@ -161,7 +164,7 @@ class MigrationsController(wsgi.Controller):
     @wsgi.expected_errors(400)
     @validation.query_schema(schema_migrations.list_query_params_v259,
                              "2.59", "2.65")
-    def index(self, req):
+    def index(self, req):  # noqa
         """Return all migrations using the query parameters as filters."""
         limit, marker = common.get_limit_and_marker(req)
         return self._index(req, add_link=True, next_link=True, add_uuid=True,
@@ -176,7 +179,7 @@ class MigrationsController(wsgi.Controller):
                              "2.66", "2.79")
     @validation.query_schema(schema_migrations.list_query_params_v280,
                              "2.80")
-    def index(self, req):
+    def index(self, req):  # noqa
         """Return all migrations using the query parameters as filters."""
         limit, marker = common.get_limit_and_marker(req)
         return self._index(req, add_link=True, next_link=True, add_uuid=True,

@@ -19,7 +19,6 @@ from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional import fixtures as func_fixtures
 from nova.tests.functional import integrated_helpers
-from nova.tests.unit.image import fake as fake_image
 
 
 class MissingReqSpecInstanceGroupUUIDTestCase(
@@ -51,9 +50,8 @@ class MissingReqSpecInstanceGroupUUIDTestCase(
         super(MissingReqSpecInstanceGroupUUIDTestCase, self).setUp()
         # Stub out external dependencies.
         self.useFixture(nova_fixtures.NeutronFixture(self))
+        self.useFixture(nova_fixtures.GlanceFixture(self))
         self.useFixture(func_fixtures.PlacementFixture())
-        fake_image.stub_out_image_service(self)
-        self.addCleanup(fake_image.FakeImageService_reset)
         # Configure the API to allow resizing to the same host so we can keep
         # the number of computes down to two in the test.
         self.flags(allow_resize_to_same_host=True)
@@ -68,10 +66,8 @@ class MissingReqSpecInstanceGroupUUIDTestCase(
         self.start_service('scheduler')
         # Start two computes, one where the server will be created and another
         # where we'll cold migrate it.
-        self.computes = {}  # keep track of the compute services per host name
-        for host in ('host1', 'host2'):
-            compute_service = self.start_service('compute', host=host)
-            self.computes[host] = compute_service
+        self._start_compute('host1')
+        self._start_compute('host2')
 
     def test_cold_migrate_reschedule(self):
         # Create an anti-affinity group for the server.

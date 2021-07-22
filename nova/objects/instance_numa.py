@@ -19,6 +19,7 @@ from oslo_utils import versionutils
 
 from nova.db import api as db
 from nova import exception
+from nova.i18n import _
 from nova.objects import base
 from nova.objects import fields as obj_fields
 from nova.virt import hardware
@@ -33,12 +34,34 @@ class InstanceNUMACell(base.NovaEphemeralObject,
     # Version 1.2: Add cpu_pinning_raw and topology fields
     # Version 1.3: Add cpu_policy and cpu_thread_policy fields
     # Version 1.4: Add cpuset_reserved field
-    VERSION = '1.4'
+    # Version 1.5: Add pcpuset field
+    # Version 1.6: Add 'mixed' to cpu_policy field
+    VERSION = '1.6'
 
     def obj_make_compatible(self, primitive, target_version):
         super(InstanceNUMACell, self).obj_make_compatible(primitive,
-                                                        target_version)
+                                                          target_version)
         target_version = versionutils.convert_version_to_tuple(target_version)
+        # Instance with a 'mixed' CPU policy could not provide a backward
+        # compatibility.
+        if target_version < (1, 6):
+            if primitive['cpu_policy'] == obj_fields.CPUAllocationPolicy.MIXED:
+                raise exception.ObjectActionError(
+                    action='obj_make_compatible',
+                    reason=_(
+                        '%s policy is not supported in version %s'
+                    ) % (primitive['cpu_policy'], target_version))
+
+        # NOTE(huaqiang): Since version 1.5, 'cpuset' is modified to track the
+        # unpinned CPUs only, with pinned CPUs tracked via 'pcpuset' instead.
+        # For a backward compatibility, move the 'dedicated' instance CPU list
+        # from 'pcpuset' to 'cpuset'.
+        if target_version < (1, 5):
+            if (primitive['cpu_policy'] ==
+                    obj_fields.CPUAllocationPolicy.DEDICATED):
+                primitive['cpuset'] = primitive['pcpuset']
+            primitive.pop('pcpuset', None)
+
         if target_version < (1, 4):
             primitive.pop('cpuset_reserved', None)
 
@@ -49,9 +72,15 @@ class InstanceNUMACell(base.NovaEphemeralObject,
     fields = {
         'id': obj_fields.IntegerField(),
         'cpuset': obj_fields.SetOfIntegersField(),
+        'pcpuset': obj_fields.SetOfIntegersField(),
+        # These physical CPUs are reserved for use by the hypervisor
+        'cpuset_reserved': obj_fields.SetOfIntegersField(nullable=True,
+                                                         default=None),
         'memory': obj_fields.IntegerField(),
         'pagesize': obj_fields.IntegerField(nullable=True,
                                             default=None),
+        # TODO(sean-k-mooney): This is no longer used and should be
+        # removed in v2
         'cpu_topology': obj_fields.ObjectField('VirtCPUTopology',
                                                nullable=True),
         'cpu_pinning_raw': obj_fields.DictOfIntegersField(nullable=True,
@@ -60,30 +89,20 @@ class InstanceNUMACell(base.NovaEphemeralObject,
                                                           default=None),
         'cpu_thread_policy': obj_fields.CPUThreadAllocationPolicyField(
             nullable=True, default=None),
-        # These physical CPUs are reserved for use by the hypervisor
-        'cpuset_reserved': obj_fields.SetOfIntegersField(nullable=True,
-                                                         default=None),
     }
 
     cpu_pinning = obj_fields.DictProxyField('cpu_pinning_raw')
 
     def __len__(self):
-        return len(self.cpuset)
+        return len(self.total_cpus)
 
-    @classmethod
-    def _from_dict(cls, data_dict):
-        # NOTE(sahid): Used as legacy, could be renamed in
-        # _legacy_from_dict_ to the future to avoid confusing.
-        cpuset = hardware.parse_cpu_spec(data_dict.get('cpus', ''))
-        memory = data_dict.get('mem', {}).get('total', 0)
-        cell_id = data_dict.get('id')
-        pagesize = data_dict.get('pagesize')
-        return cls(id=cell_id, cpuset=cpuset,
-                   memory=memory, pagesize=pagesize)
+    @property
+    def total_cpus(self):
+        return self.cpuset | self.pcpuset
 
     @property
     def siblings(self):
-        cpu_list = sorted(list(self.cpuset))
+        cpu_list = sorted(list(self.total_cpus))
 
         threads = 0
         if ('cpu_topology' in self) and self.cpu_topology:
@@ -93,12 +112,8 @@ class InstanceNUMACell(base.NovaEphemeralObject,
 
         return list(map(set, zip(*[iter(cpu_list)] * threads)))
 
-    @property
-    def cpu_pinning_requested(self):
-        return self.cpu_policy == obj_fields.CPUAllocationPolicy.DEDICATED
-
     def pin(self, vcpu, pcpu):
-        if vcpu not in self.cpuset:
+        if vcpu not in self.pcpuset:
             return
         pinning_dict = self.cpu_pinning or {}
         pinning_dict[vcpu] = pcpu
@@ -130,7 +145,7 @@ class InstanceNUMATopology(base.NovaObject,
 
     def obj_make_compatible(self, primitive, target_version):
         super(InstanceNUMATopology, self).obj_make_compatible(primitive,
-                                                        target_version)
+                                                              target_version)
         target_version = versionutils.convert_version_to_tuple(target_version)
         if target_version < (1, 3):
             primitive.pop('emulator_threads_policy', None)
@@ -146,29 +161,80 @@ class InstanceNUMATopology(base.NovaObject,
         }
 
     @classmethod
-    def obj_from_primitive(cls, primitive, context=None):
-        if 'nova_object.name' in primitive:
-            obj_topology = super(InstanceNUMATopology, cls).obj_from_primitive(
-                primitive, context=None)
-        else:
-            # NOTE(sahid): This compatibility code needs to stay until we can
-            # guarantee that there are no cases of the old format stored in
-            # the database (or forever, if we can never guarantee that).
-            obj_topology = InstanceNUMATopology._from_dict(primitive)
-            obj_topology.id = 0
-        return obj_topology
-
-    @classmethod
-    def obj_from_db_obj(cls, instance_uuid, db_obj):
+    def obj_from_db_obj(cls, context, instance_uuid, db_obj):
         primitive = jsonutils.loads(db_obj)
-        obj_topology = cls.obj_from_primitive(primitive)
 
-        if 'nova_object.name' not in db_obj:
-            obj_topology.instance_uuid = instance_uuid
-            # No benefit to store a list of changed fields
-            obj_topology.obj_reset_changes()
+        if 'nova_object.name' in primitive:
+            obj = cls.obj_from_primitive(primitive)
+            cls._migrate_legacy_dedicated_instance_cpuset(
+                context, instance_uuid, obj)
+        else:
+            obj = cls._migrate_legacy_object(context, instance_uuid, primitive)
 
-        return obj_topology
+        return obj
+
+    # TODO(huaqiang): Remove after Wallaby once we are sure these objects have
+    # been loaded at least once.
+    @classmethod
+    def _migrate_legacy_dedicated_instance_cpuset(cls, context, instance_uuid,
+                                                  obj):
+        # NOTE(huaqiang): We may meet some topology object with the old version
+        # 'InstanceNUMACell' cells, in that case, the 'dedicated' CPU is kept
+        # in 'InstanceNUMACell.cpuset' field, but it should be kept in
+        # 'InstanceNUMACell.pcpuset' field since Victoria. Making an upgrade
+        # and persisting to database.
+        update_db = False
+        for cell in obj.cells:
+            if len(cell.cpuset) == 0:
+                continue
+
+            if cell.cpu_policy != obj_fields.CPUAllocationPolicy.DEDICATED:
+                continue
+
+            cell.pcpuset = cell.cpuset
+            cell.cpuset = set()
+            update_db = True
+
+        if update_db:
+            db_obj = jsonutils.dumps(obj.obj_to_primitive())
+            values = {
+                'numa_topology': db_obj,
+            }
+            db.instance_extra_update_by_uuid(context, instance_uuid,
+                                             values)
+
+    # TODO(stephenfin): Remove in X or later, once this has bedded in
+    @classmethod
+    def _migrate_legacy_object(cls, context, instance_uuid, primitive):
+        """Convert a pre-Liberty object to a real o.vo.
+
+        Handle an unversioned object created prior to Liberty, by transforming
+        to a versioned object and saving back the serialized version of this.
+
+        :param context: RequestContext
+        :param instance_uuid: The UUID of the instance this topology is
+            associated with.
+        :param primitive: A serialized representation of the legacy object.
+        :returns: A serialized representation of the updated object.
+        """
+        obj = cls(
+            instance_uuid=instance_uuid,
+            cells=[
+                InstanceNUMACell(
+                    id=cell.get('id'),
+                    cpuset=hardware.parse_cpu_spec(cell.get('cpus', '')),
+                    pcpuset=set(),
+                    memory=cell.get('mem', {}).get('total', 0),
+                    pagesize=cell.get('pagesize'),
+                ) for cell in primitive.get('cells', [])
+            ],
+        )
+        db_obj = jsonutils.dumps(obj.obj_to_primitive())
+        values = {
+            'numa_topology': db_obj,
+        }
+        db.instance_extra_update_by_uuid(context, instance_uuid, values)
+        return obj
 
     # TODO(ndipanov) Remove this method on the major version bump to 2.0
     @base.remotable
@@ -188,7 +254,8 @@ class InstanceNUMATopology(base.NovaObject,
         if db_extra['numa_topology'] is None:
             return None
 
-        return cls.obj_from_db_obj(instance_uuid, db_extra['numa_topology'])
+        return cls.obj_from_db_obj(
+            context, instance_uuid, db_extra['numa_topology'])
 
     def _to_json(self):
         return jsonutils.dumps(self.obj_to_primitive())
@@ -197,13 +264,18 @@ class InstanceNUMATopology(base.NovaObject,
         """Defined so that boolean testing works the same as for lists."""
         return len(self.cells)
 
-    @classmethod
-    def _from_dict(cls, data_dict):
-        # NOTE(sahid): Used as legacy, could be renamed in _legacy_from_dict_
-        # in the future to avoid confusing.
-        return cls(cells=[
-            InstanceNUMACell._from_dict(cell_dict)
-            for cell_dict in data_dict.get('cells', [])])
+    # TODO(stephenfin): We should add a real 'cpu_policy' field on this object
+    # and deprecate the one found on the cell
+    @property
+    def cpu_policy(self):
+        cpu_policy = set(cell.cpu_policy for cell in self.cells)
+        if len(cpu_policy) > 1:
+            # NOTE(stephenfin): This should never happen in real life; it's to
+            # prevent programmer error.
+            raise exception.InternalError(
+                'Instance NUMA cells must have the same CPU policy.'
+            )
+        return cpu_policy.pop()
 
     @property
     def cpu_pinning(self):
@@ -211,10 +283,6 @@ class InstanceNUMATopology(base.NovaObject,
         return set(itertools.chain.from_iterable([
             cell.cpu_pinning.values() for cell in self.cells
             if cell.cpu_pinning]))
-
-    @property
-    def cpu_pinning_requested(self):
-        return all(cell.cpu_pinning_requested for cell in self.cells)
 
     def clear_host_pinning(self):
         """Clear any data related to how instance is pinned to the host.

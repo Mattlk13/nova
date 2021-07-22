@@ -14,6 +14,7 @@
 #    under the License.
 
 import mock
+import testtools
 import webob
 
 from nova.api.openstack.compute import flavors_extraspecs \
@@ -152,14 +153,6 @@ class FlavorsExtraSpecsTestV21(test.TestCase):
         with mock.patch('nova.objects.Flavor.save'):
             self.controller.delete(req, 1, 'hw:numa_nodes')
 
-    def test_delete_no_admin(self):
-        self.stub_out('nova.objects.flavor._flavor_extra_specs_del',
-                      delete_flavor_extra_specs)
-
-        req = self._get_request('1/os-extra_specs/hw:numa_nodes')
-        self.assertRaises(exception.Forbidden, self.controller.delete,
-                          req, 1, 'hw numa nodes')
-
     def test_delete_spec_not_found(self):
         req = self._get_request('1/os-extra_specs/key6',
                                 use_admin_context=True)
@@ -179,13 +172,6 @@ class FlavorsExtraSpecsTestV21(test.TestCase):
 
         self.assertEqual('shared', res_dict['extra_specs']['hw:cpu_policy'])
         self.assertEqual('1', res_dict['extra_specs']['hw:numa_nodes'])
-
-    def test_create_no_admin(self):
-        body = {'extra_specs': {'hw:numa_nodes': '1'}}
-
-        req = self._get_request('1/os-extra_specs')
-        self.assertRaises(exception.Forbidden, self.controller.create,
-                          req, 1, body=body)
 
     def test_create_flavor_not_found(self):
         body = {'extra_specs': {'hw:numa_nodes': '1'}}
@@ -264,18 +250,72 @@ class FlavorsExtraSpecsTestV21(test.TestCase):
             self.assertRaises(self.bad_request, self.controller.create,
                               req, 1, body=body)
 
+    def test_create_invalid_known_namespace(self):
+        """Test behavior of validator with specs from known namespace."""
+        invalid_specs = {
+            'hw:numa_nodes': 'foo',
+            'hw:cpu_policy': 'sharrred',
+            'hw:cpu_policyyyyyyy': 'shared',
+            'hw:foo': 'bar',
+            'resources:VCPU': 'N',
+            'resources_foo:VCPU': 'N',
+            'resources:VVCPU': '1',
+            'resources_foo:VVCPU': '1',
+            'trait:STORAGE_DISK_SSD': 'forbiden',
+            'trait_foo:HW_CPU_X86_AVX2': 'foo',
+            'trait:bar': 'required',
+            'trait_foo:bar': 'required',
+            'trait:CUSTOM_foo': 'required',
+            'trait:CUSTOM_FOO': 'bar',
+            'trait_foo:CUSTOM_BAR': 'foo',
+        }
+        for key, value in invalid_specs.items():
+            body = {'extra_specs': {key: value}}
+            req = self._get_request(
+                '1/os-extra_specs', use_admin_context=True, version='2.86',
+            )
+            with testtools.ExpectedException(
+                self.bad_request, 'Validation failed; .*'
+            ):
+                self.controller.create(req, 1, body=body)
+
+    def test_create_invalid_unknown_namespace(self):
+        """Test behavior of validator with specs from unknown namespace."""
+        unknown_specs = {
+            'foo': 'bar',
+            'foo:bar': 'baz',
+            'hww:cpu_policy': 'sharrred',
+        }
+        for key, value in unknown_specs.items():
+            body = {'extra_specs': {key: value}}
+            req = self._get_request(
+                '1/os-extra_specs', use_admin_context=True, version='2.86',
+            )
+            self.controller.create(req, 1, body=body)
+
     @mock.patch('nova.objects.flavor._flavor_extra_specs_add')
     def test_create_valid_specs(self, mock_flavor_extra_specs):
         valid_specs = {
             'hide_hypervisor_id': 'true',
+            'hw:hide_hypervisor_id': 'true',
             'hw:numa_nodes': '1',
             'hw:numa_cpus.0': '0-3,8-9,11,10',
+            'resources:VCPU': '4',
+            'resources_foo:VCPU': '4',
+            'resources:CUSTOM_FOO': '1',
+            'resources_foo:CUSTOM_BAR': '2',
+            'trait:STORAGE_DISK_SSD': 'forbidden',
+            'trait_foo:HW_CPU_X86_AVX2': 'required',
+            'trait:CUSTOM_FOO': 'forbidden',
+            'trait_foo:CUSTOM_BAR': 'required',
         }
         mock_flavor_extra_specs.side_effect = return_create_flavor_extra_specs
 
         for key, value in valid_specs.items():
             body = {"extra_specs": {key: value}}
-            req = self._get_request('1/os-extra_specs', use_admin_context=True)
+            req = self._get_request(
+                '1/os-extra_specs', use_admin_context=True, version='2.86',
+            )
             res_dict = self.controller.create(req, 1, body=body)
             self.assertEqual(value, res_dict['extra_specs'][key])
 
@@ -289,13 +329,6 @@ class FlavorsExtraSpecsTestV21(test.TestCase):
         res_dict = self.controller.update(req, 1, 'hw:cpu_policy', body=body)
 
         self.assertEqual('shared', res_dict['hw:cpu_policy'])
-
-    def test_update_item_no_admin(self):
-        body = {'hw:cpu_policy': 'shared'}
-
-        req = self._get_request('1/os-extra_specs/hw:cpu_policy')
-        self.assertRaises(exception.Forbidden, self.controller.update,
-                          req, 1, 'key1', body=body)
 
     def _test_update_item_bad_request(self, body):
         req = self._get_request('1/os-extra_specs/hw:cpu_policy',
@@ -366,3 +399,55 @@ class FlavorsExtraSpecsTestV21(test.TestCase):
                                 use_admin_context=True)
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
                           req, 1, 'hw:numa_nodes', body=body)
+
+    def test_update_invalid_specs_known_namespace(self):
+        """Test behavior of validator with specs from known namespace."""
+        invalid_specs = {
+            'hw:numa_nodes': 'foo',
+            'hw:cpu_policy': 'sharrred',
+            'hw:cpu_policyyyyyyy': 'shared',
+            'hw:foo': 'bar',
+        }
+        for key, value in invalid_specs.items():
+            body = {key: value}
+            req = self._get_request(
+                '1/os-extra_specs/{key}',
+                use_admin_context=True, version='2.86',
+            )
+            with testtools.ExpectedException(
+                self.bad_request, 'Validation failed; .*'
+            ):
+                self.controller.update(req, 1, key, body=body)
+
+    def test_update_invalid_specs_unknown_namespace(self):
+        """Test behavior of validator with specs from unknown namespace."""
+        unknown_specs = {
+            'foo': 'bar',
+            'foo:bar': 'baz',
+            'hww:cpu_policy': 'sharrred',
+        }
+        for key, value in unknown_specs.items():
+            body = {key: value}
+            req = self._get_request(
+                f'1/os-extra_specs/{key}',
+                use_admin_context=True, version='2.86',
+            )
+            self.controller.update(req, 1, key, body=body)
+
+    @mock.patch('nova.objects.flavor._flavor_extra_specs_add')
+    def test_update_valid_specs(self, mock_flavor_extra_specs):
+        valid_specs = {
+            'hide_hypervisor_id': 'true',
+            'hw:numa_nodes': '1',
+            'hw:numa_cpus.0': '0-3,8-9,11,10',
+        }
+        mock_flavor_extra_specs.side_effect = return_create_flavor_extra_specs
+
+        for key, value in valid_specs.items():
+            body = {key: value}
+            req = self._get_request(
+                f'1/os-extra_specs/{key}', use_admin_context=True,
+                version='2.86',
+            )
+            res_dict = self.controller.update(req, 1, key, body=body)
+            self.assertEqual(value, res_dict[key])

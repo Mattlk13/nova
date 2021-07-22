@@ -12,7 +12,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from __future__ import absolute_import
 import contextlib
 
 import fixtures
@@ -25,7 +24,6 @@ from pypowervm.helpers import log_helper as pvm_hlp_log
 from pypowervm.helpers import vios_busy as pvm_hlp_vbusy
 from pypowervm.utils import transaction as pvm_tx
 from pypowervm.wrappers import virtual_io_server as pvm_vios
-import six
 
 from nova import block_device as nova_block_device
 from nova.compute import provider_tree
@@ -506,11 +504,11 @@ class TestPowerVMDriver(test.NoDBTestCase):
         mock_tf_run.side_effect = exception.InstanceNotFound('id')
         exc = self.assertRaises(exception.VirtualInterfacePlugException,
                                 self.drv.plug_vifs, mock_inst, 'net_info')
-        self.assertIn('instance', six.text_type(exc))
+        self.assertIn('instance', str(exc))
         mock_tf_run.side_effect = Exception
         exc = self.assertRaises(exception.VirtualInterfacePlugException,
                                 self.drv.plug_vifs, mock_inst, 'net_info')
-        self.assertIn('unexpected', six.text_type(exc))
+        self.assertIn('unexpected', str(exc))
 
     @mock.patch('nova.virt.powervm.tasks.base.run', autospec=True)
     @mock.patch('nova.virt.powervm.tasks.network.UnplugVifs', autospec=True)
@@ -589,7 +587,8 @@ class TestPowerVMDriver(test.NoDBTestCase):
     @mock.patch('nova.virt.powervm.volume.fcvscsi.FCVscsiVolumeAdapter')
     def test_extend_volume(self, mock_vscsi_adpt):
         mock_bdm = self._fake_bdms()['block_device_mapping'][0]
-        self.drv.extend_volume(mock_bdm.get('connection_info'), self.inst, 0)
+        self.drv.extend_volume(
+            'context', mock_bdm.get('connection_info'), self.inst, 0)
         mock_vscsi_adpt.return_value.extend_volume.assert_called_once_with()
 
     def test_vol_drv_iter(self):

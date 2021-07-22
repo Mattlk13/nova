@@ -104,7 +104,8 @@ class VolumeController(wsgi.Controller):
     def show(self, req, id):
         """Return data about the given volume."""
         context = req.environ['nova.context']
-        context.can(vol_policies.BASE_POLICY_NAME)
+        context.can(vol_policies.POLICY_NAME % 'show',
+                    target={'project_id': context.project_id})
 
         try:
             vol = self.volume_api.get(context, id)
@@ -119,7 +120,8 @@ class VolumeController(wsgi.Controller):
     def delete(self, req, id):
         """Delete a volume."""
         context = req.environ['nova.context']
-        context.can(vol_policies.BASE_POLICY_NAME)
+        context.can(vol_policies.POLICY_NAME % 'delete',
+                    target={'project_id': context.project_id})
 
         try:
             self.volume_api.delete(context, id)
@@ -133,6 +135,9 @@ class VolumeController(wsgi.Controller):
     @wsgi.expected_errors(())
     def index(self, req):
         """Returns a summary list of volumes."""
+        context = req.environ['nova.context']
+        context.can(vol_policies.POLICY_NAME % 'list',
+                    target={'project_id': context.project_id})
         return self._items(req, entity_maker=_translate_volume_summary_view)
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
@@ -140,12 +145,14 @@ class VolumeController(wsgi.Controller):
     @wsgi.expected_errors(())
     def detail(self, req):
         """Returns a detailed list of volumes."""
+        context = req.environ['nova.context']
+        context.can(vol_policies.POLICY_NAME % 'detail',
+                    target={'project_id': context.project_id})
         return self._items(req, entity_maker=_translate_volume_detail_view)
 
     def _items(self, req, entity_maker):
         """Returns a list of volumes, transformed through entity_maker."""
         context = req.environ['nova.context']
-        context.can(vol_policies.BASE_POLICY_NAME)
 
         volumes = self.volume_api.get_all(context)
         limited_list = common.limited(volumes, req)
@@ -158,7 +165,8 @@ class VolumeController(wsgi.Controller):
     def create(self, req, body):
         """Creates a new volume."""
         context = req.environ['nova.context']
-        context.can(vol_policies.BASE_POLICY_NAME)
+        context.can(vol_policies.POLICY_NAME % 'create',
+                    target={'project_id': context.project_id})
 
         vol = body['volume']
 
@@ -391,15 +399,8 @@ class VolumeAttachmentController(wsgi.Controller):
             attachment['delete_on_termination'] = delete_on_termination
         return {'volumeAttachment': attachment}
 
-    @wsgi.response(202)
-    @wsgi.expected_errors((400, 404, 409))
-    @validation.schema(volumes_schema.update_volume_attachment)
-    def update(self, req, server_id, id, body):
+    def _update_volume_swap(self, req, instance, id, body):
         context = req.environ['nova.context']
-        instance = common.get_instance(self.compute_api, context, server_id)
-        context.can(va_policies.POLICY_ROOT % 'update',
-                    target={'project_id': instance.project_id})
-
         old_volume_id = id
         try:
             old_volume = self.volume_api.get(context, old_volume_id)
@@ -431,7 +432,71 @@ class VolumeAttachmentController(wsgi.Controller):
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
-                    'swap_volume', server_id)
+                    'swap_volume', instance.uuid)
+
+    def _update_volume_regular(self, req, instance, id, body):
+        context = req.environ['nova.context']
+        att = body['volumeAttachment']
+        # NOTE(danms): We may be doing an update of regular parameters in
+        # the midst of a swap operation, so to find the original BDM, we need
+        # to use the old volume ID, which is the one in the path.
+        volume_id = id
+
+        try:
+            bdm = objects.BlockDeviceMapping.get_by_volume_and_instance(
+                context, volume_id, instance.uuid)
+
+            # NOTE(danms): The attachment id is just the (current) volume id
+            if 'id' in att and att['id'] != volume_id:
+                raise exc.HTTPBadRequest(explanation='The id property is '
+                                         'not mutable')
+            if 'serverId' in att and att['serverId'] != instance.uuid:
+                raise exc.HTTPBadRequest(explanation='The serverId property '
+                                         'is not mutable')
+            if 'device' in att and att['device'] != bdm.device_name:
+                raise exc.HTTPBadRequest(explanation='The device property is '
+                                         'not mutable')
+            if 'tag' in att and att['tag'] != bdm.tag:
+                raise exc.HTTPBadRequest(explanation='The tag property is '
+                                         'not mutable')
+            if 'delete_on_termination' in att:
+                bdm.delete_on_termination = strutils.bool_from_string(
+                        att['delete_on_termination'], strict=True)
+            bdm.save()
+        except exception.VolumeBDMNotFound as e:
+            raise exc.HTTPNotFound(explanation=e.format_message())
+
+    @wsgi.response(202)
+    @wsgi.expected_errors((400, 404, 409))
+    @validation.schema(volumes_schema.update_volume_attachment, '2.0', '2.84')
+    @validation.schema(volumes_schema.update_volume_attachment_v285,
+                       min_version='2.85')
+    def update(self, req, server_id, id, body):
+        context = req.environ['nova.context']
+        instance = common.get_instance(self.compute_api, context, server_id)
+        attachment = body['volumeAttachment']
+        volume_id = attachment['volumeId']
+        only_swap = not api_version_request.is_supported(req, '2.85')
+
+        # NOTE(brinzhang): If the 'volumeId' requested by the user is
+        # different from the 'id' in the url path, or only swap is allowed by
+        # the microversion, we should check the swap volume policy.
+        # otherwise, check the volume update policy.
+        if only_swap or id != volume_id:
+            context.can(va_policies.POLICY_ROOT % 'swap', target={})
+        else:
+            context.can(va_policies.POLICY_ROOT % 'update',
+                        target={'project_id': instance.project_id})
+
+        if only_swap:
+            # NOTE(danms): Original behavior is always call swap on PUT
+            self._update_volume_swap(req, instance, id, body)
+        else:
+            # NOTE(danms): New behavior is update any supported attachment
+            # properties first, and then call swap if volumeId differs
+            self._update_volume_regular(req, instance, id, body)
+            if id != volume_id:
+                self._update_volume_swap(req, instance, id, body)
 
     @wsgi.response(202)
     @wsgi.expected_errors((400, 403, 404, 409))
@@ -473,7 +538,7 @@ class VolumeAttachmentController(wsgi.Controller):
             raise exc.HTTPBadRequest(explanation=e.format_message())
         except exception.InvalidInput as e:
             raise exc.HTTPBadRequest(explanation=e.format_message())
-        except exception.InstanceIsLocked as e:
+        except (exception.InstanceIsLocked, exception.ServiceUnavailable) as e:
             raise exc.HTTPConflict(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
@@ -516,7 +581,8 @@ class SnapshotController(wsgi.Controller):
     def show(self, req, id):
         """Return data about the given snapshot."""
         context = req.environ['nova.context']
-        context.can(vol_policies.BASE_POLICY_NAME)
+        context.can(vol_policies.POLICY_NAME % 'snapshots:show',
+                    target={'project_id': context.project_id})
 
         try:
             vol = self.volume_api.get_snapshot(context, id)
@@ -531,7 +597,8 @@ class SnapshotController(wsgi.Controller):
     def delete(self, req, id):
         """Delete a snapshot."""
         context = req.environ['nova.context']
-        context.can(vol_policies.BASE_POLICY_NAME)
+        context.can(vol_policies.POLICY_NAME % 'snapshots:delete',
+                    target={'project_id': context.project_id})
 
         try:
             self.volume_api.delete_snapshot(context, id)
@@ -543,6 +610,9 @@ class SnapshotController(wsgi.Controller):
     @wsgi.expected_errors(())
     def index(self, req):
         """Returns a summary list of snapshots."""
+        context = req.environ['nova.context']
+        context.can(vol_policies.POLICY_NAME % 'snapshots:list',
+                    target={'project_id': context.project_id})
         return self._items(req, entity_maker=_translate_snapshot_summary_view)
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
@@ -550,12 +620,14 @@ class SnapshotController(wsgi.Controller):
     @wsgi.expected_errors(())
     def detail(self, req):
         """Returns a detailed list of snapshots."""
+        context = req.environ['nova.context']
+        context.can(vol_policies.POLICY_NAME % 'snapshots:detail',
+                    target={'project_id': context.project_id})
         return self._items(req, entity_maker=_translate_snapshot_detail_view)
 
     def _items(self, req, entity_maker):
         """Returns a list of snapshots, transformed through entity_maker."""
         context = req.environ['nova.context']
-        context.can(vol_policies.BASE_POLICY_NAME)
 
         snapshots = self.volume_api.get_all_snapshots(context)
         limited_list = common.limited(snapshots, req)
@@ -568,7 +640,8 @@ class SnapshotController(wsgi.Controller):
     def create(self, req, body):
         """Creates a new snapshot."""
         context = req.environ['nova.context']
-        context.can(vol_policies.BASE_POLICY_NAME)
+        context.can(vol_policies.POLICY_NAME % 'snapshots:create',
+                    target={'project_id': context.project_id})
 
         snapshot = body['snapshot']
         volume_id = snapshot['volume_id']

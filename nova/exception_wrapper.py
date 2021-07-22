@@ -12,14 +12,12 @@
 
 import functools
 import inspect
-import traceback
 
 from oslo_utils import excutils
 
-
 import nova.conf
 from nova.notifications.objects import base
-from nova.notifications.objects import exception
+from nova.notifications.objects import exception as exception_obj
 from nova.objects import fields
 from nova import rpc
 from nova import safe_utils
@@ -27,36 +25,32 @@ from nova import safe_utils
 CONF = nova.conf.CONF
 
 
-def _emit_exception_notification(notifier, context, ex, function_name, args,
-                                 source, trace_back):
-    _emit_legacy_exception_notification(notifier, context, ex, function_name,
-                                        args)
-    _emit_versioned_exception_notification(context, ex, source, trace_back)
-
-
 @rpc.if_notifications_enabled
-def _emit_versioned_exception_notification(context, ex, source, trace_back):
-    versioned_exception_payload = \
-        exception.ExceptionPayload.from_exc_and_traceback(ex, trace_back)
+def _emit_versioned_exception_notification(context, exception, source):
+    payload = exception_obj.ExceptionPayload.from_exception(exception)
     publisher = base.NotificationPublisher(host=CONF.host, source=source)
     event_type = base.EventType(
-            object='compute',
-            action=fields.NotificationAction.EXCEPTION)
-    notification = exception.ExceptionNotification(
+        object='compute',
+        action=fields.NotificationAction.EXCEPTION,
+    )
+    notification = exception_obj.ExceptionNotification(
         publisher=publisher,
         event_type=event_type,
         priority=fields.NotificationPriority.ERROR,
-        payload=versioned_exception_payload)
+        payload=payload,
+    )
     notification.emit(context)
 
 
-def _emit_legacy_exception_notification(notifier, context, ex, function_name,
-                                       args):
-    payload = dict(exception=ex, args=args)
+def _emit_legacy_exception_notification(
+    context, exception, service, function_name, args,
+):
+    notifier = rpc.get_notifier(service)
+    payload = {'exception': exception, 'args': args}
     notifier.error(context, function_name, payload)
 
 
-def wrap_exception(notifier=None, get_notifier=None, binary=None):
+def wrap_exception(service, binary):
     """This decorator wraps a method to catch any exceptions that may
     get thrown. It also optionally sends the exception to the notification
     system.
@@ -67,17 +61,15 @@ def wrap_exception(notifier=None, get_notifier=None, binary=None):
             # contain confidential information.
             try:
                 return f(self, context, *args, **kw)
-            except Exception as e:
-                tb = traceback.format_exc()
+            except Exception as exc:
                 with excutils.save_and_reraise_exception():
-                    if notifier or get_notifier:
-                        call_dict = _get_call_dict(
-                            f, self, context, *args, **kw)
-                        function_name = f.__name__
-                        _emit_exception_notification(
-                            notifier or get_notifier(), context, e,
-                            function_name, call_dict, binary, tb)
+                    call_dict = _get_call_dict(f, self, context, *args, **kw)
+                    function_name = f.__name__
 
+                    _emit_legacy_exception_notification(
+                        context, exc, service, function_name, call_dict)
+                    _emit_versioned_exception_notification(
+                        context, exc, binary)
         return functools.wraps(f)(wrapped)
     return inner
 

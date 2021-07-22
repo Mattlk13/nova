@@ -12,7 +12,6 @@
 
 import itertools
 
-import mock
 from oslo_utils.fixture import uuidsentinel as uuids
 
 from nova import objects
@@ -43,10 +42,12 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         return spec_obj
 
     def test_numa_topology_filter_pass(self):
-        instance_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=0, cpuset=set([1]), memory=512),
-                   objects.InstanceNUMACell(id=1, cpuset=set([3]), memory=512)
-               ])
+        instance_topology = objects.InstanceNUMATopology(cells=[
+            objects.InstanceNUMACell(id=0, cpuset=set([1]), pcpuset=set(),
+                memory=512),
+            objects.InstanceNUMACell(id=1, cpuset=set([3]), pcpuset=set(),
+                memory=512),
+            ])
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1',
                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
@@ -56,10 +57,12 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
 
     def test_numa_topology_filter_numa_instance_no_numa_host_fail(self):
-        instance_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=0, cpuset=set([1]), memory=512),
-                   objects.InstanceNUMACell(id=1, cpuset=set([3]), memory=512)
-               ])
+        instance_topology = objects.InstanceNUMATopology(cells=[
+            objects.InstanceNUMACell(id=0, cpuset=set([1]), pcpuset=set(),
+                memory=512),
+            objects.InstanceNUMACell(id=1, cpuset=set([3]), pcpuset=set(),
+                memory=512),
+            ])
 
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1', {'pci_stats': None})
@@ -72,11 +75,14 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
 
     def test_numa_topology_filter_fail_fit(self):
-        instance_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=0, cpuset=set([1]), memory=512),
-                   objects.InstanceNUMACell(id=1, cpuset=set([2]), memory=512),
-                   objects.InstanceNUMACell(id=2, cpuset=set([3]), memory=512)
-               ])
+        instance_topology = objects.InstanceNUMATopology(cells=[
+            objects.InstanceNUMACell(id=0, cpuset=set([1]), pcpuset=set(),
+                memory=512),
+            objects.InstanceNUMACell(id=1, cpuset=set([2]), pcpuset=set(),
+                memory=512),
+            objects.InstanceNUMACell(id=2, cpuset=set([3]), pcpuset=set(),
+                memory=512),
+            ])
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1',
                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
@@ -86,11 +92,12 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
 
     def test_numa_topology_filter_fail_memory(self):
-        instance_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=0, cpuset=set([1]),
-                                            memory=1024),
-                   objects.InstanceNUMACell(id=1, cpuset=set([3]), memory=512)
-               ])
+        instance_topology = objects.InstanceNUMATopology(cells=[
+            objects.InstanceNUMACell(id=0, cpuset=set([1]), pcpuset=set(),
+                memory=1024),
+            objects.InstanceNUMACell(id=1, cpuset=set([3]), pcpuset=set(),
+                memory=512),
+            ])
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1',
                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
@@ -100,10 +107,11 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
 
     def test_numa_topology_filter_fail_cpu(self):
-        instance_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=0, cpuset=set([1]), memory=512),
-                   objects.InstanceNUMACell(id=1, cpuset=set([3, 4, 5]),
-                                            memory=512)])
+        instance_topology = objects.InstanceNUMATopology(cells=[
+            objects.InstanceNUMACell(id=0, cpuset=set([1]), pcpuset=set(),
+                memory=512),
+            objects.InstanceNUMACell(id=1, cpuset=set([3, 4, 5]),
+                                     pcpuset=set(), memory=512)])
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1',
                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
@@ -113,10 +121,12 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
 
     def test_numa_topology_filter_pass_set_limit(self):
-        instance_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=0, cpuset=set([1]), memory=512),
-                   objects.InstanceNUMACell(id=1, cpuset=set([3]), memory=512)
-               ])
+        instance_topology = objects.InstanceNUMATopology(cells=[
+            objects.InstanceNUMACell(id=0, cpuset=set([1]), pcpuset=set(),
+                memory=512),
+            objects.InstanceNUMACell(id=1, cpuset=set([3]), pcpuset=set(),
+                memory=512),
+            ])
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1',
                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
@@ -128,16 +138,26 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         self.assertEqual(limits.cpu_allocation_ratio, 21)
         self.assertEqual(limits.ram_allocation_ratio, 1.3)
 
-    @mock.patch('nova.objects.instance_numa.InstanceNUMACell'
-                '.cpu_pinning_requested',
-                return_value=True)
     def _do_test_numa_topology_filter_cpu_policy(
-            self, numa_topology, cpu_policy, cpu_thread_policy, passes,
-            mock_pinning_requested):
-        instance_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=0, cpuset=set([1]), memory=512),
-                   objects.InstanceNUMACell(id=1, cpuset=set([3]), memory=512)
-               ])
+            self, numa_topology, cpu_policy, cpu_thread_policy, passes):
+        instance_topology = objects.InstanceNUMATopology(cells=[
+            objects.InstanceNUMACell(
+                id=0,
+                cpuset=set(),
+                pcpuset=set([1]),
+                memory=512,
+                cpu_policy=cpu_policy,
+                cpu_thread_policy=cpu_thread_policy,
+            ),
+            objects.InstanceNUMACell(
+                id=1,
+                cpuset=set(),
+                pcpuset=set([3]),
+                memory=512,
+                cpu_policy=cpu_policy,
+                cpu_thread_policy=cpu_thread_policy,
+            ),
+        ])
         spec_obj = objects.RequestSpec(numa_topology=instance_topology,
                                        pci_requests=None,
                                        instance_uuid=uuids.fake)
@@ -206,11 +226,11 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
                 numa_topology, cpu_policy, cpu_thread_policy, True)
 
     def test_numa_topology_filter_pass_mempages(self):
-        instance_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=0, cpuset=set([3]),
-                                            memory=128, pagesize=4),
-                   objects.InstanceNUMACell(id=1, cpuset=set([1]),
-                                            memory=128, pagesize=16)
+        instance_topology = objects.InstanceNUMATopology(cells=[
+            objects.InstanceNUMACell(
+                id=0, cpuset=set([3]), pcpuset=set(), memory=128, pagesize=4),
+            objects.InstanceNUMACell(
+                id=1, cpuset=set([1]), pcpuset=set(), memory=128, pagesize=16),
             ])
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1',
@@ -221,12 +241,12 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
 
     def test_numa_topology_filter_fail_mempages(self):
-        instance_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=0, cpuset=set([3]),
-                                            memory=128, pagesize=8),
-                   objects.InstanceNUMACell(id=1, cpuset=set([1]),
-                                            memory=128, pagesize=16)
-               ])
+        instance_topology = objects.InstanceNUMATopology(cells=[
+            objects.InstanceNUMACell(
+                id=0, cpuset=set([3]), pcpuset=set(), memory=128, pagesize=8),
+            objects.InstanceNUMACell(
+                id=1, cpuset=set([1]), pcpuset=set(), memory=128, pagesize=16),
+            ])
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1',
                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
@@ -273,8 +293,11 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         host = self._get_fake_host_state_with_networks()
 
         instance_topology = objects.InstanceNUMATopology(cells=[
-            objects.InstanceNUMACell(id=0, cpuset=set([1]), memory=512),
-            objects.InstanceNUMACell(id=1, cpuset=set([3]), memory=512)])
+            objects.InstanceNUMACell(id=0, cpuset=set([1]), pcpuset=set(),
+                memory=512),
+            objects.InstanceNUMACell(id=1, cpuset=set([3]), pcpuset=set(),
+                memory=512),
+            ])
 
         network_metadata = objects.NetworkMetadata(
             physnets=set(['foo']), tunneled=False)
@@ -294,7 +317,9 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         host = self._get_fake_host_state_with_networks()
 
         instance_topology = objects.InstanceNUMATopology(cells=[
-            objects.InstanceNUMACell(id=0, cpuset=set([1]), memory=512)])
+            objects.InstanceNUMACell(id=0, cpuset=set([1]), pcpuset=set(),
+                memory=512),
+            ])
 
         # this should fail because the networks are affined to different host
         # NUMA nodes but our guest only has a single NUMA node

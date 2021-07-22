@@ -43,7 +43,7 @@ Compute controls hypervisors through an API server. Selecting the best
 hypervisor to use can be difficult, and you must take budget, resource
 constraints, supported features, and required technical specifications into
 account. However, the majority of OpenStack development is done on systems
-using KVM and Xen-based hypervisors. For a detailed list of features and
+using KVM-based hypervisors. For a detailed list of features and
 support across different hypervisors, see :doc:`/user/support-matrix`.
 
 You can also orchestrate clouds using multiple hypervisors in different
@@ -63,16 +63,11 @@ availability zones. Compute supports the following hypervisors:
 
 - `Quick Emulator (QEMU) <https://wiki.qemu.org/Manual>`__
 
-- `User Mode Linux (UML) <http://user-mode-linux.sourceforge.net>`__
-
 - `Virtuozzo <https://www.virtuozzo.com/products/vz7.html>`__
 
 - `VMware vSphere
   <https://www.vmware.com/support/vsphere-hypervisor.html>`__
 
-- `Xen (using libvirt) <https://www.xenproject.org>`__
-
-- `XenServer <https://xenserver.org>`__
 
 - `zVM <https://www.ibm.com/it-infrastructure/z/zvm>`__
 
@@ -112,7 +107,7 @@ For projects, you can use quota controls to limit the:
 
 Roles control the actions a user is allowed to perform. By default, most
 actions do not require a particular role, but you can configure them by editing
-the ``policy.json`` file for user roles. For example, a rule can be defined so
+the ``policy.yaml`` file for user roles. For example, a rule can be defined so
 that a user must have the ``admin`` role in order to be able to allocate a
 public IP address.
 
@@ -237,7 +232,7 @@ The displayed image attributes are:
 Virtual hardware templates are called ``flavors``. By default, these are
 configurable by admin users, however that behavior can be changed by redefining
 the access controls for ``compute_extension:flavormanage`` in
-``/etc/nova/policy.json`` on the ``compute-api`` server.
+``/etc/nova/policy.yaml`` on the ``compute-api`` server.
 For more information, refer to :doc:`/configuration/policy`.
 
 For a list of flavors that are available on your system:

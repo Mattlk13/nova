@@ -143,22 +143,27 @@ class InstanceNUMATopologyPayload(base.NotificationPayloadBase):
 @nova_base.NovaObjectRegistry.register_notification
 class InstanceNUMACellPayload(base.NotificationPayloadBase):
     # Version 1.0: Initial version
-    VERSION = '1.0'
+    # Version 1.1: Added pcpuset field
+    # Version 1.2: Added 'mixed' to cpu_policy field
+    VERSION = '1.2'
 
     SCHEMA = {
         'id': ('numa_cell', 'id'),
         'cpuset': ('numa_cell', 'cpuset'),
+        'pcpuset': ('numa_cell', 'pcpuset'),
+        'cpuset_reserved': ('numa_cell', 'cpuset_reserved'),
         'memory': ('numa_cell', 'memory'),
         'pagesize': ('numa_cell', 'pagesize'),
         'cpu_pinning_raw': ('numa_cell', 'cpu_pinning_raw'),
         'cpu_policy': ('numa_cell', 'cpu_policy'),
         'cpu_thread_policy': ('numa_cell', 'cpu_thread_policy'),
-        'cpuset_reserved': ('numa_cell', 'cpuset_reserved'),
     }
 
     fields = {
         'id': fields.IntegerField(),
         'cpuset': fields.SetOfIntegersField(),
+        'pcpuset': fields.SetOfIntegersField(),
+        'cpuset_reserved': fields.SetOfIntegersField(nullable=True),
         'memory': fields.IntegerField(),
         'pagesize': fields.IntegerField(nullable=True),
         'cpu_topology': fields.ObjectField('VirtCPUTopologyPayload',
@@ -167,7 +172,6 @@ class InstanceNUMACellPayload(base.NotificationPayloadBase):
         'cpu_policy': fields.CPUAllocationPolicyField(nullable=True),
         'cpu_thread_policy': fields.CPUThreadAllocationPolicyField(
             nullable=True),
-        'cpuset_reserved': fields.SetOfIntegersField(nullable=True)
     }
 
     def __init__(self, numa_cell):
@@ -236,7 +240,8 @@ class InstancePCIRequestsPayload(base.NotificationPayloadBase):
 @nova_base.NovaObjectRegistry.register_notification
 class InstancePCIRequestPayload(base.NotificationPayloadBase):
     # Version 1.0: Initial version
-    VERSION = '1.0'
+    # Version 1.1: Added 'socket' to numa_policy field
+    VERSION = '1.1'
 
     SCHEMA = {
         'count': ('pci_request', 'count'),

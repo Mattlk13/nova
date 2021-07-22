@@ -15,8 +15,6 @@
 
 """Implementation of an image service that uses Glance as the backend."""
 
-from __future__ import absolute_import
-
 import copy
 import inspect
 import itertools
@@ -26,12 +24,14 @@ import re
 import stat
 import sys
 import time
+import urllib.parse as urlparse
 
 import cryptography
 from cursive import certificate_utils
 from cursive import exception as cursive_exception
 from cursive import signature_utils
 import glanceclient
+from glanceclient.common import utils as glance_utils
 import glanceclient.exc
 from glanceclient.v2 import schemas
 from keystoneauth1 import loading as ks_loading
@@ -39,13 +39,9 @@ from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import excutils
 from oslo_utils import timeutils
-import six
-from six.moves import range
-import six.moves.urllib.parse as urlparse
 
 import nova.conf
 from nova import exception
-import nova.image.download as image_xfers
 from nova import objects
 from nova.objects import fields
 from nova import profiler
@@ -210,7 +206,7 @@ class GlanceClientWrapper(object):
                                'method': method, 'extra': extra})
                 if attempt == num_attempts:
                     raise exception.GlanceConnectionFailed(
-                        server=str(self.api_server), reason=six.text_type(e))
+                        server=str(self.api_server), reason=str(e))
                 time.sleep(1)
 
 
@@ -219,24 +215,55 @@ class GlanceImageServiceV2(object):
 
     def __init__(self, client=None):
         self._client = client or GlanceClientWrapper()
-        # NOTE(jbresnah) build the table of download handlers at the beginning
-        # so that operators can catch errors at load time rather than whenever
-        # a user attempts to use a module.  Note this cannot be done in glance
-        # space when this python module is loaded because the download module
-        # may require configuration options to be parsed.
+        # NOTE(danms): This used to be built from a list of external modules
+        # that were loaded at runtime. Preserve this list for implementations
+        # to be added here.
         self._download_handlers = {}
-        download_modules = image_xfers.load_transfer_modules()
 
-        for scheme, mod in download_modules.items():
-            if scheme not in CONF.glance.allowed_direct_url_schemes:
-                continue
+        if CONF.glance.enable_rbd_download:
+            self._download_handlers['rbd'] = self.rbd_download
 
-            try:
-                self._download_handlers[scheme] = mod.get_download_handler()
-            except Exception as ex:
-                LOG.error('When loading the module %(module_str)s the '
-                          'following error occurred: %(ex)s',
-                          {'module_str': str(mod), 'ex': ex})
+    def rbd_download(self, context, url_parts, dst_path, metadata=None):
+        """Use an explicit rbd call to download an image.
+
+        :param context: The `nova.context.RequestContext` object for the
+                        request
+        :param url_parts: Parts of URL pointing to the image location
+        :param dst_path: Filepath to transfer the image file to.
+        :param metadata: Image location metadata (currently unused)
+        """
+
+        # avoid circular import
+        from nova.storage import rbd_utils
+        try:
+            # Parse the RBD URL from url_parts, it should consist of 4
+            # sections and be in the format of:
+            # <cluster_uuid>/<pool_name>/<image_uuid>/<snapshot_name>
+            url_path = str(urlparse.unquote(url_parts.path))
+            cluster_uuid, pool_name, image_uuid, snapshot_name = (
+                url_path.split('/'))
+        except ValueError as e:
+            msg = f"Invalid RBD URL format: {e}"
+            LOG.error(msg)
+            raise nova.exception.InvalidParameterValue(msg)
+
+        rbd_driver = rbd_utils.RBDDriver(
+            user=CONF.glance.rbd_user,
+            pool=CONF.glance.rbd_pool,
+            ceph_conf=CONF.glance.rbd_ceph_conf,
+            connect_timeout=CONF.glance.rbd_connect_timeout)
+
+        try:
+            LOG.debug("Attempting to export RBD image: "
+                      "[pool_name: %s] [image_uuid: %s] "
+                      "[snapshot_name: %s] [dst_path: %s]",
+                      pool_name, image_uuid, snapshot_name, dst_path)
+
+            rbd_driver.export_image(dst_path, image_uuid,
+                                    snapshot_name, pool_name)
+        except Exception as e:
+            LOG.error("Error during RBD image export: %s", e)
+            raise nova.exception.CouldNotFetchImage(image_id=image_uuid)
 
     def show(self, context, image_id, include_locations=False,
              show_deleted=True):
@@ -275,15 +302,12 @@ class GlanceImageServiceV2(object):
 
         return image
 
-    def _get_transfer_module(self, scheme):
+    def _get_transfer_method(self, scheme):
+        """Returns a transfer method for scheme, or None."""
         try:
             return self._download_handlers[scheme]
         except KeyError:
             return None
-        except Exception:
-            LOG.error("Failed to instantiate the download handler "
-                      "for %(scheme)s", {'scheme': scheme})
-        return
 
     def detail(self, context, **kwargs):
         """Calls out to Glance for a list of detailed image information."""
@@ -319,21 +343,34 @@ class GlanceImageServiceV2(object):
     def download(self, context, image_id, data=None, dst_path=None,
                  trusted_certs=None):
         """Calls out to Glance for data and writes data."""
-        if CONF.glance.allowed_direct_url_schemes and dst_path is not None:
+
+        # First, check if image could be directly downloaded by special handler
+        if (self._download_handlers and dst_path is not None):
             image = self.show(context, image_id, include_locations=True)
             for entry in image.get('locations', []):
                 loc_url = entry['url']
                 loc_meta = entry['metadata']
                 o = urlparse.urlparse(loc_url)
-                xfer_mod = self._get_transfer_module(o.scheme)
-                if xfer_mod:
+                xfer_method = self._get_transfer_method(o.scheme)
+                if xfer_method:
                     try:
-                        xfer_mod.download(context, o, dst_path, loc_meta)
+                        xfer_method(context, o, dst_path, loc_meta)
                         LOG.info("Successfully transferred using %s", o.scheme)
+
+                        # Load chunks from the downloaded image file
+                        # for verification (if required)
+                        with open(dst_path, 'rb') as fh:
+                            downloaded_length = os.path.getsize(dst_path)
+                            image_chunks = glance_utils.IterableWithLength(fh,
+                                downloaded_length)
+                            self._verify_and_write(context, image_id,
+                                trusted_certs, image_chunks, None, None)
                         return
                     except Exception:
                         LOG.exception("Download image error")
 
+        # By default (or if direct download has failed), use glance client call
+        # to fetch the image and fill image_chunks
         try:
             image_chunks = self._client.call(
                 context, 2, 'data', args=(image_id,))
@@ -346,59 +383,88 @@ class GlanceImageServiceV2(object):
             raise exception.ImageUnacceptable(image_id=image_id,
                 reason='Image has no associated data')
 
-        # Retrieve properties for verification of Glance image signature
-        verifier = self._get_verifier(context, image_id, trusted_certs)
+        return self._verify_and_write(context, image_id, trusted_certs,
+                                      image_chunks, data, dst_path)
+
+    def _verify_and_write(self, context, image_id, trusted_certs,
+                          image_chunks, data, dst_path):
+        """Perform image signature verification and save the image file if needed.
+
+        This function writes the content of the image_chunks iterator either to
+        a file object provided by the data parameter or to a filepath provided
+        by dst_path parameter. If none of them are provided then no data will
+        be written out but instead image_chunks iterator is returned.
+
+        :param image_id: The UUID of the image
+        :param trusted_certs: A 'nova.objects.trusted_certs.TrustedCerts'
+                              object with a list of trusted image certificate
+                              IDs.
+        :param image_chunks An iterator pointing to the image data
+        :param data: File object to use when writing the image.
+            If passed as None and dst_path is provided, new file is opened.
+        :param dst_path: Filepath to transfer the image file to.
+        :returns an iterable with image data, or nothing. Iterable is returned
+            only when data param is None and dst_path is not provided (assuming
+            the caller wants to process the data by itself).
+
+        """
 
         close_file = False
         if data is None and dst_path:
             data = open(dst_path, 'wb')
             close_file = True
 
+        write_image = True
         if data is None:
+            write_image = False
 
-            # Perform image signature verification
-            if verifier:
-                try:
-                    for chunk in image_chunks:
-                        verifier.update(chunk)
-                    verifier.verify()
+        # Retrieve properties for verification of Glance image signature
+        verifier = self._get_verifier(context, image_id, trusted_certs)
 
-                    LOG.info('Image signature verification succeeded '
-                             'for image: %s', image_id)
+        # Exit early if we do not need write nor verify
+        if verifier is None and write_image is False:
+            if data is None:
+                return image_chunks
+            else:
+                return
 
-                except cryptography.exceptions.InvalidSignature:
-                    with excutils.save_and_reraise_exception():
-                        LOG.error('Image signature verification failed '
-                                  'for image: %s', image_id)
-            return image_chunks
-        else:
-            try:
-                for chunk in image_chunks:
-                    if verifier:
-                        verifier.update(chunk)
-                    data.write(chunk)
+        try:
+            for chunk in image_chunks:
                 if verifier:
-                    verifier.verify()
-                    LOG.info('Image signature verification succeeded '
-                             'for image %s', image_id)
-            except cryptography.exceptions.InvalidSignature:
+                    verifier.update(chunk)
+                if write_image:
+                    data.write(chunk)
+            if verifier:
+                verifier.verify()
+                LOG.info('Image signature verification succeeded '
+                         'for image %s', image_id)
+        except cryptography.exceptions.InvalidSignature:
+            if write_image:
                 data.truncate(0)
-                with excutils.save_and_reraise_exception():
-                    LOG.error('Image signature verification failed '
-                              'for image: %s', image_id)
-            except Exception as ex:
+            with excutils.save_and_reraise_exception():
+                LOG.error('Image signature verification failed '
+                          'for image %s', image_id)
+        except Exception as ex:
+            if write_image:
                 with excutils.save_and_reraise_exception():
                     LOG.error("Error writing to %(path)s: %(exception)s",
                               {'path': dst_path, 'exception': ex})
-            finally:
-                if close_file:
-                    # Ensure that the data is pushed all the way down to
-                    # persistent storage. This ensures that in the event of a
-                    # subsequent host crash we don't have running instances
-                    # using a corrupt backing file.
-                    data.flush()
-                    self._safe_fsync(data)
-                    data.close()
+            else:
+                with excutils.save_and_reraise_exception():
+                    LOG.error("Error during image verification: %s", ex)
+
+        finally:
+            if close_file:
+                # Ensure that the data is pushed all the way down to
+                # persistent storage. This ensures that in the event of a
+                # subsequent host crash we don't have running instances
+                # using a corrupt backing file.
+                data.flush()
+                self._safe_fsync(data)
+                data.close()
+
+        if data is None:
+            return image_chunks
 
     def _get_verifier(self, context, image_id, trusted_certs):
         verifier = None
@@ -512,7 +578,12 @@ class GlanceImageServiceV2(object):
             _reraise_translated_exception()
 
     def _upload_data(self, context, image_id, data):
-        self._client.call(context, 2, 'upload', args=(image_id, data))
+        # NOTE(aarents) offload upload in a native thread as it can block
+        # coroutine in busy environment.
+        utils.tpool_execute(self._client.call,
+                      context, 2, 'upload',
+                      args=(image_id, data))
+
         return self._client.call(context, 2, 'get', args=(image_id,))
 
     def _get_image_create_disk_format_default(self, context):
@@ -520,7 +591,7 @@ class GlanceImageServiceV2(object):
         """
         # These preferred disk formats are in order:
         # 1. we want qcow2 if possible (at least for backward compat)
-        # 2. vhd for xenapi and hyperv
+        # 2. vhd for hyperv
         # 3. vmdk for vmware
         # 4. raw should be universally accepted
         preferred_disk_formats = (
@@ -653,8 +724,43 @@ class GlanceImageServiceV2(object):
         except glanceclient.exc.HTTPForbidden:
             raise exception.ImageNotAuthorized(image_id=image_id)
         except glanceclient.exc.HTTPConflict as exc:
-            raise exception.ImageDeleteConflict(reason=six.text_type(exc))
+            raise exception.ImageDeleteConflict(reason=str(exc))
         return True
+
+    def image_import_copy(self, context, image_id, stores):
+        """Copy an image to another store using image_import.
+
+        This triggers the Glance image_import API with an opinionated
+        method of 'copy-image' to a list of stores. This will initiate
+        a copy of the image from one of the existing stores to the
+        stores provided.
+
+        :param context: The RequestContext
+        :param image_id: The image to copy
+        :param stores: A list of stores to copy the image to
+
+        :raises: ImageNotFound if the image does not exist.
+        :raises: ImageNotAuthorized if the user is not permitted to
+                 import/copy this image
+        :raises: ImageImportImpossible if the image cannot be imported
+                 for workflow reasons (not active, etc)
+        :raises: ImageBadRequest if the image is already in the requested
+                 store (which may be a race)
+        """
+        try:
+            self._client.call(context, 2, 'image_import', args=(image_id,),
+                              kwargs={'method': 'copy-image',
+                                      'stores': stores})
+        except glanceclient.exc.NotFound:
+            raise exception.ImageNotFound(image_id=image_id)
+        except glanceclient.exc.HTTPForbidden:
+            raise exception.ImageNotAuthorized(image_id=image_id)
+        except glanceclient.exc.HTTPConflict as exc:
+            raise exception.ImageImportImpossible(image_id=image_id,
+                                                  reason=str(exc))
+        except glanceclient.exc.HTTPBadRequest as exc:
+            raise exception.ImageBadRequest(image_id=image_id,
+                                            response=str(exc))
 
 
 def _extract_query_params_v2(params):
@@ -761,8 +867,7 @@ def _convert_to_v2(image_meta):
                 # in glance only string and None property values are allowed,
                 # v1 client accepts any values and converts them to string,
                 # v2 doesn't - so we have to take care of it.
-                elif prop_value is None or isinstance(
-                        prop_value, six.string_types):
+                elif prop_value is None or isinstance(prop_value, str):
                     output[prop_name] = prop_value
                 else:
                     output[prop_name] = str(prop_value)
@@ -798,13 +903,13 @@ def _convert_timestamps_to_datetimes(image_meta):
 # NOTE(bcwaldon): used to store non-string data in glance metadata
 def _json_loads(properties, attr):
     prop = properties[attr]
-    if isinstance(prop, six.string_types):
+    if isinstance(prop, str):
         properties[attr] = jsonutils.loads(prop)
 
 
 def _json_dumps(properties, attr):
     prop = properties[attr]
-    if not isinstance(prop, six.string_types):
+    if not isinstance(prop, str):
         properties[attr] = jsonutils.dumps(prop)
 
 
@@ -920,14 +1025,14 @@ def _reraise_translated_image_exception(image_id):
     """Transform the exception for the image but keep its traceback intact."""
     exc_type, exc_value, exc_trace = sys.exc_info()
     new_exc = _translate_image_exception(image_id, exc_value)
-    six.reraise(type(new_exc), new_exc, exc_trace)
+    raise new_exc.with_traceback(exc_trace)
 
 
 def _reraise_translated_exception():
     """Transform the exception but keep its traceback intact."""
     exc_type, exc_value, exc_trace = sys.exc_info()
     new_exc = _translate_plain_exception(exc_value)
-    six.reraise(type(new_exc), new_exc, exc_trace)
+    raise new_exc.with_traceback(exc_trace)
 
 
 def _translate_image_exception(image_id, exc_value):
@@ -938,7 +1043,7 @@ def _translate_image_exception(image_id, exc_value):
         return exception.ImageNotFound(image_id=image_id)
     if isinstance(exc_value, glanceclient.exc.BadRequest):
         return exception.ImageBadRequest(image_id=image_id,
-                                         response=six.text_type(exc_value))
+                                         response=str(exc_value))
     if isinstance(exc_value, glanceclient.exc.HTTPOverLimit):
         return exception.ImageQuotaExceeded(image_id=image_id)
     return exc_value
@@ -947,11 +1052,11 @@ def _translate_image_exception(image_id, exc_value):
 def _translate_plain_exception(exc_value):
     if isinstance(exc_value, (glanceclient.exc.Forbidden,
                     glanceclient.exc.Unauthorized)):
-        return exception.Forbidden(six.text_type(exc_value))
+        return exception.Forbidden(str(exc_value))
     if isinstance(exc_value, glanceclient.exc.NotFound):
-        return exception.NotFound(six.text_type(exc_value))
+        return exception.NotFound(str(exc_value))
     if isinstance(exc_value, glanceclient.exc.BadRequest):
-        return exception.Invalid(six.text_type(exc_value))
+        return exception.Invalid(str(exc_value))
     return exc_value
 
 
@@ -969,7 +1074,7 @@ def _verify_certs(context, img_sig_cert_uuid, trusted_certs):
                     'failed for certificate: %s',
                     img_sig_cert_uuid)
         raise exception.CertificateValidationFailed(
-            cert_uuid=img_sig_cert_uuid, reason=six.text_type(e))
+            cert_uuid=img_sig_cert_uuid, reason=str(e))
 
 
 def get_remote_image_service(context, image_href):
@@ -1164,20 +1269,19 @@ class API(object):
         Note that because of the poor design of the
         `glance.ImageService.download` method, the function returns different
         things depending on what arguments are passed to it. If a data argument
-        is supplied but no dest_path is specified (only done in the XenAPI virt
-        driver's image.utils module) then None is returned from the method. If
-        the data argument is not specified but a destination path *is*
-        specified, then a writeable file handle to the destination path is
-        constructed in the method and the image bits written to that file, and
-        again, None is returned from the method. If no data argument is
-        supplied and no dest_path argument is supplied (VMWare and XenAPI virt
-        drivers), then the method returns an iterator to the image bits that
-        the caller uses to write to wherever location it wants. Finally, if the
-        allow_direct_url_schemes CONF option is set to something, then the
-        nova.image.download modules are used to attempt to do an SCP copy of
-        the image bits from a file location to the dest_path and None is
-        returned after retrying one or more download locations (libvirt and
-        Hyper-V virt drivers through nova.virt.images.fetch).
+        is supplied but no dest_path is specified (not currently done by any
+        caller) then None is returned from the method. If the data argument is
+        not specified but a destination path *is* specified, then a writeable
+        file handle to the destination path is constructed in the method and
+        the image bits written to that file, and again, None is returned from
+        the method. If no data argument is supplied and no dest_path argument
+        is supplied (VMWare virt driver), then the method returns an iterator
+        to the image bits that the caller uses to write to wherever location it
+        wants. Finally, if the allow_direct_url_schemes CONF option is set to
+        something, then the nova.image.download modules are used to attempt to
+        do an SCP copy of the image bits from a file location to the dest_path
+        and None is returned after retrying one or more download locations
+        (libvirt and Hyper-V virt drivers through nova.virt.images.fetch).
 
         I think the above points to just how hacky/wacky all of this code is,
         and the reason it needs to be cleaned up and standardized across the
@@ -1191,3 +1295,13 @@ class API(object):
         return session.download(context, image_id, data=data,
                                 dst_path=dest_path,
                                 trusted_certs=trusted_certs)
+
+    def copy_image_to_store(self, context, image_id, store):
+        """Initiate a store-to-store copy in glance.
+
+        :param context: The RequestContext.
+        :param image_id: The image to copy.
+        :param store: The glance store to target the copy.
+        """
+        session, image_id = self._get_session_and_image_id(context, image_id)
+        return session.image_import_copy(context, image_id, [store])

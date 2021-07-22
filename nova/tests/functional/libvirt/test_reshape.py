@@ -19,8 +19,8 @@ from oslo_log import log as logging
 
 from nova import context
 from nova import objects
+from nova.tests.fixtures import libvirt as fakelibvirt
 from nova.tests.functional.libvirt import base
-from nova.tests.unit.virt.libvirt import fakelibvirt
 from nova.virt.libvirt import utils
 
 
@@ -59,22 +59,39 @@ class VGPUReshapeTests(base.ServersTestBase):
         # the old tree as that would be a bad time for reshape. Later when the
         # compute service is restarted the driver will do the reshape.
 
-        fake_connection = self._get_connection(
-            # We need more RAM or the 3rd server won't be created
-            host_info=fakelibvirt.HostInfo(kB_mem=8192),
-            mdev_info=fakelibvirt.HostMdevDevicesInfo())
-        self.mock_conn.return_value = fake_connection
+        mdevs = {
+            'mdev_4b20d080_1b54_4048_85b3_a6a62d165c01':
+                fakelibvirt.FakeMdevDevice(
+                    dev_name='mdev_4b20d080_1b54_4048_85b3_a6a62d165c01',
+                    type_id=fakelibvirt.NVIDIA_11_VGPU_TYPE,
+                    parent=fakelibvirt.PGPU1_PCI_ADDR),
+            'mdev_4b20d080_1b54_4048_85b3_a6a62d165c02':
+                fakelibvirt.FakeMdevDevice(
+                    dev_name='mdev_4b20d080_1b54_4048_85b3_a6a62d165c02',
+                    type_id=fakelibvirt.NVIDIA_11_VGPU_TYPE,
+                    parent=fakelibvirt.PGPU2_PCI_ADDR),
+            'mdev_4b20d080_1b54_4048_85b3_a6a62d165c03':
+                fakelibvirt.FakeMdevDevice(
+                    dev_name='mdev_4b20d080_1b54_4048_85b3_a6a62d165c03',
+                    type_id=fakelibvirt.NVIDIA_11_VGPU_TYPE,
+                    parent=fakelibvirt.PGPU3_PCI_ADDR),
+        }
 
         # start a compute with vgpu support disabled so the driver will
         # ignore the content of the above HostMdevDeviceInfo
         self.flags(enabled_vgpu_types='', group='devices')
-        self.compute = self.start_service('compute', host='compute1')
+
+        hostname = self.start_compute(
+            hostname='compute1',
+            mdev_info=fakelibvirt.HostMdevDevicesInfo(devices=mdevs),
+        )
+        self.compute = self.computes[hostname]
 
         # create the VGPU resource in placement manually
-        compute_rp_uuid = self.placement_api.get(
+        compute_rp_uuid = self.placement.get(
             '/resource_providers?name=compute1').body[
             'resource_providers'][0]['uuid']
-        inventories = self.placement_api.get(
+        inventories = self.placement.get(
             '/resource_providers/%s/inventories' % compute_rp_uuid).body
         inventories['inventories']['VGPU'] = {
             'allocation_ratio': 1.0,
@@ -83,9 +100,19 @@ class VGPUReshapeTests(base.ServersTestBase):
             'reserved': 0,
             'step_size': 1,
             'total': 3}
-        self.placement_api.put(
+        self.placement.put(
             '/resource_providers/%s/inventories' % compute_rp_uuid,
             inventories)
+
+        # enabled vgpu support
+        self.flags(
+            enabled_vgpu_types=fakelibvirt.NVIDIA_11_VGPU_TYPE,
+            group='devices')
+        # We don't want to restart the compute service or it would call for
+        # a reshape but we still want to accept some vGPU types so we call
+        # directly the needed method
+        self.compute.driver.supported_vgpu_types = (
+            self.compute.driver._get_supported_vgpu_types())
 
         # now we boot two servers with vgpu
         extra_spec = {"resources:VGPU": 1}
@@ -122,33 +149,29 @@ class VGPUReshapeTests(base.ServersTestBase):
 
         # verify that the inventory, usages and allocation are correct before
         # the reshape
-        compute_inventory = self.placement_api.get(
+        compute_inventory = self.placement.get(
             '/resource_providers/%s/inventories' % compute_rp_uuid).body[
             'inventories']
         self.assertEqual(3, compute_inventory['VGPU']['total'])
-        compute_usages = self.placement_api.get(
+        compute_usages = self.placement.get(
             '/resource_providers/%s/usages' % compute_rp_uuid).body[
             'usages']
         self.assertEqual(2, compute_usages['VGPU'])
 
         for server in (server1, server2):
-            allocations = self.placement_api.get(
+            allocations = self.placement.get(
                 '/allocations/%s' % server['id']).body['allocations']
             # the flavor has disk=10 and ephemeral=10
             self.assertEqual(
                 {'DISK_GB': 20, 'MEMORY_MB': 2048, 'VCPU': 2, 'VGPU': 1},
                 allocations[compute_rp_uuid]['resources'])
 
-        # enabled vgpu support
-        self.flags(
-            enabled_vgpu_types=fakelibvirt.NVIDIA_11_VGPU_TYPE,
-            group='devices')
         # restart compute which will trigger a reshape
         self.compute = self.restart_compute_service(self.compute)
 
         # verify that the inventory, usages and allocation are correct after
         # the reshape
-        compute_inventory = self.placement_api.get(
+        compute_inventory = self.placement.get(
             '/resource_providers/%s/inventories' % compute_rp_uuid).body[
             'inventories']
         self.assertNotIn('VGPU', compute_inventory)
@@ -161,16 +184,16 @@ class VGPUReshapeTests(base.ServersTestBase):
         for pci_device in [fakelibvirt.PGPU1_PCI_ADDR,
                            fakelibvirt.PGPU2_PCI_ADDR,
                            fakelibvirt.PGPU3_PCI_ADDR]:
-            gpu_rp_uuid = self.placement_api.get(
+            gpu_rp_uuid = self.placement.get(
                 '/resource_providers?name=compute1_%s' % pci_device).body[
                 'resource_providers'][0]['uuid']
             pgpu_uuid_to_name[gpu_rp_uuid] = pci_device
-            gpu_inventory = self.placement_api.get(
+            gpu_inventory = self.placement.get(
                 '/resource_providers/%s/inventories' % gpu_rp_uuid).body[
                 'inventories']
             self.assertEqual(1, gpu_inventory['VGPU']['total'])
 
-            gpu_usages = self.placement_api.get(
+            gpu_usages = self.placement.get(
                 '/resource_providers/%s/usages' % gpu_rp_uuid).body[
                 'usages']
             usages[pci_device] = gpu_usages['VGPU']
@@ -180,7 +203,7 @@ class VGPUReshapeTests(base.ServersTestBase):
         self.assertEqual(2, len(used_devices))
         # Make sure that both instances are using the correct pGPUs
         for server in [server1, server2]:
-            allocations = self.placement_api.get(
+            allocations = self.placement.get(
                 '/allocations/%s' % server['id']).body[
                 'allocations']
             self.assertEqual(
@@ -205,15 +228,15 @@ class VGPUReshapeTests(base.ServersTestBase):
         # find the pGPU that wasn't used before we created the third instance
         # It should have taken the previously available pGPU
         device = avail_devices[0]
-        gpu_rp_uuid = self.placement_api.get(
+        gpu_rp_uuid = self.placement.get(
             '/resource_providers?name=compute1_%s' % device).body[
             'resource_providers'][0]['uuid']
-        gpu_usages = self.placement_api.get(
+        gpu_usages = self.placement.get(
             '/resource_providers/%s/usages' % gpu_rp_uuid).body[
             'usages']
         self.assertEqual(1, gpu_usages['VGPU'])
 
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server3['id']).body[
             'allocations']
         self.assertEqual(

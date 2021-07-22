@@ -12,10 +12,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from urllib import parse
+
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 import requests
-from six.moves.urllib import parse
 
 
 LOG = logging.getLogger(__name__)
@@ -314,9 +315,31 @@ class TestOpenStackClient(object):
     def delete_flavor(self, flavor_id):
         return self.api_delete('/flavors/%s' % flavor_id)
 
-    def post_extra_spec(self, flavor_id, spec):
-        return self.api_post('/flavors/%s/os-extra_specs' %
-                             flavor_id, spec)
+    def get_extra_specs(self, flavor_id):
+        return self.api_get(
+            '/flavors/%s/os-extra_specs' % flavor_id
+        ).body['extra_specs']
+
+    def get_extra_spec(self, flavor_id, spec_id):
+        return self.api_get(
+            '/flavors/%s/os-extra_specs/%s' % (flavor_id, spec_id),
+        ).body
+
+    def post_extra_spec(self, flavor_id, body, **_params):
+        url = '/flavors/%s/os-extra_specs' % flavor_id
+        if _params:
+            query_string = '?%s' % parse.urlencode(list(_params.items()))
+            url += query_string
+
+        return self.api_post(url, body)
+
+    def put_extra_spec(self, flavor_id, spec_id, body, **_params):
+        url = '/flavors/%s/os-extra_specs/%s' % (flavor_id, spec_id)
+        if _params:
+            query_string = '?%s' % parse.urlencode(list(_params.items()))
+            url += query_string
+
+        return self.api_put(url, body)
 
     def get_volume(self, volume_id):
         return self.api_get('/os-volumes/%s' % volume_id).body['volume']
@@ -344,9 +367,9 @@ class TestOpenStackClient(object):
     def delete_snapshot(self, snap_id):
         return self.api_delete('/os-snapshots/%s' % snap_id)
 
-    def get_server_volume(self, server_id, attachment_id):
+    def get_server_volume(self, server_id, volume_id):
         return self.api_get('/servers/%s/os-volume_attachments/%s' %
-                            (server_id, attachment_id)
+                            (server_id, volume_id)
                         ).body['volumeAttachment']
 
     def get_server_volumes(self, server_id):
@@ -358,14 +381,14 @@ class TestOpenStackClient(object):
                              (server_id), volume_attachment
                             ).body['volumeAttachment']
 
-    def put_server_volume(self, server_id, attachment_id, volume_id):
+    def put_server_volume(self, server_id, original_volume_id, volume_id):
         return self.api_put('/servers/%s/os-volume_attachments/%s' %
-                            (server_id, attachment_id),
+                            (server_id, original_volume_id),
                             {"volumeAttachment": {"volumeId": volume_id}})
 
-    def delete_server_volume(self, server_id, attachment_id):
+    def delete_server_volume(self, server_id, volume_id):
         return self.api_delete('/servers/%s/os-volume_attachments/%s' %
-                            (server_id, attachment_id))
+                            (server_id, volume_id))
 
     def post_server_metadata(self, server_id, metadata):
         post_body = {'metadata': {}}
@@ -517,16 +540,20 @@ class TestOpenStackClient(object):
     def get_server_diagnostics(self, server_id):
         return self.api_get('/servers/%s/diagnostics' % server_id).body
 
-    def get_quota_detail(self, project_id=None):
+    def get_quota_detail(self, project_id=None, user_id=None):
         if not project_id:
             project_id = self.project_id
-        return self.api_get(
-            '/os-quota-sets/%s/detail' % project_id).body['quota_set']
+        url = '/os-quota-sets/%s/detail'
+        if user_id:
+            url += '?user_id=%s' % user_id
+        return self.api_get(url % project_id).body['quota_set']
 
-    def update_quota(self, quotas, project_id=None):
+    def update_quota(self, quotas, project_id=None, user_id=None):
         if not project_id:
             project_id = self.project_id
+        url = '/os-quota-sets/%s'
+        if user_id:
+            url += '?user_id=%s' % user_id
         body = {'quota_set': {}}
         body['quota_set'].update(quotas)
-        return self.api_put(
-            '/os-quota-sets/%s' % project_id, body).body['quota_set']
+        return self.api_put(url % project_id, body).body['quota_set']

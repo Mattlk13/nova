@@ -37,6 +37,7 @@ from nova.compute import power_state
 from nova.compute import task_states
 from nova.compute import utils as compute_utils
 import nova.conf
+from nova import context as nova_context
 from nova import exception
 from nova.i18n import _
 from nova import objects
@@ -70,6 +71,7 @@ class VMwareVCDriver(driver.ComputeDriver):
         "supports_multiattach": False,
         "supports_trusted_certs": False,
         "supports_pcpus": False,
+        "supports_accelerators": False,
 
         # Image type support flags
         "supports_image_type_aki": False,
@@ -108,12 +110,6 @@ class VMwareVCDriver(driver.ComputeDriver):
             raise Exception(_("Must specify host_ip, host_username and "
                               "host_password to use vmwareapi.VMwareVCDriver"))
 
-        if CONF.vnc.keymap:
-            LOG.warning('The option "[vnc] keymap" has been deprecated in '
-                        'favor of the VMWare-specific "[vmware] vnc_keymap" '
-                        'option. Please update nova.conf to address this '
-                        'change')
-
         self._datastore_regex = None
         if CONF.vmware.datastore_regex:
             try:
@@ -140,7 +136,8 @@ class VMwareVCDriver(driver.ComputeDriver):
                                        "found in vCenter")
                                      % self._cluster_name)
         self._vcenter_uuid = self._get_vcenter_uuid()
-        self._nodename = self._create_nodename(self._cluster_ref.value)
+        self._nodename = \
+            self._create_nodename(vim_util.get_moref_value(self._cluster_ref))
         self._volumeops = volumeops.VMwareVolumeOps(self._session,
                                                     self._cluster_ref)
         self._vmops = vmops.VMwareVMOps(self._session,
@@ -200,13 +197,6 @@ class VMwareVCDriver(driver.ComputeDriver):
                 self._datastore_regex = None
 
     def init_host(self, host):
-        LOG.warning('The vmwareapi driver is deprecated and may be removed in '
-                    'a future release. The driver is not tested by the '
-                    'OpenStack project nor does it have clear maintainer(s) '
-                    'and thus its quality can not be ensured. If you are '
-                    'using the driver in production please let us know in '
-                    'freenode IRC and/or the openstack-discuss mailing list.')
-
         vim = self._session.vim
         if vim is None:
             self._session._create_session()
@@ -235,7 +225,8 @@ class VMwareVCDriver(driver.ComputeDriver):
             LOG.debug('Extension %s already exists.', constants.EXTENSION_KEY)
 
     def cleanup(self, context, instance, network_info, block_device_info=None,
-                destroy_disks=True, migrate_data=None, destroy_vifs=True):
+                destroy_disks=True, migrate_data=None, destroy_vifs=True,
+                destroy_secrets=True):
         """Cleanup after instance being destroyed by Hypervisor."""
         pass
 
@@ -286,7 +277,7 @@ class VMwareVCDriver(driver.ComputeDriver):
 
     def finish_migration(self, context, migration, instance, disk_info,
                          network_info, image_meta, resize_instance,
-                         block_device_info=None, power_on=True):
+                         allocations, block_device_info=None, power_on=True):
         """Completes a resize, turning on the migrated instance."""
         self._vmops.finish_migration(context, migration, instance, disk_info,
                                      network_info, image_meta, resize_instance,
@@ -540,7 +531,7 @@ class VMwareVCDriver(driver.ComputeDriver):
 
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
-              block_device_info=None, power_on=True):
+              block_device_info=None, power_on=True, accel_info=None):
         """Create VM instance."""
         self._vmops.spawn(context, instance, image_meta, injected_files,
                           admin_password, network_info, block_device_info)
@@ -570,7 +561,8 @@ class VMwareVCDriver(driver.ComputeDriver):
         self._vmops.snapshot(context, instance, image_id, update_task_state)
 
     def reboot(self, context, instance, network_info, reboot_type,
-               block_device_info=None, bad_volumes_callback=None):
+               block_device_info=None, bad_volumes_callback=None,
+               accel_info=None):
         """Reboot VM instance."""
         self._vmops.reboot(instance, network_info, reboot_type)
 
@@ -603,7 +595,7 @@ class VMwareVCDriver(driver.ComputeDriver):
                                   instance=instance)
 
     def destroy(self, context, instance, network_info, block_device_info=None,
-                destroy_disks=True):
+                destroy_disks=True, destroy_secrets=True):
         """Destroy VM instance."""
 
         # Destroy gets triggered when Resource Claim in resource_tracker
@@ -621,7 +613,8 @@ class VMwareVCDriver(driver.ComputeDriver):
         if block_device_info is not None:
             try:
                 self._detach_instance_volumes(instance, block_device_info)
-            except vexc.ManagedObjectNotFoundException:
+            except (vexc.ManagedObjectNotFoundException,
+                    exception.InstanceNotFound):
                 LOG.warning('Instance does not exists. Proceeding to '
                             'delete instance properties on datastore',
                             instance=instance)
@@ -644,11 +637,15 @@ class VMwareVCDriver(driver.ComputeDriver):
         self._vmops.resume(instance)
 
     def rescue(self, context, instance, network_info, image_meta,
-               rescue_password):
+               rescue_password, block_device_info):
         """Rescue the specified instance."""
         self._vmops.rescue(context, instance, network_info, image_meta)
 
-    def unrescue(self, instance, network_info):
+    def unrescue(
+        self,
+        context: nova_context.RequestContext,
+        instance: 'objects.Instance',
+    ):
         """Unrescue the specified instance."""
         self._vmops.unrescue(instance)
 
@@ -657,7 +654,7 @@ class VMwareVCDriver(driver.ComputeDriver):
         self._vmops.power_off(instance, timeout, retry_interval)
 
     def power_on(self, context, instance, network_info,
-                 block_device_info=None):
+                 block_device_info=None, accel_info=None):
         """Power on the specified instance."""
         self._vmops.power_on(instance)
 

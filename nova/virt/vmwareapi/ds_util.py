@@ -395,7 +395,7 @@ def file_size(session, ds_browser, ds_path, file_name):
                                        datastorePath=str(ds_path),
                                        searchSpec=search_spec)
     task_info = session._wait_for_task(search_task)
-    if hasattr(task_info.result, 'file'):
+    if hasattr(task_info.result, 'file') and task_info.result.file:
         return task_info.result.file[0].fileSize
 
 
@@ -470,7 +470,7 @@ def _update_datacenter_cache_from_objects(session, dcs):
             if datastore_refs:
                 datastore_refs = datastore_refs.ManagedObjectReference
                 for ds in datastore_refs:
-                    ds_refs.append(ds.value)
+                    ds_refs.append(vutil.get_moref_value(ds))
             else:
                 LOG.debug("Datacenter %s doesn't have any datastore "
                           "associated with it, ignoring it", name)
@@ -481,12 +481,12 @@ def _update_datacenter_cache_from_objects(session, dcs):
 
 def get_dc_info(session, ds_ref):
     """Get the datacenter name and the reference."""
-    dc_info = _DS_DC_MAPPING.get(ds_ref.value)
+    dc_info = _DS_DC_MAPPING.get(vutil.get_moref_value(ds_ref))
     if not dc_info:
         dcs = session._call_method(vim_util, "get_objects",
                 "Datacenter", ["name", "datastore", "vmFolder"])
         _update_datacenter_cache_from_objects(session, dcs)
-        dc_info = _DS_DC_MAPPING.get(ds_ref.value)
+        dc_info = _DS_DC_MAPPING.get(vutil.get_moref_value(ds_ref))
     return dc_info
 
 
@@ -509,6 +509,6 @@ def get_connected_hosts(session, datastore):
 
     connected_hosts = []
     for host_mount in host_mounts.DatastoreHostMount:
-        connected_hosts.append(host_mount.key.value)
+        connected_hosts.append(vutil.get_moref_value(host_mount.key))
 
     return connected_hosts

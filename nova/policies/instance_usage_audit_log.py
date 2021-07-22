@@ -18,26 +18,49 @@ from oslo_policy import policy
 from nova.policies import base
 
 
-BASE_POLICY_NAME = 'os_compute_api:os-instance-usage-audit-log'
+BASE_POLICY_NAME = 'os_compute_api:os-instance-usage-audit-log:%s'
 
+DEPRECATED_REASON = """
+Nova API policies are introducing new default roles with scope_type
+capabilities. Old policies are deprecated and silently going to be ignored
+in nova 23.0.0 release.
+"""
+
+DEPRECATED_POLICY = policy.DeprecatedRule(
+    'os_compute_api:os-instance-usage-audit-log',
+    base.RULE_ADMIN_API,
+    deprecated_reason=DEPRECATED_REASON,
+    deprecated_since='21.0.0'
+)
 
 instance_usage_audit_log_policies = [
     policy.DocumentedRuleDefault(
-        BASE_POLICY_NAME,
-        base.RULE_ADMIN_API,
-        "List all usage audits and that occurred before a specified time "
-        "for all servers on all compute hosts where usage auditing is "
-        "configured",
-        [
+        name=BASE_POLICY_NAME % 'list',
+        check_str=base.SYSTEM_READER,
+        description="List all usage audits.",
+        operations=[
             {
                 'method': 'GET',
                 'path': '/os-instance_usage_audit_log'
             },
+        ],
+        scope_types=['system'],
+        deprecated_rule=DEPRECATED_POLICY),
+    policy.DocumentedRuleDefault(
+        name=BASE_POLICY_NAME % 'show',
+        check_str=base.SYSTEM_READER,
+        description="List all usage audits occurred before "
+        "a specified time for all servers on all compute hosts where "
+        "usage auditing is configured",
+        operations=[
+
             {
                 'method': 'GET',
                 'path': '/os-instance_usage_audit_log/{before_timestamp}'
             }
-        ]),
+        ],
+        scope_types=['system'],
+        deprecated_rule=DEPRECATED_POLICY),
 ]
 
 

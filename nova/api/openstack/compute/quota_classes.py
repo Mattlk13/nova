@@ -82,18 +82,18 @@ class QuotaClassSetsController(wsgi.Controller):
 
     @wsgi.Controller.api_version('2.50', '2.56')  # noqa
     @wsgi.expected_errors(())
-    def show(self, req, id):
+    def show(self, req, id):  # noqa
         return self._show(req, id, FILTERED_QUOTAS_2_50)
 
     @wsgi.Controller.api_version('2.57')  # noqa
     @wsgi.expected_errors(())
-    def show(self, req, id):
+    def show(self, req, id):  # noqa
         return self._show(req, id, FILTERED_QUOTAS_2_57)
 
     def _show(self, req, id, filtered_quotas=None,
               exclude_server_groups=False):
         context = req.environ['nova.context']
-        context.can(qcs_policies.POLICY_ROOT % 'show', {'quota_class': id})
+        context.can(qcs_policies.POLICY_ROOT % 'show', target={})
         values = QUOTAS.get_class_quotas(context, id)
         return self._format_quota_set(id, values, filtered_quotas,
                                       exclude_server_groups)
@@ -107,19 +107,19 @@ class QuotaClassSetsController(wsgi.Controller):
     @wsgi.Controller.api_version("2.50", "2.56")  # noqa
     @wsgi.expected_errors(400)
     @validation.schema(quota_classes.update_v250)
-    def update(self, req, id, body):
+    def update(self, req, id, body):  # noqa
         return self._update(req, id, body, FILTERED_QUOTAS_2_50)
 
     @wsgi.Controller.api_version("2.57")  # noqa
     @wsgi.expected_errors(400)
     @validation.schema(quota_classes.update_v257)
-    def update(self, req, id, body):
+    def update(self, req, id, body):  # noqa
         return self._update(req, id, body, FILTERED_QUOTAS_2_57)
 
     def _update(self, req, id, body, filtered_quotas=None,
                 exclude_server_groups=False):
         context = req.environ['nova.context']
-        context.can(qcs_policies.POLICY_ROOT % 'update', {'quota_class': id})
+        context.can(qcs_policies.POLICY_ROOT % 'update', target={})
         try:
             utils.check_string_length(id, 'quota_class_name',
                                       min_length=1, max_length=255)

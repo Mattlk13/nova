@@ -13,7 +13,6 @@
 #    under the License.
 
 import datetime
-import hashlib
 import os
 import os.path
 import tempfile
@@ -31,13 +30,13 @@ from oslo_context import context as common_context
 from oslo_context import fixture as context_fixture
 from oslo_utils import encodeutils
 from oslo_utils import fixture as utils_fixture
-from oslo_utils import units
-import six
+from oslo_utils.secretutils import md5
 
 from nova import context
 from nova import exception
 from nova.objects import base as obj_base
 from nova.objects import instance as instance_obj
+from nova.objects import service as service_obj
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.unit.objects import test_objects
@@ -74,24 +73,25 @@ class GenericUtilsTestCase(test.NoDBTestCase):
         self.assertEqual(('', ''), result)
 
     def test_hostname_unicode_sanitization(self):
-        hostname = u"\u7684.test.example.com"
-        self.assertEqual("test.example.com",
-                         utils.sanitize_hostname(hostname))
+        hostname = u'\u7684myamazinghostname'
+        self.assertEqual(
+            'myamazinghostname', utils.sanitize_hostname(hostname))
 
     def test_hostname_sanitize_periods(self):
-        hostname = "....test.example.com..."
-        self.assertEqual("test.example.com",
-                         utils.sanitize_hostname(hostname))
+        hostname = '....test.example.com...'
+        self.assertEqual(
+            'test-example-com', utils.sanitize_hostname(hostname))
 
     def test_hostname_sanitize_dashes(self):
-        hostname = "----test.example.com---"
-        self.assertEqual("test.example.com",
-                         utils.sanitize_hostname(hostname))
+        hostname = '----my-amazing-hostname---'
+        self.assertEqual(
+            "my-amazing-hostname", utils.sanitize_hostname(hostname))
 
     def test_hostname_sanitize_characters(self):
         hostname = "(#@&$!(@*--#&91)(__=+--test-host.example!!.com-0+"
-        self.assertEqual("91----test-host.example.com-0",
-                         utils.sanitize_hostname(hostname))
+        self.assertEqual(
+            "91----test-host-example-com-0",
+            utils.sanitize_hostname(hostname))
 
     def test_hostname_translate(self):
         hostname = "<}\x1fh\x10e\x08l\x02l\x05o\x12!{>"
@@ -100,20 +100,20 @@ class GenericUtilsTestCase(test.NoDBTestCase):
     def test_hostname_has_default(self):
         hostname = u"\u7684hello"
         defaultname = "Server-1"
-        self.assertEqual("hello", utils.sanitize_hostname(hostname,
-                                                          defaultname))
+        self.assertEqual(
+            "hello", utils.sanitize_hostname(hostname, defaultname))
 
     def test_hostname_empty_has_default(self):
         hostname = u"\u7684"
         defaultname = "Server-1"
-        self.assertEqual(defaultname, utils.sanitize_hostname(hostname,
-                                                              defaultname))
+        self.assertEqual(
+            defaultname, utils.sanitize_hostname(hostname, defaultname))
 
     def test_hostname_empty_has_default_too_long(self):
         hostname = u"\u7684"
         defaultname = "a" * 64
-        self.assertEqual("a" * 63, utils.sanitize_hostname(hostname,
-                                                           defaultname))
+        self.assertEqual(
+            "a" * 63, utils.sanitize_hostname(hostname, defaultname))
 
     def test_hostname_empty_no_default(self):
         hostname = u"\u7684"
@@ -204,7 +204,7 @@ class GenericUtilsTestCase(test.NoDBTestCase):
     def test_get_hash_str(self):
         base_str = b"foo"
         base_unicode = u"foo"
-        value = hashlib.md5(base_str).hexdigest()
+        value = md5(base_str, usedforsecurity=False).hexdigest()
         self.assertEqual(
             value, utils.get_hash_str(base_str))
         self.assertEqual(
@@ -215,8 +215,7 @@ class GenericUtilsTestCase(test.NoDBTestCase):
         instance.display_name = u'\u00CD\u00F1st\u00E1\u00F1c\u00E9'
         # should be a bytes string if python2 before conversion
         self.assertIs(str, type(repr(instance)))
-        self.assertIs(six.text_type,
-                      type(utils.get_obj_repr_unicode(instance)))
+        self.assertIs(str, type(utils.get_obj_repr_unicode(instance)))
 
     @mock.patch('oslo_concurrency.processutils.execute')
     def test_ssh_execute(self, mock_execute):
@@ -224,6 +223,12 @@ class GenericUtilsTestCase(test.NoDBTestCase):
                          'remotehost', 'ls', '-l')
         utils.ssh_execute('remotehost', 'ls', '-l')
         mock_execute.assert_called_once_with(*expected_args)
+
+    @mock.patch('nova.utils.generate_uid')
+    def test_tpool_execute(self, mock_generate):
+        expected_kargs = {'size': 12}
+        utils.tpool_execute(utils.generate_uid, 'mytopic', size=12)
+        mock_generate.assert_called_once_with('mytopic', **expected_kargs)
 
     def test_generate_hostid(self):
         host = 'host'
@@ -255,7 +260,7 @@ class TestCachedFile(test.NoDBTestCase):
 
         fake_contents = "lorem ipsum"
 
-        with mock.patch('six.moves.builtins.open',
+        with mock.patch('builtins.open',
                         mock.mock_open(read_data=fake_contents)):
             fresh, data = utils.read_cached_file("/this/is/a/fake")
 
@@ -579,7 +584,7 @@ class ValidateIntegerTestCase(test.NoDBTestCase):
                           max_value=54)
         self.assertRaises(exception.InvalidInput,
                           utils.validate_integer,
-                          six.unichr(129), "UnicodeError",
+                          chr(129), "UnicodeError",
                           max_value=1000)
 
 
@@ -731,43 +736,6 @@ class GetImageFromSystemMetadataTestCase(test.NoDBTestCase):
             self.assertNotIn(key, image)
 
 
-class GetImageMetadataFromVolumeTestCase(test.NoDBTestCase):
-    def test_inherit_image_properties(self):
-        properties = {"fake_prop": "fake_value"}
-        volume = {"volume_image_metadata": properties}
-        image_meta = utils.get_image_metadata_from_volume(volume)
-        self.assertEqual(properties, image_meta["properties"])
-
-    def test_image_size(self):
-        volume = {"size": 10}
-        image_meta = utils.get_image_metadata_from_volume(volume)
-        self.assertEqual(10 * units.Gi, image_meta["size"])
-
-    def test_image_status(self):
-        volume = {}
-        image_meta = utils.get_image_metadata_from_volume(volume)
-        self.assertEqual("active", image_meta["status"])
-
-    def test_values_conversion(self):
-        properties = {"min_ram": "5", "min_disk": "7"}
-        volume = {"volume_image_metadata": properties}
-        image_meta = utils.get_image_metadata_from_volume(volume)
-        self.assertEqual(5, image_meta["min_ram"])
-        self.assertEqual(7, image_meta["min_disk"])
-
-    def test_suppress_not_image_properties(self):
-        properties = {"min_ram": "256", "min_disk": "128",
-                      "image_id": "fake_id", "image_name": "fake_name",
-                      "container_format": "ami", "disk_format": "ami",
-                      "size": "1234", "checksum": "fake_checksum"}
-        volume = {"volume_image_metadata": properties}
-        image_meta = utils.get_image_metadata_from_volume(volume)
-        self.assertEqual({}, image_meta["properties"])
-        self.assertEqual(0, image_meta["size"])
-        # volume's properties should not be touched
-        self.assertNotEqual({}, properties)
-
-
 class SafeTruncateTestCase(test.NoDBTestCase):
     def test_exception_to_dict_with_long_message_3_bytes(self):
         # Generate Chinese byte string whose length is 300. This Chinese UTF-8
@@ -867,7 +835,7 @@ class UT8TestCase(test.NoDBTestCase):
     def test_not_text_type(self):
         return_value = utils.utf8(1)
         self.assertEqual(b"1", return_value)
-        self.assertIsInstance(return_value, six.binary_type)
+        self.assertIsInstance(return_value, bytes)
 
     def test_text_type_with_encoding(self):
         some_value = 'test\u2026config'
@@ -1239,3 +1207,187 @@ class TestGetSDKAdapter(test.NoDBTestCase):
         self.mock_get_confgrp.assert_called_once_with(self.service_type)
         self.mock_connection.assert_not_called()
         self.mock_get_auth_sess.assert_not_called()
+
+
+class TestOldComputeCheck(test.NoDBTestCase):
+
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_no_compute(self, mock_get_min_service):
+        mock_get_min_service.return_value = 0
+
+        utils.raise_if_old_compute()
+
+        mock_get_min_service.assert_called_once_with(
+            mock.ANY, ['nova-compute'])
+
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_old_but_supported_compute(self, mock_get_min_service):
+        oldest = service_obj.SERVICE_VERSION_ALIASES[
+            service_obj.OLDEST_SUPPORTED_SERVICE_VERSION]
+        mock_get_min_service.return_value = oldest
+
+        utils.raise_if_old_compute()
+
+        mock_get_min_service.assert_called_once_with(
+            mock.ANY, ['nova-compute'])
+
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_new_compute(self, mock_get_min_service):
+        mock_get_min_service.return_value = service_obj.SERVICE_VERSION
+
+        utils.raise_if_old_compute()
+
+        mock_get_min_service.assert_called_once_with(
+            mock.ANY, ['nova-compute'])
+
+    @mock.patch('nova.objects.service.Service.get_minimum_version')
+    def test_too_old_compute_cell(self, mock_get_min_service):
+        self.flags(group='api_database', connection=None)
+        oldest = service_obj.SERVICE_VERSION_ALIASES[
+            service_obj.OLDEST_SUPPORTED_SERVICE_VERSION]
+        mock_get_min_service.return_value = oldest - 1
+
+        ex = self.assertRaises(
+            exception.TooOldComputeService, utils.raise_if_old_compute)
+
+        self.assertIn('cell', str(ex))
+        mock_get_min_service.assert_called_once_with(mock.ANY, 'nova-compute')
+
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_too_old_compute_top_level(self, mock_get_min_service):
+        self.flags(group='api_database', connection='fake db connection')
+        oldest = service_obj.SERVICE_VERSION_ALIASES[
+            service_obj.OLDEST_SUPPORTED_SERVICE_VERSION]
+        mock_get_min_service.return_value = oldest - 1
+
+        ex = self.assertRaises(
+            exception.TooOldComputeService, utils.raise_if_old_compute)
+
+        self.assertIn('system', str(ex))
+        mock_get_min_service.assert_called_once_with(
+            mock.ANY, ['nova-compute'])
+
+    @mock.patch.object(utils.LOG, 'warning')
+    @mock.patch('nova.objects.service.Service.get_minimum_version')
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_api_db_is_configured_but_the_service_cannot_access_db(
+            self, mock_get_all, mock_get, mock_warn):
+        # This is the case when the nova-compute service is wrongly configured
+        # with db credentials but nova-compute is never allowed to access the
+        # db directly.
+        mock_get_all.side_effect = exception.DBNotAllowed(
+            binary='nova-compute')
+
+        oldest = service_obj.SERVICE_VERSION_ALIASES[
+            service_obj.OLDEST_SUPPORTED_SERVICE_VERSION]
+        mock_get.return_value = oldest - 1
+
+        ex = self.assertRaises(
+            exception.TooOldComputeService, utils.raise_if_old_compute)
+
+        self.assertIn('cell', str(ex))
+        mock_get_all.assert_called_once_with(mock.ANY, ['nova-compute'])
+        mock_get.assert_called_once_with(mock.ANY, 'nova-compute')
+        mock_warn.assert_called_once_with(
+            'This service is configured for access to the API database but is '
+            'not allowed to directly access the database. You should run this '
+            'service without the [api_database]/connection config option. The '
+            'service version check will only query the local cell.')
+
+
+class RunOnceTests(test.NoDBTestCase):
+
+    fake_logger = mock.MagicMock()
+
+    @utils.run_once("already ran once", fake_logger)
+    def dummy_test_func(self, fail=False):
+        if fail:
+            raise ValueError()
+        return True
+
+    def setUp(self):
+        super(RunOnceTests, self).setUp()
+        self.dummy_test_func.reset()
+        RunOnceTests.fake_logger.reset_mock()
+
+    def test_wrapped_functions_called_once(self):
+        self.assertFalse(self.dummy_test_func.called)
+        result = self.dummy_test_func()
+        self.assertTrue(result)
+        self.assertTrue(self.dummy_test_func.called)
+
+        # assert that on second invocation no result
+        # is returned and that the logger is invoked.
+        result = self.dummy_test_func()
+        RunOnceTests.fake_logger.assert_called_once()
+        self.assertIsNone(result)
+
+    def test_wrapped_functions_called_once_raises(self):
+        self.assertFalse(self.dummy_test_func.called)
+        self.assertRaises(ValueError, self.dummy_test_func, fail=True)
+        self.assertTrue(self.dummy_test_func.called)
+
+        # assert that on second invocation no result
+        # is returned and that the logger is invoked.
+        result = self.dummy_test_func()
+        RunOnceTests.fake_logger.assert_called_once()
+        self.assertIsNone(result)
+
+    def test_wrapped_functions_can_be_reset(self):
+        # assert we start with a clean state
+        self.assertFalse(self.dummy_test_func.called)
+        result = self.dummy_test_func()
+        self.assertTrue(result)
+
+        self.dummy_test_func.reset()
+        # assert we restored a clean state
+        self.assertFalse(self.dummy_test_func.called)
+        result = self.dummy_test_func()
+        self.assertTrue(result)
+
+        # assert that we never called the logger
+        RunOnceTests.fake_logger.assert_not_called()
+
+    def test_reset_calls_cleanup(self):
+        mock_clean = mock.Mock()
+
+        @utils.run_once("already ran once", self.fake_logger,
+                        cleanup=mock_clean)
+        def f():
+            pass
+
+        f()
+        self.assertTrue(f.called)
+
+        f.reset()
+        self.assertFalse(f.called)
+        mock_clean.assert_called_once_with()
+
+    def test_clean_is_not_called_at_reset_if_wrapped_not_called(self):
+        mock_clean = mock.Mock()
+
+        @utils.run_once("already ran once", self.fake_logger,
+                        cleanup=mock_clean)
+        def f():
+            pass
+
+        self.assertFalse(f.called)
+
+        f.reset()
+        self.assertFalse(f.called)
+        self.assertFalse(mock_clean.called)
+
+    def test_reset_works_even_if_cleanup_raises(self):
+        mock_clean = mock.Mock(side_effect=ValueError())
+
+        @utils.run_once("already ran once", self.fake_logger,
+                        cleanup=mock_clean)
+        def f():
+            pass
+
+        f()
+        self.assertTrue(f.called)
+
+        self.assertRaises(ValueError, f.reset)
+        self.assertFalse(f.called)
+        mock_clean.assert_called_once_with()

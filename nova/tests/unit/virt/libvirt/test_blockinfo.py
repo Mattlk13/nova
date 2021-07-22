@@ -25,8 +25,8 @@ from nova import exception
 from nova import objects
 from nova.objects import fields as obj_fields
 from nova import test
+from nova.tests import fixtures as nova_fixtures
 from nova.tests.unit import fake_block_device
-import nova.tests.unit.image.fake
 from nova.tests.unit.virt import fakelibosinfo
 from nova.virt import block_device as driver_block_device
 from nova.virt import driver
@@ -41,7 +41,13 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
         self.user_id = 'fake'
         self.project_id = 'fake'
         self.context = context.get_admin_context()
-        nova.tests.unit.image.fake.stub_out_image_service(self)
+        self.useFixture(nova_fixtures.GlanceFixture(self))
+
+        flavor = objects.Flavor(
+            id=2, name='m1.micro', vcpus=1, memory_mb=128, root_gb=0,
+            ephemeral_gb=0, swap=0, rxtx_factor=1.0, flavorid='1',
+            vcpu_weight=None,)
+
         self.test_instance = {
             'uuid': '32dfcb37-5af1-552b-357c-be8c3aa38310',
             'memory_kb': '1024000',
@@ -53,7 +59,10 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
             'image_ref': '155d900f-4e14-4e4c-a73d-069cbf4541e6',
             'root_gb': 10,
             'ephemeral_gb': 20,
-            'instance_type_id': 2,  # m1.tiny
+            'instance_type_id': flavor.id,
+            'flavor': flavor,
+            'old_flavor': None,
+            'new_flavor': None,
             'config_drive': None,
             'launched_at': None,
             'system_metadata': {},
@@ -62,36 +71,25 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
             'disk_format': 'raw',
         }
 
-        flavor = objects.Flavor(memory_mb=128,
-                                root_gb=0,
-                                name='m1.micro',
-                                ephemeral_gb=0,
-                                vcpus=1,
-                                swap=0,
-                                rxtx_factor=1.0,
-                                flavorid='1',
-                                vcpu_weight=None,
-                                id=2)
-        self.test_instance['flavor'] = flavor
-        self.test_instance['old_flavor'] = None
-        self.test_instance['new_flavor'] = None
-
-    def test_volume_in_mapping(self):
-        swap = {'device_name': '/dev/sdb',
-                'swap_size': 1}
+    def _test_block_device_info(self, with_eph=True, with_swap=True,
+                                with_bdms=True):
+        swap = {'device_name': '/dev/vdb', 'swap_size': 1}
         ephemerals = [{'device_type': 'disk', 'guest_format': 'ext4',
-                       'device_name': '/dev/sdc1', 'size': 10},
+                       'device_name': '/dev/vdc1', 'size': 10},
                       {'disk_bus': 'ide', 'guest_format': None,
-                       'device_name': '/dev/sdd', 'size': 10}]
+                       'device_name': '/dev/vdd', 'size': 10}]
         block_device_mapping = [{'mount_device': '/dev/sde',
                                  'device_path': 'fake_device'},
                                 {'mount_device': '/dev/sdf',
                                  'device_path': 'fake_device'}]
-        block_device_info = {
-                'root_device_name': '/dev/sda',
-                'swap': swap,
-                'ephemerals': ephemerals,
-                'block_device_mapping': block_device_mapping}
+        return {'root_device_name': '/dev/vda',
+                'swap': swap if with_swap else {},
+                'ephemerals': ephemerals if with_eph else [],
+                'block_device_mapping':
+                    block_device_mapping if with_bdms else []}
+
+    def test_volume_in_mapping(self):
+        block_device_info = self._test_block_device_info()
 
         def _assert_volume_in_mapping(device_name, true_or_false):
             self.assertEqual(
@@ -99,10 +97,10 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
                 block_device.volume_in_mapping(device_name,
                                                block_device_info))
 
-        _assert_volume_in_mapping('sda', False)
-        _assert_volume_in_mapping('sdb', True)
-        _assert_volume_in_mapping('sdc1', True)
-        _assert_volume_in_mapping('sdd', True)
+        _assert_volume_in_mapping('vda', False)
+        _assert_volume_in_mapping('vdb', True)
+        _assert_volume_in_mapping('vdc1', True)
+        _assert_volume_in_mapping('vdd', True)
         _assert_volume_in_mapping('sde', True)
         _assert_volume_in_mapping('sdf', True)
         _assert_volume_in_mapping('sdg', False)
@@ -240,7 +238,9 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
             }
         self.assertEqual(expect, mapping)
 
-    def test_get_disk_mapping_rescue_with_config(self):
+    def _test_get_disk_mapping_rescue_with_config(
+        self, expect_disk_config_rescue,
+    ):
         # A simple disk mapping setup, but in rescue mode with a config drive
 
         test_instance_with_config = self.test_instance
@@ -253,20 +253,235 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
                                              image_meta,
                                              rescue=True)
 
-        expect_disk_config_rescue = {
-            'bus': 'ide', 'dev': 'hda', 'type': 'cdrom'}
-        if blockinfo.libvirt_utils.get_arch({}) == 'aarch64':
-            expect_disk_config_rescue['bus'] = 'scsi'
-            expect_disk_config_rescue['dev'] = 'sda'
         expect = {
-            'disk.rescue': {'bus': 'virtio', 'dev': 'vda',
-                            'type': 'disk', 'boot_index': '1'},
+            'disk.rescue': {
+                'bus': 'virtio', 'dev': 'vda',
+                'type': 'disk', 'boot_index': '1',
+            },
             'disk': {'bus': 'virtio', 'dev': 'vdb', 'type': 'disk'},
             'disk.config.rescue': expect_disk_config_rescue,
-            'root': {'bus': 'virtio', 'dev': 'vda',
-                     'type': 'disk', 'boot_index': '1'},
-            }
+            'root': {
+                'bus': 'virtio', 'dev': 'vda',
+                'type': 'disk', 'boot_index': '1',
+            },
+        }
         self.assertEqual(expect, mapping)
+
+    @mock.patch('nova.virt.libvirt.utils.get_arch',
+        new=mock.Mock(return_value=obj_fields.Architecture.X86_64))
+    def test_get_disk_mapping_rescue_with_config__x86_64(self):
+        self._test_get_disk_mapping_rescue_with_config({
+            'bus': 'ide', 'dev': 'hda', 'type': 'cdrom',
+        })
+
+    @mock.patch('nova.virt.libvirt.utils.get_arch',
+        new=mock.Mock(return_value=obj_fields.Architecture.AARCH64))
+    def test_get_disk_mapping_rescue_with_config__aarch64(self):
+        self._test_get_disk_mapping_rescue_with_config({
+            'bus': 'scsi', 'dev': 'sda', 'type': 'cdrom',
+        })
+
+    def _test_get_disk_mapping_stable_rescue(
+            self, rescue_props, expected, block_device_info, with_local=False):
+        instance = objects.Instance(**self.test_instance)
+
+        # Make disk.local disks optional per test as found in
+        # nova.virt.libvirt.BlockInfo.get_default_ephemeral_info
+        instance.ephemeral_gb = '20' if with_local else None
+
+        image_meta = objects.ImageMeta.from_dict(self.test_image_meta)
+
+        rescue_image_meta = objects.ImageMeta.from_dict(self.test_image_meta)
+        rescue_props = objects.ImageMetaProps.from_dict(rescue_props)
+        rescue_image_meta.properties = rescue_props
+
+        mapping = blockinfo.get_disk_mapping("kvm", instance, "virtio", "ide",
+            image_meta, rescue=True, block_device_info=block_device_info,
+            rescue_image_meta=rescue_image_meta)
+
+        # Assert that the expected mapping is returned from get_disk_mapping
+        self.assertEqual(expected, mapping)
+
+    def test_get_disk_mapping_stable_rescue_virtio_disk(self):
+        """Assert the disk mapping when rescuing using a virtio disk"""
+        rescue_props = {'hw_rescue_bus': 'virtio'}
+        block_info = self._test_block_device_info(
+            with_eph=False, with_swap=False, with_bdms=False)
+        expected = {
+            'disk': {'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                     'type': 'disk'},
+            'disk.rescue': {'bus': 'virtio', 'dev': 'vdb', 'type': 'disk'},
+            'root': {'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                     'type': 'disk'}
+        }
+        self._test_get_disk_mapping_stable_rescue(
+            rescue_props, expected, block_info)
+
+    def test_get_disk_mapping_stable_rescue_ide_disk(self):
+        """Assert the disk mapping when rescuing using an IDE disk"""
+        rescue_props = {'hw_rescue_bus': 'ide'}
+        block_info = self._test_block_device_info(
+             with_eph=False, with_swap=False, with_bdms=False)
+        expected = {
+            'disk': {'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                     'type': 'disk'},
+            'disk.rescue': {'bus': 'ide', 'dev': 'hda', 'type': 'disk'},
+            'root': {'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                     'type': 'disk'}
+        }
+        self._test_get_disk_mapping_stable_rescue(
+            rescue_props, expected, block_info)
+
+    def test_get_disk_mapping_stable_rescue_usb_disk(self):
+        """Assert the disk mapping when rescuing using a USB disk"""
+        rescue_props = {'hw_rescue_bus': 'usb'}
+        block_info = self._test_block_device_info(
+            with_eph=False, with_swap=False, with_bdms=False)
+        expected = {
+            'disk': {'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                     'type': 'disk'},
+            'disk.rescue': {'bus': 'usb', 'dev': 'sda', 'type': 'disk'},
+            'root': {'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                     'type': 'disk'}
+        }
+        self._test_get_disk_mapping_stable_rescue(
+            rescue_props, expected, block_info)
+
+    @mock.patch('nova.virt.libvirt.utils.get_arch',
+        new=mock.Mock(return_value=obj_fields.Architecture.X86_64))
+    def test_get_disk_mapping_stable_rescue_ide_cdrom(self):
+        """Assert the disk mapping when rescuing using an IDE cd-rom"""
+        rescue_props = {'hw_rescue_device': 'cdrom'}
+        block_info = self._test_block_device_info(
+            with_eph=False, with_swap=False, with_bdms=False)
+        expected = {
+            'disk': {'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                     'type': 'disk'},
+            'disk.rescue': {'bus': 'ide', 'dev': 'hda', 'type': 'cdrom'},
+            'root': {'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                     'type': 'disk'}
+        }
+        self._test_get_disk_mapping_stable_rescue(
+            rescue_props, expected, block_info)
+
+    def test_get_disk_mapping_stable_rescue_virtio_disk_with_local(self):
+        """Assert the disk mapping when rescuing using a virtio disk with
+           default ephemeral (local) disks also attached to the instance.
+        """
+        rescue_props = {'hw_rescue_bus': 'virtio'}
+        block_info = self._test_block_device_info(
+            with_eph=False, with_swap=False, with_bdms=False)
+        expected = {
+            'disk': {'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                     'type': 'disk'},
+            'disk.local': {'bus': 'virtio', 'dev': 'vdb', 'type': 'disk'},
+            'disk.rescue': {'bus': 'virtio', 'dev': 'vdc', 'type': 'disk'},
+            'root': {'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                     'type': 'disk'}
+        }
+        self._test_get_disk_mapping_stable_rescue(
+            rescue_props, expected, block_info, with_local=True)
+
+    def test_get_disk_mapping_stable_rescue_virtio_disk_with_eph(self):
+        """Assert the disk mapping when rescuing using a virtio disk with
+           ephemeral disks also attached to the instance.
+        """
+        rescue_props = {'hw_rescue_bus': 'virtio'}
+        block_info = self._test_block_device_info(
+            with_swap=False, with_bdms=False)
+        expected = {
+            'disk': {
+                'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                'type': 'disk'},
+            'disk.eph0': {
+                'bus': 'virtio', 'dev': 'vdc1', 'format': 'ext4',
+                'type': 'disk'},
+            'disk.eph1': {
+                'bus': 'ide', 'dev': 'vdd', 'type': 'disk'},
+            'disk.rescue': {
+                'bus': 'virtio', 'dev': 'vdb', 'type': 'disk'},
+            'root': {
+                'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                'type': 'disk'}
+        }
+        self._test_get_disk_mapping_stable_rescue(
+            rescue_props, expected, block_info, with_local=True)
+
+    def test_get_disk_mapping_stable_rescue_virtio_disk_with_swap(self):
+        """Assert the disk mapping when rescuing using a virtio disk with
+           swap attached to the instance.
+        """
+        rescue_props = {'hw_rescue_bus': 'virtio'}
+        block_info = self._test_block_device_info(
+            with_eph=False, with_bdms=False)
+        expected = {
+            'disk': {
+                'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                'type': 'disk'},
+            'disk.rescue': {
+                'bus': 'virtio', 'dev': 'vdc', 'type': 'disk'},
+            'disk.swap': {
+                'bus': 'virtio', 'dev': 'vdb', 'type': 'disk'},
+            'root': {
+                'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                'type': 'disk'}
+        }
+        self._test_get_disk_mapping_stable_rescue(
+            rescue_props, expected, block_info)
+
+    def test_get_disk_mapping_stable_rescue_virtio_disk_with_bdm(self):
+        """Assert the disk mapping when rescuing using a virtio disk with
+           volumes also attached to the instance.
+        """
+        rescue_props = {'hw_rescue_bus': 'virtio'}
+        block_info = self._test_block_device_info(
+            with_eph=False, with_swap=False)
+        expected = {
+            '/dev/sde': {
+                'bus': 'scsi', 'dev': 'sde', 'type': 'disk'},
+            '/dev/sdf': {
+                'bus': 'scsi', 'dev': 'sdf', 'type': 'disk'},
+            'disk': {
+                'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                'type': 'disk'},
+            'disk.rescue': {
+                'bus': 'virtio', 'dev': 'vdb', 'type': 'disk'},
+            'root': {
+                'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                'type': 'disk'}
+        }
+        self._test_get_disk_mapping_stable_rescue(
+            rescue_props, expected, block_info)
+
+    def test_get_disk_mapping_stable_rescue_virtio_disk_with_everything(self):
+        """Assert the disk mapping when rescuing using a virtio disk with
+           volumes, ephemerals and swap also attached to the instance.
+        """
+        rescue_props = {'hw_rescue_bus': 'virtio'}
+        block_info = self._test_block_device_info()
+        expected = {
+            '/dev/sde': {
+                'bus': 'scsi', 'dev': 'sde', 'type': 'disk'},
+            '/dev/sdf': {
+                'bus': 'scsi', 'dev': 'sdf', 'type': 'disk'},
+            'disk': {
+                'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                'type': 'disk'},
+            'disk.eph0': {
+                'bus': 'virtio', 'dev': 'vdc1', 'format': 'ext4',
+                'type': 'disk'},
+            'disk.eph1': {
+                'bus': 'ide', 'dev': 'vdd', 'type': 'disk'},
+            'disk.rescue': {
+                'bus': 'virtio', 'dev': 'vdc', 'type': 'disk'},
+            'disk.swap': {
+                'bus': 'virtio', 'dev': 'vdb', 'type': 'disk'},
+            'root': {
+                'boot_index': '1', 'bus': 'virtio', 'dev': 'vda',
+                'type': 'disk'}
+        }
+        self._test_get_disk_mapping_stable_rescue(
+            rescue_props, expected, block_info, with_local=True)
 
     def test_get_disk_mapping_lxc(self):
         # A simple disk mapping setup, but for lxc
@@ -363,7 +578,9 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
             }
         self.assertEqual(expect, mapping)
 
-    def test_get_disk_mapping_simple_configdrive(self):
+    def _test_get_disk_mapping_simple_configdrive(
+        self, expect_bus, expect_dev,
+    ):
         # A simple disk mapping setup, but with configdrive added
         # It's necessary to check if the architecture is power, because
         # power doesn't have support to ide, and so libvirt translate
@@ -374,34 +591,51 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
         instance_ref = objects.Instance(**self.test_instance)
         image_meta = objects.ImageMeta.from_dict(self.test_image_meta)
 
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
-                                             "virtio", "ide",
-                                             image_meta)
+        mapping = blockinfo.get_disk_mapping(
+            "kvm", instance_ref, "virtio", "ide", image_meta)
 
         # Pick the first drive letter on the bus that is available
         # as the config drive. Delete the last device hardcode as
         # the config drive here.
 
-        bus_ppc = ("scsi", "sda")
-        bus_aarch64 = ("scsi", "sda")
-        expect_bus = {"ppc": bus_ppc, "ppc64": bus_ppc,
-                        "ppc64le": bus_ppc, "aarch64": bus_aarch64}
-
-        bus, dev = expect_bus.get(blockinfo.libvirt_utils.get_arch({}),
-                                  ("ide", "hda"))
-
         expect = {
-            'disk': {'bus': 'virtio', 'dev': 'vda',
-                     'type': 'disk', 'boot_index': '1'},
+            'disk': {
+                'bus': 'virtio', 'dev': 'vda',
+                'type': 'disk', 'boot_index': '1',
+            },
             'disk.local': {'bus': 'virtio', 'dev': 'vdb', 'type': 'disk'},
-            'disk.config': {'bus': bus, 'dev': dev, 'type': 'cdrom'},
-            'root': {'bus': 'virtio', 'dev': 'vda',
-                     'type': 'disk', 'boot_index': '1'}
-            }
-
+            'disk.config': {
+                'bus': expect_bus, 'dev': expect_dev, 'type': 'cdrom',
+            },
+            'root': {
+                'bus': 'virtio', 'dev': 'vda',
+                'type': 'disk', 'boot_index': '1',
+            },
+        }
         self.assertEqual(expect, mapping)
 
-    def test_get_disk_mapping_cdrom_configdrive(self):
+    @mock.patch(
+        'nova.virt.libvirt.utils.get_arch',
+        return_value=obj_fields.Architecture.X86_64)
+    def test_get_disk_mapping_simple_configdrive__x86_64(self, mock_get_arch):
+        self._test_get_disk_mapping_simple_configdrive('ide', 'hda')
+        mock_get_arch.assert_called()
+
+    @mock.patch(
+        'nova.virt.libvirt.utils.get_arch',
+        return_value=obj_fields.Architecture.PPC64)
+    def test_get_disk_mapping_simple_configdrive__ppc64(self, mock_get_arch):
+        self._test_get_disk_mapping_simple_configdrive('scsi', 'sda')
+        mock_get_arch.assert_called()
+
+    @mock.patch(
+        'nova.virt.libvirt.utils.get_arch',
+        return_value=obj_fields.Architecture.AARCH64)
+    def test_get_disk_mapping_simple_configdrive__aarch64(self, mock_get_arch):
+        self._test_get_disk_mapping_simple_configdrive('scsi', 'sda')
+        mock_get_arch.assert_called()
+
+    def _test_get_disk_mapping_cdrom_configdrive(self, expect_bus, expect_dev):
         # A simple disk mapping setup, with configdrive added as cdrom
         # It's necessary to check if the architecture is power, because
         # power doesn't have support to ide, and so libvirt translate
@@ -413,28 +647,46 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
         instance_ref = objects.Instance(**self.test_instance)
         image_meta = objects.ImageMeta.from_dict(self.test_image_meta)
 
-        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
-                                             "virtio", "ide",
-                                             image_meta)
-
-        bus_ppc = ("scsi", "sda")
-        bus_aarch64 = ("scsi", "sda")
-        expect_bus = {"ppc": bus_ppc, "ppc64": bus_ppc,
-                        "ppc64le": bus_ppc, "aarch64": bus_aarch64}
-
-        bus, dev = expect_bus.get(blockinfo.libvirt_utils.get_arch({}),
-                                  ("ide", "hda"))
+        mapping = blockinfo.get_disk_mapping(
+            "kvm", instance_ref, "virtio", "ide", image_meta)
 
         expect = {
-            'disk': {'bus': 'virtio', 'dev': 'vda',
-                     'type': 'disk', 'boot_index': '1'},
+            'disk': {
+                'bus': 'virtio', 'dev': 'vda',
+                'type': 'disk', 'boot_index': '1',
+            },
             'disk.local': {'bus': 'virtio', 'dev': 'vdb', 'type': 'disk'},
-            'disk.config': {'bus': bus, 'dev': dev, 'type': 'cdrom'},
-            'root': {'bus': 'virtio', 'dev': 'vda',
-                     'type': 'disk', 'boot_index': '1'}
+            'disk.config': {
+                'bus': expect_bus, 'dev': expect_dev, 'type': 'cdrom',
+            },
+            'root': {
+                'bus': 'virtio', 'dev': 'vda',
+                'type': 'disk', 'boot_index': '1',
+            }
             }
 
         self.assertEqual(expect, mapping)
+
+    @mock.patch(
+        'nova.virt.libvirt.utils.get_arch',
+        return_value=obj_fields.Architecture.X86_64)
+    def test_get_disk_mapping_cdrom_configdrive__x86_64(self, mock_get_arch):
+        self._test_get_disk_mapping_cdrom_configdrive('ide', 'hda')
+        mock_get_arch.assert_called()
+
+    @mock.patch(
+        'nova.virt.libvirt.utils.get_arch',
+        return_value=obj_fields.Architecture.PPC64)
+    def test_get_disk_mapping_cdrom_configdrive__ppc64(self, mock_get_arch):
+        self._test_get_disk_mapping_cdrom_configdrive('scsi', 'sda')
+        mock_get_arch.assert_called()
+
+    @mock.patch(
+        'nova.virt.libvirt.utils.get_arch',
+        return_value=obj_fields.Architecture.AARCH64)
+    def test_get_disk_mapping_cdrom_configdrive__aarch64(self, mock_get_arch):
+        self._test_get_disk_mapping_cdrom_configdrive('scsi', 'sda')
+        mock_get_arch.assert_called()
 
     def test_get_disk_mapping_disk_configdrive(self):
         # A simple disk mapping setup, with configdrive added as disk
@@ -793,14 +1045,11 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
 
     def test_success_get_disk_bus_for_disk_dev(self):
         expected = (
-                ('ide', ("kvm", "hda")),
-                ('scsi', ("kvm", "sdf")),
-                ('virtio', ("kvm", "vds")),
-                ('fdc', ("kvm", "fdc")),
-                ('uml', ("kvm", "ubd")),
-                ('xen', ("xen", "sdf")),
-                ('xen', ("xen", "xvdb"))
-                )
+            ('ide', ("kvm", "hda")),
+            ('scsi', ("kvm", "sdf")),
+            ('virtio', ("kvm", "vds")),
+            ('fdc', ("kvm", "fdc")),
+        )
         for res, args in expected:
             self.assertEqual(res, blockinfo.get_disk_bus_for_disk_dev(*args))
 
@@ -831,7 +1080,9 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
 
     def test_get_disk_bus_for_device_type_cdrom_with_q35_image_meta(self):
         instance = objects.Instance(**self.test_instance)
-        image_meta = {'properties': {'hw_machine_type': 'pc-q35-rhel8.0.0'}}
+        image_meta = {'properties': {
+            'hw_machine_type': 'pc-q35-rhel8.0.0',
+            'hw_architecture': obj_fields.Architecture.X86_64}}
         image_meta = objects.ImageMeta.from_dict(image_meta)
         bus = blockinfo.get_disk_bus_for_device_type(instance, 'kvm',
                                                      image_meta,
@@ -1011,15 +1262,6 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
                                                'device_type': 'disk'},
                                               {}, 'virtio')
         mock_get_info.reset_mock()
-        # xen with incompatible root_device_name/disk_bus combination
-        root_bdm['disk_bus'] = 'xen'
-        blockinfo.get_root_info(instance, 'xen', image_meta, root_bdm,
-                                'xen', 'ide', root_device_name='sda')
-        mock_get_info.assert_called_once_with(instance, 'xen', image_meta,
-                                              {'device_name': 'xvda',
-                                               'disk_bus': 'xen',
-                                               'device_type': 'disk'},
-                                              {}, 'xen')
 
     def test_get_boot_order_simple(self):
         disk_info = {
@@ -1075,35 +1317,68 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
         expected_order = ['hd', 'cdrom']
         self.assertEqual(expected_order, blockinfo.get_boot_order(disk_info))
 
+    def _get_rescue_image_meta(self, props_dict):
+        meta_dict = dict(self.test_image_meta)
+        meta_dict['properties'] = props_dict
+        return objects.ImageMeta.from_dict(meta_dict)
+
+    def test_get_rescue_device(self):
+        # Assert that all supported device types are returned correctly
+        for device in blockinfo.SUPPORTED_DEVICE_TYPES:
+            meta = self._get_rescue_image_meta({'hw_rescue_device': device})
+            self.assertEqual(device, blockinfo.get_rescue_device(meta))
+
+        # Assert that disk is returned if hw_rescue_device isn't set
+        meta = self._get_rescue_image_meta({'hw_rescue_bus': 'virtio'})
+        self.assertEqual('disk', blockinfo.get_rescue_device(meta))
+
+        # Assert that UnsupportedHardware is raised for unsupported devices
+        meta = self._get_rescue_image_meta({'hw_rescue_device': 'fs'})
+        self.assertRaises(exception.UnsupportedRescueDevice,
+                          blockinfo.get_rescue_device, meta)
+
+    def test_get_rescue_bus(self):
+        # Assert that all supported device bus types are returned. Stable
+        # device rescue is not supported by lxc so ignore this.
+        for virt_type in ['qemu', 'kvm', 'parallels']:
+            for bus in blockinfo.SUPPORTED_DEVICE_BUSES[virt_type]:
+                meta = self._get_rescue_image_meta({'hw_rescue_bus': bus})
+                self.assertEqual(bus, blockinfo.get_rescue_bus(None, virt_type,
+                                                               meta, None))
+
+        # Assert that UnsupportedHardware is raised for unsupported devices
+        meta = self._get_rescue_image_meta({'hw_rescue_bus': 'xen'})
+        self.assertRaises(exception.UnsupportedRescueBus,
+                          blockinfo.get_rescue_bus, None, 'kvm', meta, 'disk')
+
 
 class DefaultDeviceNamesTestCase(test.NoDBTestCase):
     def setUp(self):
         super(DefaultDeviceNamesTestCase, self).setUp()
         self.context = context.get_admin_context()
+        self.flavor = objects.Flavor(id=2, swap=4)
         self.instance = objects.Instance(
-                uuid='32dfcb37-5af1-552b-357c-be8c3aa38310',
-                memory_kb='1024000',
-                basepath='/some/path',
-                bridge_name='br100',
-                vcpus=2,
-                project_id='fake',
-                bridge='br101',
-                image_ref='155d900f-4e14-4e4c-a73d-069cbf4541e6',
-                root_gb=10,
-                ephemeral_gb=20,
-                instance_type_id=2,
-                config_drive=False,
-                root_device_name = '/dev/vda',
-                system_metadata={})
+            uuid='32dfcb37-5af1-552b-357c-be8c3aa38310',
+            memory_kb='1024000',
+            basepath='/some/path',
+            bridge_name='br100',
+            vcpus=2,
+            project_id='fake',
+            bridge='br101',
+            image_ref='155d900f-4e14-4e4c-a73d-069cbf4541e6',
+            root_gb=10,
+            ephemeral_gb=20,
+            instance_type_id=self.flavor.id,
+            flavor=self.flavor,
+            config_drive=False,
+            root_device_name = '/dev/vda',
+            system_metadata={})
         self.image_meta = objects.ImageMeta(
             disk_format='raw',
             properties=objects.ImageMetaProps())
 
         self.virt_type = 'kvm'
-        self.flavor = objects.Flavor(swap=4)
         self.patchers = []
-        self.patchers.append(mock.patch.object(self.instance, 'get_flavor',
-                                               return_value=self.flavor))
         self.patchers.append(mock.patch(
                 'nova.objects.block_device.BlockDeviceMapping.save'))
         for patcher in self.patchers:
@@ -1171,7 +1446,10 @@ class DefaultDeviceNamesTestCase(test.NoDBTestCase):
         for patcher in self.patchers:
             patcher.stop()
 
-    def _test_default_device_names(self, eph, swap, bdm):
+    @mock.patch(
+        'nova.virt.libvirt.utils.get_arch',
+        return_value=obj_fields.Architecture.X86_64)
+    def _test_default_device_names(self, eph, swap, bdm, mock_get_arch):
         bdms = eph + swap + bdm
         bdi = driver.get_block_device_info(self.instance, bdms)
         blockinfo.default_device_names(self.virt_type,
@@ -1179,6 +1457,8 @@ class DefaultDeviceNamesTestCase(test.NoDBTestCase):
                                        self.instance,
                                        bdi,
                                        self.image_meta)
+
+        mock_get_arch.assert_called()
 
     def test_only_block_device_mapping(self):
         # Test no-op

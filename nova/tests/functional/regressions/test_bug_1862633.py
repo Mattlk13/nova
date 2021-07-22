@@ -16,8 +16,6 @@ from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional import fixtures as func_fixtures
 from nova.tests.functional import integrated_helpers
-from nova.tests.unit import fake_notifier
-from nova.tests.unit.image import fake as fake_image
 
 
 class UnshelveNeutronErrorTest(
@@ -27,17 +25,16 @@ class UnshelveNeutronErrorTest(
         # Start standard fixtures.
         placement = func_fixtures.PlacementFixture()
         self.useFixture(placement)
-        self.placement_api = placement.api
+        self.placement = placement.api
         self.neutron = nova_fixtures.NeutronFixture(self)
         self.useFixture(self.neutron)
-        fake_image.stub_out_image_service(self)
-        self.addCleanup(fake_image.FakeImageService_reset)
+        self.useFixture(nova_fixtures.GlanceFixture(self))
         # Start nova services.
         self.api = self.useFixture(nova_fixtures.OSAPIFixture(
             api_version='v2.1')).admin_api
         self.api.microversion = 'latest'
-        fake_notifier.stub_notifier(self)
-        self.addCleanup(fake_notifier.reset)
+        self.notifier = self.useFixture(
+            nova_fixtures.NotificationFixture(self))
 
         self.start_service('conductor')
         self.start_service('scheduler')
@@ -54,8 +51,9 @@ class UnshelveNeutronErrorTest(
         }
         self.api.post_server_action(server['id'], req)
         self._wait_for_server_parameter(
-            server, {'status': 'SHELVED_OFFLOADED'})
-        allocations = self.placement_api.get(
+            server, {'status': 'SHELVED_OFFLOADED',
+                     'OS-EXT-SRV-ATTR:host': None})
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
         self.assertEqual(0, len(allocations))
 
@@ -74,14 +72,15 @@ class UnshelveNeutronErrorTest(
                 reason='test')
             req = {'unshelve': None}
             self.api.post_server_action(server['id'], req)
-            fake_notifier.wait_for_versioned_notifications(
+            self.notifier.wait_for_versioned_notifications(
                 'instance.unshelve.start')
             self._wait_for_server_parameter(
                 server,
                 {'status': 'SHELVED_OFFLOADED',
-                 'OS-EXT-STS:task_state': None})
+                 'OS-EXT-STS:task_state': None,
+                 'OS-EXT-SRV-ATTR:host': None})
 
         # As the instance went back to offloaded state we expect no allocation
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
         self.assertEqual(0, len(allocations))

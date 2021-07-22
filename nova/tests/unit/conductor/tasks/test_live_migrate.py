@@ -14,7 +14,6 @@ import mock
 import oslo_messaging as messaging
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel as uuids
-import six
 
 from nova.compute import power_state
 from nova.compute import rpcapi as compute_rpcapi
@@ -22,7 +21,6 @@ from nova.compute import vm_states
 from nova.conductor.tasks import live_migrate
 from nova import context as nova_context
 from nova import exception
-from nova.network import model as network_model
 from nova import objects
 from nova.scheduler.client import query
 from nova.scheduler.client import report
@@ -61,6 +59,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.instance.system_metadata = {'image_hw_disk_bus': 'scsi'}
         self.instance.numa_topology = None
         self.instance.pci_requests = None
+        self.instance.resources = None
         self.destination = "destination"
         self.block_migration = "bm"
         self.disk_over_commit = "doc"
@@ -72,8 +71,8 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.heal_reqspec_is_bfv_mock = _p.start()
         self.addCleanup(_p.stop)
 
-        _p = mock.patch('nova.objects.RequestSpec.ensure_network_metadata')
-        self.ensure_network_metadata_mock = _p.start()
+        _p = mock.patch('nova.objects.RequestSpec.ensure_network_information')
+        self.ensure_network_information_mock = _p.start()
         self.addCleanup(_p.stop)
 
         _p = mock.patch(
@@ -96,23 +95,32 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         dest_node = objects.ComputeNode(hypervisor_hostname='dest_node')
         with test.nested(
             mock.patch.object(self.task, '_check_host_is_up'),
-            mock.patch.object(self.task, '_check_requested_destination',
-                              return_value=(mock.sentinel.source_node,
-                                            dest_node)),
+            mock.patch.object(self.task, '_check_requested_destination'),
             mock.patch.object(scheduler_utils,
                               'claim_resources_on_destination'),
             mock.patch.object(self.migration, 'save'),
             mock.patch.object(self.task.compute_rpcapi, 'live_migration'),
             mock.patch('nova.conductor.tasks.migrate.'
                        'replace_allocation_with_migration'),
+            mock.patch.object(self.task, '_check_destination_is_not_source'),
+            mock.patch.object(self.task,
+                              '_check_destination_has_enough_memory'),
+            mock.patch.object(self.task,
+                              '_check_compatible_with_source_hypervisor',
+                              return_value=(mock.sentinel.source_node,
+                                            dest_node)),
         ) as (mock_check_up, mock_check_dest, mock_claim, mock_save, mock_mig,
-              m_alloc):
+              m_alloc, m_check_diff, m_check_enough_mem, m_check_compatible):
             mock_mig.return_value = "bob"
             m_alloc.return_value = (mock.MagicMock(), mock.sentinel.allocs)
 
             self.assertEqual("bob", self.task.execute())
-            mock_check_up.assert_called_once_with(self.instance_host)
+            mock_check_up.assert_has_calls([
+                mock.call(self.instance_host), mock.call(self.destination)])
             mock_check_dest.assert_called_once_with()
+            m_check_diff.assert_called_once()
+            m_check_enough_mem.assert_called_once()
+            m_check_compatible.assert_called_once()
             allocs = mock.sentinel.allocs
             mock_claim.assert_called_once_with(
                 self.context, self.task.report_client,
@@ -146,7 +154,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         # When the task is executed with a destination it means the host is
         # being forced and we don't call the scheduler, so we don't need to
         # modify the request spec
-        self.ensure_network_metadata_mock.assert_not_called()
+        self.ensure_network_information_mock.assert_not_called()
 
     @mock.patch('nova.availability_zones.get_host_availability_zone',
                 return_value='nova')
@@ -204,9 +212,10 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
     @mock.patch.object(objects.ComputeNode, 'get_by_host_and_nodename')
     def test_check_instance_has_no_numa_passes_non_kvm(self, mock_get):
         self.flags(enable_numa_live_migration=False, group='workarounds')
-        self.task.instance.numa_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=0, cpuset=set([0]),
-                                            memory=1024)])
+        self.task.instance.numa_topology = objects.InstanceNUMATopology(cells=[
+            objects.InstanceNUMACell(
+                id=0, cpuset=set([0]), pcpuset=set(), memory=1024),
+            ])
         mock_get.return_value = objects.ComputeNode(
             uuid=uuids.cn1, hypervisor_type='xen')
         self.task._check_instance_has_no_numa()
@@ -217,9 +226,10 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
     def test_check_instance_has_no_numa_passes_workaround(
             self, mock_get_min_ver, mock_get):
         self.flags(enable_numa_live_migration=True, group='workarounds')
-        self.task.instance.numa_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=0, cpuset=set([0]),
-                                            memory=1024)])
+        self.task.instance.numa_topology = objects.InstanceNUMATopology(cells=[
+            objects.InstanceNUMACell(
+                id=0, cpuset=set([0]), pcpuset=set(), memory=1024),
+            ])
         mock_get.return_value = objects.ComputeNode(
             uuid=uuids.cn1, hypervisor_type='qemu')
         self.task._check_instance_has_no_numa()
@@ -233,9 +243,10 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.flags(enable_numa_live_migration=False, group='workarounds')
         mock_get.return_value = objects.ComputeNode(
             uuid=uuids.cn1, hypervisor_type='qemu')
-        self.task.instance.numa_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=0, cpuset=set([0]),
-                                            memory=1024)])
+        self.task.instance.numa_topology = objects.InstanceNUMATopology(cells=[
+            objects.InstanceNUMACell(
+                id=0, cpuset=set([0]), pcpuset=set(), memory=1024),
+            ])
         self.assertRaises(exception.MigrationPreCheckError,
                           self.task._check_instance_has_no_numa)
         mock_get_min_ver.assert_called_once_with(self.context, 'nova-compute')
@@ -248,9 +259,10 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.flags(enable_numa_live_migration=False, group='workarounds')
         mock_get.return_value = objects.ComputeNode(
             uuid=uuids.cn1, hypervisor_type='qemu')
-        self.task.instance.numa_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=0, cpuset=set([0]),
-                                            memory=1024)])
+        self.task.instance.numa_topology = objects.InstanceNUMATopology(cells=[
+            objects.InstanceNUMACell(
+                id=0, cpuset=set([0]), pcpuset=set(), memory=1024),
+            ])
         self.task._check_instance_has_no_numa()
         mock_get_min_ver.assert_called_once_with(self.context, 'nova-compute')
 
@@ -282,61 +294,16 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.assertRaises(exception.ComputeHostNotFound,
             self.task._check_host_is_up, "host")
 
-    @mock.patch.object(objects.Service, 'get_by_compute_host')
-    @mock.patch.object(live_migrate.LiveMigrationTask, '_get_compute_info')
-    @mock.patch.object(servicegroup.API, 'service_is_up')
-    @mock.patch.object(compute_rpcapi.ComputeAPI,
-                       'check_can_live_migrate_destination')
-    def test_check_requested_destination(self, mock_check, mock_is_up,
-                                         mock_get_info, mock_get_host):
-        mock_get_host.return_value = "service"
-        mock_is_up.return_value = True
-        hypervisor_details = objects.ComputeNode(
-            hypervisor_type="a",
-            hypervisor_version=6.1,
-            free_ram_mb=513,
-            memory_mb=512,
-            ram_allocation_ratio=1.0)
-        mock_get_info.return_value = hypervisor_details
-        mock_check.return_value = "migrate_data"
-        self.task.limits = fake_limits1
-
-        with test.nested(
-            mock.patch.object(self.task.network_api,
-                              'supports_port_binding_extension',
-                              return_value=False),
-            mock.patch.object(self.task, '_check_can_migrate_pci')):
-            self.assertEqual((hypervisor_details, hypervisor_details),
-                             self.task._check_requested_destination())
-        self.assertEqual("migrate_data", self.task.migrate_data)
-        mock_get_host.assert_called_once_with(self.context, self.destination)
-        mock_is_up.assert_called_once_with("service")
-        self.assertEqual([mock.call(self.destination),
-                          mock.call(self.instance_host),
-                          mock.call(self.destination)],
-                         mock_get_info.call_args_list)
-        mock_check.assert_called_once_with(self.context, self.instance,
-            self.destination, self.block_migration, self.disk_over_commit,
-            self.task.migration, fake_limits1)
-
-    def test_check_requested_destination_fails_with_same_dest(self):
+    def test_check_destination_fails_with_same_dest(self):
         self.task.destination = "same"
         self.task.source = "same"
         self.assertRaises(exception.UnableToMigrateToSelf,
-                          self.task._check_requested_destination)
+                          self.task._check_destination_is_not_source)
 
-    @mock.patch.object(objects.Service, 'get_by_compute_host',
-                       side_effect=exception.ComputeHostNotFound(host='host'))
-    def test_check_requested_destination_fails_when_destination_is_up(self,
-                                                                      mock):
-        self.assertRaises(exception.ComputeHostNotFound,
-                          self.task._check_requested_destination)
-
-    @mock.patch.object(live_migrate.LiveMigrationTask, '_check_host_is_up')
     @mock.patch.object(objects.ComputeNode,
                        'get_first_node_by_host_for_old_compat')
-    def test_check_requested_destination_fails_with_not_enough_memory(
-        self, mock_get_first, mock_is_up):
+    def test_check_destination_fails_with_not_enough_memory(
+        self, mock_get_first):
         mock_get_first.return_value = (
             objects.ComputeNode(free_ram_mb=513,
                                 memory_mb=1024,
@@ -346,46 +313,54 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         # ratio reduces the total available RAM to 410MB
         # (1024 * 0.9 - (1024 - 513))
         self.assertRaises(exception.MigrationPreCheckError,
-                          self.task._check_requested_destination)
-        mock_is_up.assert_called_once_with(self.destination)
+                          self.task._check_destination_has_enough_memory)
         mock_get_first.assert_called_once_with(self.context, self.destination)
 
-    @mock.patch.object(live_migrate.LiveMigrationTask, '_check_host_is_up')
-    @mock.patch.object(live_migrate.LiveMigrationTask,
-                       '_check_destination_has_enough_memory')
     @mock.patch.object(live_migrate.LiveMigrationTask, '_get_compute_info')
-    def test_check_requested_destination_fails_with_hypervisor_diff(
-        self, mock_get_info, mock_check, mock_is_up):
+    def test_check_compatible_fails_with_hypervisor_diff(
+        self, mock_get_info):
         mock_get_info.side_effect = [
             objects.ComputeNode(hypervisor_type='b'),
             objects.ComputeNode(hypervisor_type='a')]
 
         self.assertRaises(exception.InvalidHypervisorType,
-                          self.task._check_requested_destination)
-        mock_is_up.assert_called_once_with(self.destination)
-        mock_check.assert_called_once_with()
+                          self.task._check_compatible_with_source_hypervisor,
+                          self.destination)
         self.assertEqual([mock.call(self.instance_host),
                           mock.call(self.destination)],
                          mock_get_info.call_args_list)
 
-    @mock.patch.object(live_migrate.LiveMigrationTask, '_check_host_is_up')
-    @mock.patch.object(live_migrate.LiveMigrationTask,
-                       '_check_destination_has_enough_memory')
     @mock.patch.object(live_migrate.LiveMigrationTask, '_get_compute_info')
-    def test_check_requested_destination_fails_with_hypervisor_too_old(
-        self, mock_get_info, mock_check, mock_is_up):
+    def test_check_compatible_fails_with_hypervisor_too_old(
+        self, mock_get_info):
         host1 = {'hypervisor_type': 'a', 'hypervisor_version': 7}
         host2 = {'hypervisor_type': 'a', 'hypervisor_version': 6}
         mock_get_info.side_effect = [objects.ComputeNode(**host1),
                                      objects.ComputeNode(**host2)]
 
         self.assertRaises(exception.DestinationHypervisorTooOld,
-                          self.task._check_requested_destination)
-        mock_is_up.assert_called_once_with(self.destination)
-        mock_check.assert_called_once_with()
+                          self.task._check_compatible_with_source_hypervisor,
+                          self.destination)
         self.assertEqual([mock.call(self.instance_host),
                           mock.call(self.destination)],
                          mock_get_info.call_args_list)
+
+    @mock.patch.object(compute_rpcapi.ComputeAPI,
+                       'check_can_live_migrate_destination')
+    def test_check_requested_destination(self, mock_check):
+        mock_check.return_value = "migrate_data"
+        self.task.limits = fake_limits1
+
+        with test.nested(
+            mock.patch.object(self.task.network_api,
+                              'supports_port_binding_extension',
+                              return_value=False),
+            mock.patch.object(self.task, '_check_can_migrate_pci')):
+            self.assertIsNone(self.task._check_requested_destination())
+        self.assertEqual("migrate_data", self.task.migrate_data)
+        mock_check.assert_called_once_with(self.context, self.instance,
+            self.destination, self.block_migration, self.disk_over_commit,
+            self.task.migration, fake_limits1)
 
     @mock.patch.object(objects.Service, 'get_by_compute_host')
     @mock.patch.object(live_migrate.LiveMigrationTask, '_get_compute_info')
@@ -417,7 +392,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
             mock.patch.object(self.task, '_check_can_migrate_pci')):
             ex = self.assertRaises(exception.MigrationPreCheckError,
                                    self.task._check_requested_destination)
-        self.assertIn('across cells', six.text_type(ex))
+        self.assertIn('across cells', str(ex))
 
     @mock.patch.object(live_migrate.LiveMigrationTask,
                        '_call_livem_checks_on_host')
@@ -440,7 +415,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
 
         mock_setup.assert_called_once_with(self.context, self.fake_spec)
         mock_reset.assert_called_once_with()
-        self.ensure_network_metadata_mock.assert_called_once_with(
+        self.ensure_network_information_mock.assert_called_once_with(
             self.instance)
         self.heal_reqspec_is_bfv_mock.assert_called_once_with(
             self.context, self.fake_spec, self.instance)
@@ -625,43 +600,6 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
             self.assertRaises(exception.MigrationPreCheckError,
                               self.task._call_livem_checks_on_host, {}, {})
 
-    def test_call_livem_checks_on_host_bind_ports(self):
-        data = objects.LibvirtLiveMigrateData()
-        bindings = {
-            uuids.port1: {'host': 'dest-host'},
-            uuids.port2: {'host': 'dest-host'}
-        }
-
-        @mock.patch.object(self.task, '_check_can_migrate_pci')
-        @mock.patch.object(self.task.compute_rpcapi,
-                           'check_can_live_migrate_destination',
-                           return_value=data)
-        @mock.patch.object(self.task.network_api,
-                           'supports_port_binding_extension',
-                           return_value=True)
-        @mock.patch.object(self.task.network_api,
-                           'bind_ports_to_host', return_value=bindings)
-        def _test(mock_bind_ports_to_host,
-                  mock_supports_port_binding,
-                  mock_check_can_live_migrate_dest,
-                  mock_check_can_migrate_pci):
-            nwinfo = network_model.NetworkInfo([
-                network_model.VIF(uuids.port1),
-                network_model.VIF(uuids.port2)])
-            self.instance.info_cache = objects.InstanceInfoCache(
-                network_info=nwinfo)
-            self.task._call_livem_checks_on_host('dest-host', {})
-            # Assert the migrate_data set on the task based on the port
-            # bindings created.
-            self.assertIn('vifs', data)
-            self.assertEqual(2, len(data.vifs))
-            for vif in data.vifs:
-                self.assertIn('source_vif', vif)
-                self.assertEqual('dest-host', vif.host)
-                self.assertEqual(vif.port_id, vif.source_vif['id'])
-
-        _test()
-
     @mock.patch('nova.network.neutron.API.bind_ports_to_host')
     def test_bind_ports_on_destination_merges_profiles(self, mock_bind_ports):
         """Assert that if both the migration_data and the provider mapping
@@ -745,6 +683,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
             mock_fill_provider_mapping, mock_update_pci_req):
         resource_req = [objects.RequestGroup(requester_id=uuids.port_id)]
         self.mock_get_res_req.return_value = resource_req
+        self.instance.pci_requests = objects.InstancePCIRequests(requests=[])
 
         self.assertEqual(("host1", "node1", fake_limits1),
                          self.task._find_destination())
@@ -760,7 +699,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
 
         mock_setup.assert_called_once_with(self.context, self.fake_spec)
         mock_reset.assert_called_once_with()
-        self.ensure_network_metadata_mock.assert_called_once_with(
+        self.ensure_network_information_mock.assert_called_once_with(
             self.instance)
         self.heal_reqspec_is_bfv_mock.assert_called_once_with(
             self.context, self.fake_spec, self.instance)
@@ -771,8 +710,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         mock_fill_provider_mapping.assert_called_once_with(
             self.task.request_spec, fake_selection1)
         mock_update_pci_req.assert_called_once_with(
-            self.context, self.task.report_client, self.instance,
-            {uuids.port_id: []})
+            self.context, self.task.report_client, [], {uuids.port_id: []})
 
     @mock.patch.object(objects.InstanceMapping, 'get_by_instance_uuid',
                        side_effect=exception.InstanceMappingNotFound(
@@ -858,3 +796,29 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
                           _test, pci_requests, False, True)
         self.assertRaises(exception.MigrationPreCheckError,
                           _test, pci_requests, True, True)
+
+    def test_check_can_migrate_specific_resources(self):
+        """Test _check_can_migrate_specific_resources allows live migration
+        with vpmem.
+        """
+        @mock.patch.object(live_migrate, 'supports_vpmem_live_migration')
+        def _test(resources, supp_lm_vpmem_retval, mock_support_lm_vpmem):
+            self.instance.resources = resources
+            mock_support_lm_vpmem.return_value = supp_lm_vpmem_retval
+            self.task._check_can_migrate_specific_resources()
+
+        vpmem_0 = objects.LibvirtVPMEMDevice(
+            label='4GB', name='ns_0', devpath='/dev/dax0.0',
+            size=4292870144, align=2097152)
+        resource_0 = objects.Resource(
+            provider_uuid=uuids.rp,
+            resource_class="CUSTOM_PMEM_NAMESPACE_4GB",
+            identifier='ns_0', metadata=vpmem_0)
+        resources = objects.ResourceList(
+            objects=[resource_0])
+
+        _test(None, False)
+        _test(None, True)
+        _test(resources, True)
+        self.assertRaises(exception.MigrationPreCheckError,
+                          _test, resources, False)

@@ -18,14 +18,12 @@ import time
 
 from oslo_utils import fixture as utils_fixture
 from oslo_utils import timeutils
-import six
 
 from nova.api.openstack import api_version_request as avr
 import nova.conf
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional.api_sample_tests import api_sample_base
 from nova.tests.unit.api.openstack import fakes
-from nova.tests.unit.image import fake
 
 CONF = nova.conf.CONF
 
@@ -34,7 +32,7 @@ class ServersSampleBase(api_sample_base.ApiSampleTestBaseV21):
     microversion = None
     sample_dir = 'servers'
 
-    user_data_contents = six.b('#!/bin/bash\n/bin/su\necho "I am in you!"\n')
+    user_data_contents = b'#!/bin/bash\n/bin/su\necho "I am in you!"\n'
     user_data = base64.b64encode(user_data_contents)
 
     common_req_names = [
@@ -61,15 +59,14 @@ class ServersSampleBase(api_sample_base.ApiSampleTestBaseV21):
         # common server sample files from 'servers' directory.
         # Set False if tests need to use extension specific sample files
         subs = {
-            'image_id': fake.get_valid_image_id(),
+            'image_id': self.glance.auto_disk_config_enabled_image['id'],
             'host': self._get_host(),
             'compute_endpoint': self._get_compute_endpoint(),
             'versioned_compute_endpoint': self._get_vers_compute_endpoint(),
             'glance_host': self._get_glance_host(),
             'access_ip_v4': '1.2.3.4',
             'access_ip_v6': '80fe::',
-            'user_data': (self.user_data if six.PY2
-                          else self.user_data.decode('utf-8')),
+            'user_data': self.user_data.decode('utf-8'),
             'uuid': '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}'
                     '-[0-9a-f]{4}-[0-9a-f]{12}',
             'name': 'new-server-test' if name is None else name,
@@ -105,6 +102,9 @@ class ServersSampleBase(api_sample_base.ApiSampleTestBaseV21):
 
 
 class ServersSampleJsonTest(ServersSampleBase):
+    # Many of the 'os_compute_api:servers:*' policies are admin-only, and we
+    # want to get admin-style (complete) responses even for those aren't
+    ADMIN_API = True
     # This controls whether or not we use the common server API sample
     # for server post req/resp.
     use_common_server_post = True
@@ -129,8 +129,7 @@ class ServersSampleJsonTest(ServersSampleBase):
         subs['mac_addr'] = '(?:[a-f0-9]{2}:){5}[a-f0-9]{2}'
         subs['access_ip_v4'] = '1.2.3.4'
         subs['access_ip_v6'] = '80fe::'
-        subs['user_data'] = (self.user_data if six.PY2
-                             else self.user_data.decode('utf-8'))
+        subs['user_data'] = self.user_data.decode('utf-8')
         # config drive can be a string for True or empty value for False
         subs['cdrive'] = '.*'
         self._verify_response('server-get-resp', subs, response, 200)
@@ -156,8 +155,7 @@ class ServersSampleJsonTest(ServersSampleBase):
         subs['mac_addr'] = '(?:[a-f0-9]{2}:){5}[a-f0-9]{2}'
         subs['access_ip_v4'] = '1.2.3.4'
         subs['access_ip_v6'] = '80fe::'
-        subs['user_data'] = (self.user_data if six.PY2
-                             else self.user_data.decode('utf-8'))
+        subs['user_data'] = self.user_data.decode('utf-8')
         # config drive can be a string for True or empty value for False
         subs['cdrive'] = '.*'
         self._verify_response('servers-details-resp', subs, response, 200)
@@ -192,7 +190,7 @@ class ServersSampleJson219Test(ServersSampleJsonTest):
         uuid = self.test_servers_post()
         response = self._do_put('servers/%s' % uuid, 'server-put-req', {})
         subs = {
-            'image_id': fake.get_valid_image_id(),
+            'image_id': self.glance.auto_disk_config_enabled_image['id'],
             'hostid': '[a-f0-9]+',
             'glance_host': self._get_glance_host(),
             'access_ip_v4': '1.2.3.4',
@@ -235,9 +233,8 @@ class ServersSampleJson247Test(ServersSampleJsonTest):
 
     def test_server_rebuild(self):
         uuid = self._post_server()
-        image = fake.get_valid_image_id()
         params = {
-            'uuid': image,
+            'uuid': self.glance.auto_disk_config_enabled_image['id'],
             'name': 'foobar',
             'pass': 'seekr3t',
             'hostid': '[a-f0-9]+',
@@ -259,6 +256,9 @@ class ServersSampleJson252Test(ServersSampleJsonTest):
 
 
 class ServersSampleJson263Test(ServersSampleBase):
+    # Many of the 'os_compute_api:servers:*' policies are admin-only, and we
+    # want to get admin-style (complete) responses even for those aren't
+    ADMIN_API = True
     microversion = '2.63'
     scenarios = [('v2_63', {'api_major_version': 'v2.1'})]
 
@@ -271,8 +271,7 @@ class ServersSampleJson263Test(ServersSampleBase):
             'hostname': r'[\w\.\-]+',
             'access_ip_v4': '1.2.3.4',
             'access_ip_v6': '80fe::',
-            'user_data': (self.user_data if six.PY2
-                          else self.user_data.decode('utf-8')),
+            'user_data': self.user_data.decode('utf-8'),
             'cdrive': '.*',
         }
 
@@ -282,10 +281,8 @@ class ServersSampleJson263Test(ServersSampleBase):
     def test_server_rebuild(self):
         uuid = self._post_server(use_common_server_api_samples=False)
         fakes.stub_out_key_pair_funcs(self)
-        image = fake.get_valid_image_id()
-
         params = {
-            'uuid': image,
+            'uuid': self.glance.auto_disk_config_enabled_image['id'],
             'name': 'foobar',
             'key_name': 'new-key',
             'description': 'description of foobar',
@@ -328,6 +325,9 @@ class ServersSampleJson263Test(ServersSampleBase):
 
 
 class ServersSampleJson266Test(ServersSampleBase):
+    # Many of the 'os_compute_api:servers:*' policies are admin-only, and we
+    # want to get admin-style (complete) responses even for those aren't
+    ADMIN_API = True
     microversion = '2.66'
     scenarios = [('v2_66', {'api_major_version': 'v2.1'})]
 
@@ -340,8 +340,7 @@ class ServersSampleJson266Test(ServersSampleBase):
             'hostname': r'[\w\.\-]+',
             'access_ip_v4': '1.2.3.4',
             'access_ip_v6': '80fe::',
-            'user_data': (self.user_data if six.PY2
-                          else self.user_data.decode('utf-8')),
+            'user_data': self.user_data.decode('utf-8'),
             'cdrive': '.*',
         }
 
@@ -381,6 +380,9 @@ class ServersSampleJson267Test(ServersSampleBase):
 
 
 class ServersSampleJson269Test(ServersSampleBase):
+    # Many of the 'os_compute_api:servers:*' policies are admin-only, and we
+    # want to get admin-style (complete) responses even for those aren't
+    ADMIN_API = True
     microversion = '2.69'
     scenarios = [('v2_69', {'api_major_version': 'v2.1'})]
 
@@ -428,6 +430,9 @@ class ServersSampleJson269Test(ServersSampleBase):
 
 
 class ServersSampleJson271Test(ServersSampleBase):
+    # Many of the 'os_compute_api:servers:*' policies are admin-only, and we
+    # want to get admin-style (complete) responses even for those aren't
+    ADMIN_API = True
     microversion = '2.71'
     scenarios = [('v2_71', {'api_major_version': 'v2.1'})]
 
@@ -440,8 +445,7 @@ class ServersSampleJson271Test(ServersSampleBase):
             'hostname': r'[\w\.\-]+',
             'access_ip_v4': '1.2.3.4',
             'access_ip_v6': '80fe::',
-            'user_data': (self.user_data if six.PY2
-                          else self.user_data.decode('utf-8')),
+            'user_data': self.user_data.decode('utf-8'),
             'cdrive': '.*',
         }
 
@@ -475,9 +479,8 @@ class ServersSampleJson271Test(ServersSampleBase):
     def test_servers_rebuild_with_server_groups(self):
         uuid = self._test_servers_post()
         fakes.stub_out_key_pair_funcs(self)
-        image = fake.get_valid_image_id()
         params = {
-            'uuid': image,
+            'uuid': self.glance.auto_disk_config_enabled_image['id'],
             'name': 'foobar',
             'key_name': 'new-key',
             'description': 'description of foobar',
@@ -521,6 +524,9 @@ class ServersSampleJson271Test(ServersSampleBase):
 
 
 class ServersSampleJson273Test(ServersSampleBase):
+    # Many of the 'os_compute_api:servers:*' policies are admin-only, and we
+    # want to get admin-style (complete) responses even for those aren't
+    ADMIN_API = True
     microversion = '2.73'
     scenarios = [('v2_73', {'api_major_version': 'v2.1'})]
 
@@ -546,9 +552,8 @@ class ServersSampleJson273Test(ServersSampleBase):
 
     def test_server_rebuild_with_empty_locked_reason(self):
         uuid = self._post_server(use_common_server_api_samples=False)
-        image = fake.get_valid_image_id()
         params = {
-            'uuid': image,
+            'uuid': self.glance.auto_disk_config_enabled_image['id'],
             'name': 'foobar',
             'pass': 'seekr3t',
             'hostid': '[a-f0-9]+',
@@ -577,6 +582,8 @@ class ServersSampleJson274Test(ServersSampleBase):
     """Supporting host and/or hypervisor_hostname is an admin API
     to create servers.
     """
+    # Many of the 'os_compute_api:servers:*' policies are admin-only, and we
+    # want to get admin-style (complete) responses even for those aren't
     ADMIN_API = True
     SUPPORTS_CELLS = True
     microversion = '2.74'
@@ -607,6 +614,10 @@ class ServersSampleJson274Test(ServersSampleBase):
 
 class ServersUpdateSampleJsonTest(ServersSampleBase):
 
+    # Many of the 'os_compute_api:servers:*' policies are admin-only, and we
+    # want to get admin-style (complete) responses even for those aren't
+    ADMIN_API = True
+
     def test_update_server(self):
         uuid = self._post_server()
         subs = {}
@@ -629,9 +640,8 @@ class ServersSampleJson275Test(ServersUpdateSampleJsonTest):
 
     def test_server_rebuild(self):
         uuid = self._post_server()
-        image = fake.get_valid_image_id()
         params = {
-            'uuid': image,
+            'uuid': self.glance.auto_disk_config_enabled_image['id'],
             'name': 'foobar',
             'pass': 'seekr3t',
             'hostid': '[a-f0-9]+',
@@ -674,6 +684,9 @@ class _ServersActionsJsonTestMixin(object):
 
 
 class ServersActionsJsonTest(ServersSampleBase, _ServersActionsJsonTestMixin):
+    # Many of the 'os_compute_api:servers:*' policies are admin-only, and we
+    # want to get admin-style (complete) responses even for those aren't
+    ADMIN_API = True
     SUPPORTS_CELLS = True
 
     def test_server_reboot_hard(self):
@@ -690,9 +703,8 @@ class ServersActionsJsonTest(ServersSampleBase, _ServersActionsJsonTestMixin):
 
     def test_server_rebuild(self):
         uuid = self._post_server()
-        image = fake.get_valid_image_id()
         params = {
-            'uuid': image,
+            'uuid': self.glance.auto_disk_config_enabled_image['id'],
             'name': 'foobar',
             'pass': 'seekr3t',
             'hostid': '[a-f0-9]+',
@@ -799,14 +811,16 @@ class ServersActionsJsonTest(ServersSampleBase, _ServersActionsJsonTestMixin):
 
 
 class ServersActionsJson219Test(ServersSampleBase):
+    # Many of the 'os_compute_api:servers:*' policies are admin-only, and we
+    # want to get admin-style (complete) responses even for those aren't
+    ADMIN_API = True
     microversion = '2.19'
     scenarios = [('v2_19', {'api_major_version': 'v2.1'})]
 
     def test_server_rebuild(self):
         uuid = self._post_server()
-        image = fake.get_valid_image_id()
         params = {
-            'uuid': image,
+            'uuid': self.glance.auto_disk_config_enabled_image['id'],
             'name': 'foobar',
             'description': 'description of foobar',
             'pass': 'seekr3t',
@@ -823,14 +837,16 @@ class ServersActionsJson219Test(ServersSampleBase):
 
 
 class ServersActionsJson226Test(ServersSampleBase):
+    # Many of the 'os_compute_api:servers:*' policies are admin-only, and we
+    # want to get admin-style (complete) responses even for those aren't
+    ADMIN_API = True
     microversion = '2.26'
     scenarios = [('v2_26', {'api_major_version': 'v2.1'})]
 
     def test_server_rebuild(self):
         uuid = self._post_server()
-        image = fake.get_valid_image_id()
         params = {
-            'uuid': image,
+            'uuid': self.glance.auto_disk_config_enabled_image['id'],
             'access_ip_v4': '1.2.3.4',
             'access_ip_v6': '80fe::',
             'disk_config': 'AUTO',
@@ -855,6 +871,9 @@ class ServersActionsJson226Test(ServersSampleBase):
 
 
 class ServersActionsJson254Test(ServersSampleBase):
+    # Many of the 'os_compute_api:servers:*' policies are admin-only, and we
+    # want to get admin-style (complete) responses even for those aren't
+    ADMIN_API = True
     microversion = '2.54'
     sample_dir = 'servers'
     scenarios = [('v2_54', {'api_major_version': 'v2.1'})]
@@ -865,9 +884,8 @@ class ServersActionsJson254Test(ServersSampleBase):
     def test_server_rebuild(self):
         fakes.stub_out_key_pair_funcs(self)
         uuid = self._create_server()
-        image = fake.get_valid_image_id()
         params = {
-            'uuid': image,
+            'uuid': self.glance.auto_disk_config_enabled_image['id'],
             'name': 'foobar',
             'key_name': 'new-key',
             'description': 'description of foobar',

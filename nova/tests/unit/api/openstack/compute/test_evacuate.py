@@ -12,10 +12,8 @@
 #   License for the specific language governing permissions and limitations
 #   under the License.
 
-import fixtures
 import mock
 from oslo_utils.fixture import uuidsentinel as uuids
-import six
 import testtools
 import webob
 
@@ -68,9 +66,6 @@ class EvacuateTestV21(test.NoDBTestCase):
         self.stub_out('nova.compute.api.API.get', fake_compute_api_get)
         self.stub_out('nova.compute.api.HostAPI.service_get_by_compute_host',
                       fake_service_get_by_compute_host)
-        self.mock_list_port = self.useFixture(
-            fixtures.MockPatch('nova.network.neutron.API.list_ports')).mock
-        self.mock_list_port.return_value = {'ports': []}
         self.UUID = uuids.fake
         for _method in self._methods:
             self.stub_out('nova.compute.api.API.%s' % _method,
@@ -111,6 +106,23 @@ class EvacuateTestV21(test.NoDBTestCase):
                                       'onSharedStorage': 'False',
                                       'adminPass': 'MyNewPass'},
                                      uuid='BAD_UUID')
+
+    @mock.patch('nova.compute.api.API.evacuate')
+    def test_evacuate__with_vtpm(self, mock_evacuate):
+        mock_evacuate.side_effect = exception.OperationNotSupportedForVTPM(
+            instance_uuid=uuids.instance, operation='foo')
+        self._check_evacuate_failure(
+            webob.exc.HTTPConflict,
+            {'host': 'foo', 'onSharedStorage': 'False', 'adminPass': 'bar'})
+
+    @mock.patch('nova.compute.api.API.evacuate')
+    def test_evacuate__with_vdpa_interface(self, mock_evacuate):
+        mock_evacuate.side_effect = \
+            exception.OperationNotSupportedForVDPAInterface(
+                instance_uuid=uuids.instance, operation='foo')
+        self._check_evacuate_failure(
+            webob.exc.HTTPConflict,
+            {'host': 'foo', 'onSharedStorage': 'False', 'adminPass': 'bar'})
 
     def test_evacuate_with_active_service(self):
         def fake_evacuate(*args, **kwargs):
@@ -191,13 +203,6 @@ class EvacuateTestV21(test.NoDBTestCase):
     def test_evacuate_shared(self, mock_save):
         self._get_evacuate_response({'host': 'my-host',
                                      'onSharedStorage': 'True'})
-
-    def test_not_admin(self):
-        body = {'evacuate': {'host': 'my-host',
-                             'onSharedStorage': 'False'}}
-        self.assertRaises(exception.PolicyNotAuthorized,
-                          self.controller._evacuate,
-                          self.req, self.UUID, body=body)
 
     def test_evacuate_to_same_host(self):
         self._check_evacuate_failure(webob.exc.HTTPBadRequest,
@@ -316,12 +321,6 @@ class EvacuateTestV214(EvacuateTestV21):
             self.assertEqual(admin_pass,
                              mock_evacuate.call_args_list[0][0][4])
 
-    def test_not_admin(self):
-        body = {'evacuate': {'host': 'my-host'}}
-        self.assertRaises(exception.PolicyNotAuthorized,
-                          self.controller._evacuate,
-                          self.req, self.UUID, body=body)
-
     @testtools.skip('onSharedStorage was removed from Microversion 2.14')
     @mock.patch('nova.objects.Instance.save')
     def test_evacuate_shared_and_pass(self, mock_save):
@@ -395,7 +394,7 @@ class EvacuateTestV268(EvacuateTestV229):
         ex = self._check_evacuate_failure(self.validation_error,
                                           {'host': 'my-host',
                                            'force': 'true'})
-        self.assertIn('force', six.text_type(ex))
+        self.assertIn('force', str(ex))
 
     def test_forced_evacuate_with_no_host_provided(self):
         # not applicable for v2.68, which removed the 'force' parameter

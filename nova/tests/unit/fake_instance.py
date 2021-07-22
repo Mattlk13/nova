@@ -43,11 +43,11 @@ def fake_db_secgroups(instance, names):
 
 
 def fake_db_instance(**updates):
-    if 'instance_type' in updates:
-        if isinstance(updates['instance_type'], objects.Flavor):
-            flavor = updates['instance_type']
+    if 'flavor' in updates:
+        if isinstance(updates['flavor'], objects.Flavor):
+            flavor = updates['flavor']
         else:
-            flavor = objects.Flavor(**updates['instance_type'])
+            flavor = objects.Flavor(**updates['flavor'])
         flavorinfo = jsonutils.dumps({
             'cur': flavor.obj_to_primitive(),
             'old': None,
@@ -119,7 +119,6 @@ def fake_instance_obj(context, obj_instance_class=None, **updates):
                                 is_public=True,
                                 extra_specs={},
                                 projects=[])
-        flavor.obj_reset_changes()
     inst = obj_instance_class._from_db_object(context,
                obj_instance_class(), fake_db_instance(**updates),
                expected_attrs=expected_attrs)
@@ -140,7 +139,8 @@ def fake_instance_obj(context, obj_instance_class=None, **updates):
     inst.old_flavor = None
     inst.new_flavor = None
     inst.resources = None
-    inst.obj_reset_changes()
+    inst.migration_context = None
+    inst.obj_reset_changes(recursive=True)
     return inst
 
 

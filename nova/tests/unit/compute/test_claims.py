@@ -56,7 +56,12 @@ class DummyTracker(object):
 
     def new_pci_tracker(self):
         ctxt = context.RequestContext('testuser', 'testproject')
-        self.pci_tracker = pci_manager.PciDevTracker(ctxt)
+        with mock.patch.object(
+            objects.PciDeviceList, 'get_by_compute_node',
+            return_value=objects.PciDeviceList()
+        ):
+            self.pci_tracker = pci_manager.PciDevTracker(
+                ctxt, objects.ComputeNode(id=1, numa_topology=None))
 
 
 class ClaimTestCase(test.NoDBTestCase):
@@ -74,7 +79,7 @@ class ClaimTestCase(test.NoDBTestCase):
     def _claim(self, limits=None, requests=None, **kwargs):
         numa_topology = kwargs.pop('numa_topology', None)
         instance = self._fake_instance(**kwargs)
-        instance.flavor = self._fake_instance_type(**kwargs)
+        instance.flavor = self._fake_flavor(**kwargs)
         if numa_topology:
             db_numa_topology = {
                     'id': 1, 'created_at': None, 'updated_at': None,
@@ -109,8 +114,8 @@ class ClaimTestCase(test.NoDBTestCase):
         instance.update(**kwargs)
         return fake_instance.fake_instance_obj(self.context, **instance)
 
-    def _fake_instance_type(self, **kwargs):
-        instance_type = {
+    def _fake_flavor(self, **kwargs):
+        flavor = {
             'id': 1,
             'name': 'fakeitype',
             'memory_mb': 1024,
@@ -118,8 +123,8 @@ class ClaimTestCase(test.NoDBTestCase):
             'root_gb': 10,
             'ephemeral_gb': 5
         }
-        instance_type.update(**kwargs)
-        return objects.Flavor(**instance_type)
+        flavor.update(**kwargs)
+        return objects.Flavor(**flavor)
 
     def _fake_compute_node(self, values=None):
         compute_node = {
@@ -186,13 +191,14 @@ class ClaimTestCase(test.NoDBTestCase):
     def test_numa_topology_no_limit(self):
         huge_instance = objects.InstanceNUMATopology(
                 cells=[objects.InstanceNUMACell(
-                    id=1, cpuset=set([1, 2]), memory=512)])
+                    id=1, cpuset=set([1, 2]), pcpuset=set(), memory=512)])
         self._claim(numa_topology=huge_instance)
 
     def test_numa_topology_fails(self):
         huge_instance = objects.InstanceNUMATopology(
                 cells=[objects.InstanceNUMACell(
-                    id=1, cpuset=set([1, 2, 3, 4, 5]), memory=2048)])
+                    id=1, cpuset=set([1, 2, 3, 4, 5]), pcpuset=set(),
+                    memory=2048)])
         limit_topo = objects.NUMATopologyLimits(
             cpu_allocation_ratio=1, ram_allocation_ratio=1)
         self.assertRaises(exception.ComputeResourcesUnavailable,
@@ -203,7 +209,7 @@ class ClaimTestCase(test.NoDBTestCase):
     def test_numa_topology_passes(self):
         huge_instance = objects.InstanceNUMATopology(
                 cells=[objects.InstanceNUMACell(
-                    id=1, cpuset=set([1, 2]), memory=512)])
+                    id=1, cpuset=set([1, 2]), pcpuset=set(), memory=512)])
         limit_topo = objects.NUMATopologyLimits(
             cpu_allocation_ratio=1, ram_allocation_ratio=1)
         self._claim(limits={'numa_topology': limit_topo},
@@ -230,7 +236,7 @@ class ClaimTestCase(test.NoDBTestCase):
 
         huge_instance = objects.InstanceNUMATopology(
                 cells=[objects.InstanceNUMACell(
-                    id=1, cpuset=set([1, 2]), memory=512)])
+                    id=1, cpuset=set([1, 2]), pcpuset=set(), memory=512)])
 
         self._claim(requests=requests, numa_topology=huge_instance)
 
@@ -265,7 +271,7 @@ class ClaimTestCase(test.NoDBTestCase):
 
         huge_instance = objects.InstanceNUMATopology(
                 cells=[objects.InstanceNUMACell(
-                    id=1, cpuset=set([1, 2]), memory=512)])
+                    id=1, cpuset=set([1, 2]), pcpuset=set(), memory=512)])
 
         self.assertRaises(exception.ComputeResourcesUnavailable,
                           self._claim,
@@ -294,7 +300,7 @@ class ClaimTestCase(test.NoDBTestCase):
 
         huge_instance = objects.InstanceNUMATopology(
                 cells=[objects.InstanceNUMACell(
-                    id=1, cpuset=set([1, 2]), memory=512)])
+                    id=1, cpuset=set([1, 2]), pcpuset=set(), memory=512)])
 
         self._claim(requests=requests, numa_topology=huge_instance)
 
@@ -317,7 +323,7 @@ class MoveClaimTestCase(ClaimTestCase):
 
     def _claim(self, limits=None, requests=None,
                image_meta=None, **kwargs):
-        instance_type = self._fake_instance_type(**kwargs)
+        flavor = self._fake_flavor(**kwargs)
         numa_topology = kwargs.pop('numa_topology', None)
         image_meta = image_meta or {}
         self.instance = self._fake_instance(**kwargs)
@@ -341,7 +347,7 @@ class MoveClaimTestCase(ClaimTestCase):
                     return_value=self.db_numa_topology)
         def get_claim(mock_extra_get, mock_numa_get):
             return claims.MoveClaim(
-                self.context, self.instance, _NODENAME, instance_type,
+                self.context, self.instance, _NODENAME, flavor,
                 image_meta, self.tracker, self.compute_node, requests,
                 objects.Migration(migration_type='migration'), limits=limits)
         return get_claim()
@@ -365,45 +371,47 @@ class MoveClaimTestCase(ClaimTestCase):
 class LiveMigrationClaimTestCase(ClaimTestCase):
 
     def test_live_migration_claim_bad_pci_request(self):
-        instance_type = self._fake_instance_type()
+        flavor = self._fake_flavor()
         instance = self._fake_instance()
         instance.numa_topology = None
         self.assertRaisesRegex(
             exception.ComputeResourcesUnavailable,
             'PCI requests are not supported',
-            claims.MoveClaim, self.context, instance, _NODENAME, instance_type,
+            claims.MoveClaim, self.context, instance, _NODENAME, flavor,
             {}, self.tracker, self.compute_node,
             objects.InstancePCIRequests(requests=[
                 objects.InstancePCIRequest(alias_name='fake-alias')]),
             objects.Migration(migration_type='live-migration'), None)
 
     def test_live_migration_page_size(self):
-        instance_type = self._fake_instance_type()
+        flavor = self._fake_flavor()
         instance = self._fake_instance()
         instance.numa_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=1, cpuset=set([1, 2]),
-                                            memory=512, pagesize=2)])
+            cells=[objects.InstanceNUMACell(
+                id=1, cpuset=set([1, 2]),
+                pcpuset=set(), memory=512, pagesize=2)])
         claimed_numa_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=1, cpuset=set([1, 2]),
-                                            memory=512, pagesize=1)])
+            cells=[objects.InstanceNUMACell(
+            id=1, cpuset=set([1, 2]), pcpuset=set(), memory=512, pagesize=1)])
         with mock.patch('nova.virt.hardware.numa_fit_instance_to_host',
                         return_value=claimed_numa_topology):
             self.assertRaisesRegex(
                 exception.ComputeResourcesUnavailable,
                 'Requested page size is different',
                 claims.MoveClaim, self.context, instance, _NODENAME,
-                instance_type, {}, self.tracker, self.compute_node,
+                flavor, {}, self.tracker, self.compute_node,
                 self.empty_requests,
                 objects.Migration(migration_type='live-migration'), None)
 
     def test_claim_fails_page_size_not_called(self):
-        instance_type = self._fake_instance_type()
+        flavor = self._fake_flavor()
         instance = self._fake_instance()
         # This topology cannot fit in self.compute_node
         # (see _fake_compute_node())
         numa_topology = objects.InstanceNUMATopology(
-            cells=[objects.InstanceNUMACell(id=1, cpuset=set([1, 2, 3]),
-                                            memory=1024)])
+            cells=[objects.InstanceNUMACell(
+            id=1, cpuset=set([1, 2, 3]), pcpuset=set(),
+            memory=1024)])
         with test.nested(
             mock.patch('nova.virt.hardware.numa_get_constraints',
                         return_value=numa_topology),
@@ -414,16 +422,16 @@ class LiveMigrationClaimTestCase(ClaimTestCase):
                 exception.ComputeResourcesUnavailable,
                 'Requested instance NUMA topology',
                 claims.MoveClaim, self.context, instance, _NODENAME,
-                instance_type, {}, self.tracker, self.compute_node,
+                flavor, {}, self.tracker, self.compute_node,
                 self.empty_requests,
                 objects.Migration(migration_type='live-migration'), None)
             mock_test_page_size.assert_not_called()
 
     def test_live_migration_no_instance_numa_topology(self):
-        instance_type = self._fake_instance_type()
+        flavor = self._fake_flavor()
         instance = self._fake_instance()
         instance.numa_topology = None
         claims.MoveClaim(
-            self.context, instance, _NODENAME, instance_type, {}, self.tracker,
+            self.context, instance, _NODENAME, flavor, {}, self.tracker,
             self.compute_node, self.empty_requests,
             objects.Migration(migration_type='live-migration'), None)

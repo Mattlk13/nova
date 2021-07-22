@@ -19,8 +19,10 @@ from nova.api.openstack.compute.schemas import reset_server_state
 from nova.api.openstack import wsgi
 from nova.api import validation
 from nova.compute import api as compute
+from nova.compute import instance_actions
 from nova.compute import vm_states
 from nova import exception
+from nova import objects
 from nova.policies import admin_actions as aa_policies
 
 # States usable in resetState action
@@ -34,18 +36,11 @@ class AdminActionsController(wsgi.Controller):
         super(AdminActionsController, self).__init__()
         self.compute_api = compute.API()
 
-    @wsgi.response(202)
-    @wsgi.expected_errors((404, 409))
+    @wsgi.expected_errors(410)
     @wsgi.action('resetNetwork')
     def _reset_network(self, req, id, body):
-        """Permit admins to reset networking on a server."""
-        context = req.environ['nova.context']
-        context.can(aa_policies.POLICY_ROOT % 'reset_network')
-        instance = common.get_instance(self.compute_api, context, id)
-        try:
-            self.compute_api.reset_network(context, instance)
-        except exception.InstanceIsLocked as e:
-            raise exc.HTTPConflict(explanation=e.format_message())
+        """(Removed) Permit admins to reset networking on a server."""
+        raise exc.HTTPGone()
 
     @wsgi.response(202)
     @wsgi.expected_errors((404, 409))
@@ -53,8 +48,9 @@ class AdminActionsController(wsgi.Controller):
     def _inject_network_info(self, req, id, body):
         """Permit admins to inject network info into a server."""
         context = req.environ['nova.context']
-        context.can(aa_policies.POLICY_ROOT % 'inject_network_info')
         instance = common.get_instance(self.compute_api, context, id)
+        context.can(aa_policies.POLICY_ROOT % 'inject_network_info',
+                    target={'project_id': instance.project_id})
         try:
             self.compute_api.inject_network_info(context, instance)
         except exception.InstanceIsLocked as e:
@@ -67,12 +63,18 @@ class AdminActionsController(wsgi.Controller):
     def _reset_state(self, req, id, body):
         """Permit admins to reset the state of a server."""
         context = req.environ["nova.context"]
-        context.can(aa_policies.POLICY_ROOT % 'reset_state')
+        instance = common.get_instance(self.compute_api, context, id)
+        context.can(aa_policies.POLICY_ROOT % 'reset_state',
+                    target={'project_id': instance.project_id})
+
+        # Log os-resetState as an instance action
+        instance_action = objects.InstanceAction.action_start(
+            context, instance.uuid, instance_actions.RESET_STATE)
 
         # Identify the desired state from the body
         state = state_map[body["os-resetState"]["state"]]
 
-        instance = common.get_instance(self.compute_api, context, id)
         instance.vm_state = state
         instance.task_state = None
         instance.save(admin_state_reset=True)
+        instance_action.finish()

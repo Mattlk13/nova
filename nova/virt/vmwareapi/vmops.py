@@ -212,7 +212,7 @@ class VMwareVMOps(object):
                                 datastore, injected_files, admin_password,
                                 network_info):
         session_vim = self._session.vim
-        cookies = session_vim.client.options.transport.cookiejar
+        cookies = session_vim.client.cookiejar
         dc_path = vutil.get_inventory_path(session_vim, dc_info.ref)
         uploaded_iso_path = self._create_config_drive(context,
                                                       instance,
@@ -415,7 +415,7 @@ class VMwareVMOps(object):
             dc_path = vutil.get_inventory_path(session.vim, vi.dc_info.ref)
 
             host = self._session._host
-            cookies = session.vim.client.options.transport.cookiejar
+            cookies = session.vim.client.cookiejar
 
         images.fetch_image(
             context,
@@ -859,8 +859,7 @@ class VMwareVMOps(object):
         inst_md = instance_metadata.InstanceMetadata(instance,
                                                      content=injected_files,
                                                      extra_md=extra_md,
-                                                     network_info=network_info,
-                                                     request_context=context)
+                                                     network_info=network_info)
         try:
             with configdrive.ConfigDriveBuilder(instance_md=inst_md) as cdb:
                 with utils.tempdir() as tmp_path:
@@ -1125,7 +1124,7 @@ class VMwareVMOps(object):
             LOG.warning('Instance does not exist on backend',
                         instance=instance)
         except Exception:
-            LOG.exception(_('Destroy instance failed'), instance=instance)
+            LOG.exception('Destroy instance failed', instance=instance)
         finally:
             vm_util.vm_ref_cache_delete(instance.uuid)
 
@@ -1226,7 +1225,8 @@ class VMwareVMOps(object):
         self._fetch_image_if_missing(context, vi)
 
         # Get the rescue disk path
-        rescue_disk_path = datastore.build_path(instance.uuid,
+        vm_folder = ds_obj.DatastorePath.parse(vmdk.path).dirname
+        rescue_disk_path = datastore.build_path(vm_folder,
                 "%s-rescue.%s" % (image_info.image_id, image_info.file_type))
 
         # Copy the cached image to the be the rescue disk. This will be used
@@ -1584,8 +1584,9 @@ class VMwareVMOps(object):
         ds_hosts = self._session._call_method(vutil, 'get_object_property',
                                               ds_ref, 'host')
         for ds_host in ds_hosts.DatastoreHostMount:
+            ds_host_ref_value = vutil.get_moref_value(ds_host.key)
             for cluster_host in cluster_hosts.ManagedObjectReference:
-                if ds_host.key.value == cluster_host.value:
+                if ds_host_ref_value == vutil.get_moref_value(cluster_host):
                     return cluster_host
 
     def _find_datastore_for_migration(self, instance, vm_ref, cluster_ref,
@@ -1605,8 +1606,9 @@ class VMwareVMOps(object):
             return None
         # check if the current datastore is connected to the destination
         # cluster
+        ds_ref_value = vutil.get_moref_value(ds_ref)
         for datastore in cluster_datastores.ManagedObjectReference:
-            if datastore.value == ds_ref.value:
+            if vutil.get_moref_value(datastore) == ds_ref_value:
                 ds = ds_obj.get_datastore_by_ref(self._session, ds_ref)
                 if (datastore_regex is None or
                         datastore_regex.match(ds.name)):
@@ -1820,13 +1822,14 @@ class VMwareVMOps(object):
                   instance=instance)
 
     def _get_ds_browser(self, ds_ref):
-        ds_browser = self._datastore_browser_mapping.get(ds_ref.value)
+        ds_ref_value = vutil.get_moref_value(ds_ref)
+        ds_browser = self._datastore_browser_mapping.get(ds_ref_value)
         if not ds_browser:
             ds_browser = self._session._call_method(vutil,
                                                     "get_object_property",
                                                     ds_ref,
                                                     "browser")
-            self._datastore_browser_mapping[ds_ref.value] = ds_browser
+            self._datastore_browser_mapping[ds_ref_value] = ds_browser
         return ds_browser
 
     def _create_folder_if_missing(self, ds_name, ds_ref, folder):

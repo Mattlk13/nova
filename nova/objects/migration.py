@@ -53,13 +53,13 @@ class Migration(base.NovaPersistentObject, base.NovaObject,
         'source_node': fields.StringField(nullable=True),     # source nodename
         'dest_node': fields.StringField(nullable=True),       # dest nodename
         'dest_host': fields.StringField(nullable=True),       # dest host IP
+        # TODO(stephenfin): Rename these to old_flavor_id, new_flavor_id in
+        # v2.0
         'old_instance_type_id': fields.IntegerField(nullable=True),
         'new_instance_type_id': fields.IntegerField(nullable=True),
         'instance_uuid': fields.StringField(nullable=True),
         'status': fields.StringField(nullable=True),
-        'migration_type': fields.EnumField(['migration', 'resize',
-                                            'live-migration', 'evacuation'],
-                                           nullable=False),
+        'migration_type': fields.MigrationTypeField(nullable=False),
         'hidden': fields.BooleanField(nullable=False, default=False),
         'memory_total': fields.IntegerField(nullable=True),
         'memory_processed': fields.IntegerField(nullable=True),
@@ -205,6 +205,14 @@ class Migration(base.NovaPersistentObject, base.NovaObject,
     def is_same_host(self):
         return self.source_compute == self.dest_compute
 
+    @property
+    def is_live_migration(self):
+        return self.migration_type == fields.MigrationType.LIVE_MIGRATION
+
+    @property
+    def is_resize(self):
+        return self.migration_type == fields.MigrationType.RESIZE
+
 
 @base.NovaObjectRegistry.register
 class MigrationList(base.ObjectListBase, base.NovaObject):
@@ -216,7 +224,9 @@ class MigrationList(base.ObjectListBase, base.NovaObject):
     #              for an instance.
     # Version 1.4: Added sort_keys, sort_dirs, limit, marker kwargs to
     #              get_by_filters for migrations pagination support.
-    VERSION = '1.4'
+    # Version 1.5: Added a new function to get in progress migrations
+    #              and error migrations for a given host + node.
+    VERSION = '1.5'
 
     fields = {
         'objects': fields.ListOfObjectsField('Migration'),
@@ -258,5 +268,13 @@ class MigrationList(base.ObjectListBase, base.NovaObject):
                                     migration_type=None):
         db_migrations = db.migration_get_in_progress_by_instance(
             context, instance_uuid, migration_type)
+        return base.obj_make_list(context, cls(context), objects.Migration,
+                                  db_migrations)
+
+    @base.remotable_classmethod
+    def get_in_progress_and_error(cls, context, host, node):
+        db_migrations = \
+            db.migration_get_in_progress_and_error_by_host_and_node(
+                context, host, node)
         return base.obj_make_list(context, cls(context), objects.Migration,
                                   db_migrations)

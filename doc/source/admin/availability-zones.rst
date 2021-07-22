@@ -29,7 +29,7 @@ note when comparing availability zones and host aggregates:
 
   .. warning::
 
-      The use of the default availability zone name is requests can be very
+      The use of the default availability zone name in requests can be very
       error-prone. Since the user can see the list of availability zones, they
       have no way to know whether the default availability zone name (currently
       ``nova``) is provided because an host belongs to an aggregate whose AZ
@@ -211,7 +211,7 @@ where an instance is launched. For example:
 
     This is an admin-only operation by default, though you can modify this
     behavior using the ``os_compute_api:servers:create:forced_host`` rule in
-    ``policy.json``.
+    ``policy.yaml``.
 
 However, as discussed `previously <Implications for moving servers>`_, when
 launching instances in this manner the scheduler filters are not run. For this
@@ -228,7 +228,7 @@ example:
 
     This is an admin-only operation by default, though you can modify this
     behavior using the ``compute:servers:create:requested_destination`` rule in
-    ``policy.json``.
+    ``policy.yaml``.
 
 This avoids the need to explicitly select an availability zone and ensures the
 scheduler filters are not bypassed.

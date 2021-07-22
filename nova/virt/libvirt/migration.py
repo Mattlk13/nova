@@ -25,6 +25,7 @@ from oslo_log import log as logging
 from nova.compute import power_state
 import nova.conf
 from nova import exception
+from nova import objects
 from nova.virt import hardware
 from nova.virt.libvirt import config as vconfig
 
@@ -52,46 +53,44 @@ def graphics_listen_addrs(migrate_data):
     return listen_addrs
 
 
-def serial_listen_addr(migrate_data):
-    """Returns listen address serial from a LibvirtLiveMigrateData"""
-    listen_addr = None
-    # NOTE (markus_z/dansmith): Our own from_legacy_dict() code can return
-    # an object with nothing set here. That can happen based on the
-    # compute RPC version pin. Until we can bump that major (which we
-    # can do just before Ocata releases), we may still get a legacy
-    # dict over the wire, converted to an object, and thus is may be unset
-    # here.
-    if migrate_data.obj_attr_is_set('serial_listen_addr'):
-        # NOTE (markus_z): The value of 'serial_listen_addr' is either
-        # an IP address (as string type) or None. There's no need of a
-        # conversion, in fact, doing a string conversion of None leads to
-        # 'None', which is an invalid (string type) value here.
-        listen_addr = migrate_data.serial_listen_addr
-    return listen_addr
-
-
-# TODO(sahid): remove me for Q*
-def serial_listen_ports(migrate_data):
-    """Returns ports serial from a LibvirtLiveMigrateData"""
-    ports = []
-    if migrate_data.obj_attr_is_set('serial_listen_ports'):
-        ports = migrate_data.serial_listen_ports
-    return ports
-
-
-def get_updated_guest_xml(guest, migrate_data, get_volume_config,
-                          get_vif_config=None):
+def get_updated_guest_xml(instance, guest, migrate_data, get_volume_config,
+                          get_vif_config=None, new_resources=None):
     xml_doc = etree.fromstring(guest.get_xml_desc(dump_migratable=True))
     xml_doc = _update_graphics_xml(xml_doc, migrate_data)
     xml_doc = _update_serial_xml(xml_doc, migrate_data)
-    xml_doc = _update_volume_xml(xml_doc, migrate_data, get_volume_config)
+    xml_doc = _update_volume_xml(
+        xml_doc, migrate_data, instance, get_volume_config)
     xml_doc = _update_perf_events_xml(xml_doc, migrate_data)
     xml_doc = _update_memory_backing_xml(xml_doc, migrate_data)
     if get_vif_config is not None:
         xml_doc = _update_vif_xml(xml_doc, migrate_data, get_vif_config)
     if 'dst_numa_info' in migrate_data:
         xml_doc = _update_numa_xml(xml_doc, migrate_data)
+    if new_resources:
+        xml_doc = _update_device_resources_xml(xml_doc, new_resources)
     return etree.tostring(xml_doc, encoding='unicode')
+
+
+def _update_device_resources_xml(xml_doc, new_resources):
+    vpmems = []
+    for resource in new_resources:
+        if 'metadata' in resource:
+            res_meta = resource.metadata
+            if isinstance(res_meta, objects.LibvirtVPMEMDevice):
+                vpmems.append(res_meta)
+    # If there are other resources in the future, the xml should
+    # be updated here like vpmems
+    xml_doc = _update_vpmems_xml(xml_doc, vpmems)
+    return xml_doc
+
+
+def _update_vpmems_xml(xml_doc, vpmems):
+    memory_devices = xml_doc.findall("./devices/memory")
+    for pos, memory_dev in enumerate(memory_devices):
+        if memory_dev.get('model') == 'nvdimm':
+            devpath = memory_dev.find('./source/path')
+            devpath.text = vpmems[pos].devpath
+    return xml_doc
 
 
 def _update_numa_xml(xml_doc, migrate_data):
@@ -125,9 +124,23 @@ def _update_numa_xml(xml_doc, migrate_data):
         memory.set('nodeset', hardware.format_cpu_spec(set(all_cells)))
 
     if 'sched_vcpus' and 'sched_priority' in info:
-        vcpusched = xml_doc.find('./cputune/vcpusched')
-        vcpusched.set('vcpus', hardware.format_cpu_spec(info.sched_vcpus))
-        vcpusched.set('priority', str(info.sched_priority))
+        cputune = xml_doc.find('./cputune')
+
+        # delete the old variant(s)
+        for elem in cputune.findall('./vcpusched'):
+            elem.getparent().remove(elem)
+
+        # ...and create a new, shiny one
+        vcpusched = vconfig.LibvirtConfigGuestCPUTuneVCPUSched()
+        vcpusched.vcpus = info.sched_vcpus
+        vcpusched.priority = info.sched_priority
+        # TODO(stephenfin): Stop assuming scheduler type. We currently only
+        # create these elements for real-time instances and 'fifo' is the only
+        # scheduler policy we currently support so this is reasonably safe to
+        # assume, but it's still unnecessary
+        vcpusched.scheduler = 'fifo'
+
+        cputune.append(vcpusched.format_dom())
 
     LOG.debug('_update_numa_xml output xml=%s',
               etree.tostring(xml_doc, encoding='unicode', pretty_print=True))
@@ -151,8 +164,8 @@ def _update_graphics_xml(xml_doc, migrate_data):
 
 
 def _update_serial_xml(xml_doc, migrate_data):
-    listen_addr = serial_listen_addr(migrate_data)
-    listen_ports = serial_listen_ports(migrate_data)
+    listen_addr = migrate_data.serial_listen_addr
+    listen_ports = migrate_data.serial_listen_ports
 
     def set_listen_addr_and_port(source, listen_addr, serial_listen_ports):
         # The XML nodes can be empty, which would make checks like
@@ -180,7 +193,7 @@ def _update_serial_xml(xml_doc, migrate_data):
     return xml_doc
 
 
-def _update_volume_xml(xml_doc, migrate_data, get_volume_config):
+def _update_volume_xml(xml_doc, migrate_data, instance, get_volume_config):
     """Update XML using device information of destination host."""
     migrate_bdm_info = migrate_data.bdms
 
@@ -197,7 +210,7 @@ def _update_volume_xml(xml_doc, migrate_data, get_volume_config):
             serial_source not in bdm_info_by_serial):
             continue
         conf = get_volume_config(
-            bdm_info.connection_info, bdm_info.as_disk_info())
+            instance, bdm_info.connection_info, bdm_info.as_disk_info())
 
         if bdm_info.obj_attr_is_set('encryption_secret_uuid'):
             conf.encryption = vconfig.LibvirtConfigGuestDiskEncryption()
@@ -284,15 +297,11 @@ def _update_memory_backing_xml(xml_doc, migrate_data):
     """
     old_xml_has_memory_backing = True
     file_backed = False
-    discard = False
 
     memory_backing = xml_doc.findall('./memoryBacking')
 
     if 'dst_wants_file_backed_memory' in migrate_data:
         file_backed = migrate_data.dst_wants_file_backed_memory
-
-    if 'file_backed_memory_discard' in migrate_data:
-        discard = migrate_data.file_backed_memory_discard
 
     if not memory_backing:
         # Create memoryBacking element
@@ -314,9 +323,7 @@ def _update_memory_backing_xml(xml_doc, migrate_data):
     memory_backing.append(etree.Element("source", type="file"))
     memory_backing.append(etree.Element("access", mode="shared"))
     memory_backing.append(etree.Element("allocation", mode="immediate"))
-
-    if discard:
-        memory_backing.append(etree.Element("discard"))
+    memory_backing.append(etree.Element("discard"))
 
     if not old_xml_has_memory_backing:
         xml_doc.append(memory_backing)

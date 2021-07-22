@@ -17,129 +17,10 @@
 import inspect
 
 import fixtures
-import mock
-import six
 from webob.util import status_reasons
 
-from nova import context
 from nova import exception
-from nova import exception_wrapper
-from nova import rpc
 from nova import test
-from nova.tests.unit import fake_notifier
-
-
-def good_function(self, context):
-    return 99
-
-
-def bad_function_exception(self, context, extra, blah="a", boo="b", zoo=None):
-    raise test.TestingException('bad things happened')
-
-
-def bad_function_unknown_module(self, context):
-    """Example traceback that points to a module that getmodule() can't find.
-
-    Traceback (most recent call last):
-      File "<stdin>", line 1, in <module>
-      File "src/lxml/lxml.etree.pyx", line 2402, in
-          lxml.etree._Attrib.__setitem__ (src/lxml/lxml.etree.c:67548)
-      File "src/lxml/apihelpers.pxi", line 570, in
-          lxml.etree._setAttributeValue (src/lxml/lxml.etree.c:21551)
-      File "src/lxml/apihelpers.pxi", line 1437, in
-          lxml.etree._utf8 (src/lxml/lxml.etree.c:30194)
-    TypeError: Argument must be bytes or unicode, got 'NoneType'
-
-    """
-    from lxml import etree
-    x = etree.fromstring('<hello/>')
-    x.attrib['foo'] = None
-
-
-class WrapExceptionTestCase(test.NoDBTestCase):
-    def setUp(self):
-        super(WrapExceptionTestCase, self).setUp()
-        fake_notifier.stub_notifier(self)
-        self.addCleanup(fake_notifier.reset)
-
-    def test_wrap_exception_good_return(self):
-        wrapped = exception_wrapper.wrap_exception(rpc.get_notifier('fake'))
-        self.assertEqual(99, wrapped(good_function)(1, 2))
-        self.assertEqual(0, len(fake_notifier.NOTIFICATIONS))
-        self.assertEqual(0, len(fake_notifier.VERSIONED_NOTIFICATIONS))
-
-    def test_wrap_exception_unknown_module(self):
-        ctxt = context.get_admin_context()
-        wrapped = exception_wrapper.wrap_exception(
-            rpc.get_notifier('fake'), binary='nova-compute')
-        self.assertRaises(
-            TypeError, wrapped(bad_function_unknown_module), None, ctxt)
-        self.assertEqual(1, len(fake_notifier.VERSIONED_NOTIFICATIONS))
-        notification = fake_notifier.VERSIONED_NOTIFICATIONS[0]
-        payload = notification['payload']['nova_object.data']
-        self.assertEqual('unknown', payload['module_name'])
-
-    def test_wrap_exception_with_notifier(self):
-        wrapped = exception_wrapper.wrap_exception(rpc.get_notifier('fake'),
-                                                   binary='nova-compute')
-        ctxt = context.get_admin_context()
-        self.assertRaises(test.TestingException,
-                          wrapped(bad_function_exception), 1, ctxt, 3, zoo=3)
-
-        self.assertEqual(1, len(fake_notifier.NOTIFICATIONS))
-        notification = fake_notifier.NOTIFICATIONS[0]
-        self.assertEqual('bad_function_exception', notification.event_type)
-        self.assertEqual(ctxt, notification.context)
-        self.assertEqual(3, notification.payload['args']['extra'])
-        for key in ['exception', 'args']:
-            self.assertIn(key, notification.payload.keys())
-        self.assertNotIn('context', notification.payload['args'].keys())
-
-        self.assertEqual(1, len(fake_notifier.VERSIONED_NOTIFICATIONS))
-        notification = fake_notifier.VERSIONED_NOTIFICATIONS[0]
-        self.assertEqual('compute.exception', notification['event_type'])
-        self.assertEqual('nova-compute:fake-mini',
-                         notification['publisher_id'])
-        self.assertEqual('ERROR', notification['priority'])
-
-        payload = notification['payload']
-        self.assertEqual('ExceptionPayload', payload['nova_object.name'])
-        self.assertEqual('1.1', payload['nova_object.version'])
-
-        payload = payload['nova_object.data']
-        self.assertEqual('TestingException', payload['exception'])
-        self.assertEqual('bad things happened', payload['exception_message'])
-        self.assertEqual('bad_function_exception', payload['function_name'])
-        self.assertEqual('nova.tests.unit.test_exception',
-                         payload['module_name'])
-        self.assertIn('bad_function_exception', payload['traceback'])
-
-    @mock.patch('nova.rpc.NOTIFIER')
-    @mock.patch('nova.notifications.objects.exception.'
-                'ExceptionNotification.__init__')
-    def test_wrap_exception_notification_not_emitted_if_disabled(
-            self, mock_notification, mock_notifier):
-        mock_notifier.is_enabled.return_value = False
-
-        wrapped = exception_wrapper.wrap_exception(rpc.get_notifier('fake'),
-                                                   binary='nova-compute')
-        ctxt = context.get_admin_context()
-        self.assertRaises(test.TestingException,
-                          wrapped(bad_function_exception), 1, ctxt, 3, zoo=3)
-        self.assertFalse(mock_notification.called)
-
-    @mock.patch('nova.notifications.objects.exception.'
-                'ExceptionNotification.__init__')
-    def test_wrap_exception_notification_not_emitted_if_unversioned(
-            self, mock_notifier):
-        self.flags(notification_format='unversioned', group='notifications')
-
-        wrapped = exception_wrapper.wrap_exception(rpc.get_notifier('fake'),
-                                                   binary='nova-compute')
-        ctxt = context.get_admin_context()
-        self.assertRaises(test.TestingException,
-                          wrapped(bad_function_exception), 1, ctxt, 3, zoo=3)
-        self.assertFalse(mock_notifier.called)
 
 
 class NovaExceptionTestCase(test.NoDBTestCase):
@@ -148,11 +29,10 @@ class NovaExceptionTestCase(test.NoDBTestCase):
             msg_fmt = "default message"
 
         exc = FakeNovaException()
-        self.assertEqual('default message', six.text_type(exc))
+        self.assertEqual('default message', str(exc))
 
     def test_error_msg(self):
-        self.assertEqual('test',
-                         six.text_type(exception.NovaException('test')))
+        self.assertEqual('test', str(exception.NovaException('test')))
         self.assertEqual('test',
                          exception.NovaException(Exception('test')).message)
 
@@ -161,7 +41,7 @@ class NovaExceptionTestCase(test.NoDBTestCase):
             msg_fmt = "default message: %(code)s"
 
         exc = FakeNovaException(code=500)
-        self.assertEqual('default message: 500', six.text_type(exc))
+        self.assertEqual('default message: 500', str(exc))
         self.assertEqual('default message: 500', exc.message)
 
     def test_error_msg_exception_with_kwargs(self):
@@ -169,7 +49,7 @@ class NovaExceptionTestCase(test.NoDBTestCase):
             msg_fmt = "default message: %(misspelled_code)s"
 
         exc = FakeNovaException(code=500, misspelled_code='blah')
-        self.assertEqual('default message: blah', six.text_type(exc))
+        self.assertEqual('default message: blah', str(exc))
         self.assertEqual('default message: blah', exc.message)
 
     def test_default_error_code(self):
@@ -186,33 +66,22 @@ class NovaExceptionTestCase(test.NoDBTestCase):
         exc = FakeNovaException(code=404)
         self.assertEqual(exc.kwargs['code'], 404)
 
-    def test_cleanse_dict(self):
-        kwargs = {'foo': 1, 'blah_pass': 2, 'zoo_password': 3, '_pass': 4}
-        self.assertEqual({'foo': 1}, exception_wrapper._cleanse_dict(kwargs))
-
-        kwargs = {}
-        self.assertEqual({}, exception_wrapper._cleanse_dict(kwargs))
-
     def test_format_message_local(self):
         class FakeNovaException(exception.NovaException):
             msg_fmt = "some message"
 
         exc = FakeNovaException()
-        self.assertEqual(six.text_type(exc), exc.format_message())
+        self.assertEqual(str(exc), exc.format_message())
 
     def test_format_message_remote(self):
         class FakeNovaException_Remote(exception.NovaException):
             msg_fmt = "some message"
 
-            if six.PY2:
-                def __unicode__(self):
-                    return u"print the whole trace"
-            else:
-                def __str__(self):
-                    return "print the whole trace"
+            def __str__(self):
+                return "print the whole trace"
 
         exc = FakeNovaException_Remote()
-        self.assertEqual(u"print the whole trace", six.text_type(exc))
+        self.assertEqual(u"print the whole trace", str(exc))
         self.assertEqual("some message", exc.format_message())
 
     def test_format_message_remote_error(self):
@@ -225,9 +94,6 @@ class NovaExceptionTestCase(test.NoDBTestCase):
 
         class FakeNovaException_Remote(exception.NovaException):
             msg_fmt = "some message %(somearg)s"
-
-            def __unicode__(self):
-                return u"print the whole trace"
 
         exc = FakeNovaException_Remote(lame_arg='lame')
         self.assertEqual("some message %(somearg)s", exc.format_message())

@@ -17,7 +17,6 @@ import copy
 import mock
 from oslo_utils.fixture import uuidsentinel
 from oslo_utils import uuidutils
-import six
 import webob
 
 from nova.api.openstack import api_version_request as avr
@@ -25,11 +24,9 @@ from nova.api.openstack.compute import server_groups as sg_v21
 from nova import context
 from nova import exception
 from nova import objects
-from nova.policies import server_groups as sg_policies
 from nova import test
 from nova.tests import fixtures
 from nova.tests.unit.api.openstack import fakes
-from nova.tests.unit import policy_fixture
 
 
 class AttrDict(dict):
@@ -92,7 +89,7 @@ class ServerGroupTestV21(test.NoDBTestCase):
         self.req = fakes.HTTPRequest.blank('')
         self.admin_req = fakes.HTTPRequest.blank('', use_admin_context=True)
         self.foo_req = fakes.HTTPRequest.blank('', project_id='foo')
-        self.policy = self.useFixture(policy_fixture.RealPolicyFixture())
+        self.policy = self.useFixture(fixtures.RealPolicyFixture())
 
         self.useFixture(fixtures.Database(database='api'))
         cells = fixtures.CellDatabases()
@@ -139,7 +136,7 @@ class ServerGroupTestV21(test.NoDBTestCase):
             req, body={'server_group': sgroup})
         self.assertIn(
             "Invalid input for field/attribute server_group",
-            six.text_type(result)
+            str(result)
         )
         # 'rules' isn't an acceptable request key before 2.64
         sgroup = server_group_template(rules=rules)
@@ -148,7 +145,7 @@ class ServerGroupTestV21(test.NoDBTestCase):
             req, body={'server_group': sgroup})
         self.assertIn(
             "Invalid input for field/attribute server_group",
-            six.text_type(result)
+            str(result)
         )
 
     def test_create_server_group(self):
@@ -165,26 +162,6 @@ class ServerGroupTestV21(test.NoDBTestCase):
 
         # test as non-admin
         self.controller.create(self.req, body={'server_group': sgroup})
-
-    def test_create_server_group_rbac_admin_only(self):
-        sgroup = server_group_template()
-        sgroup['policies'] = ['affinity']
-
-        # override policy to restrict to admin
-        rule_name = sg_policies.POLICY_ROOT % 'create'
-        rules = {rule_name: 'is_admin:True'}
-        self.policy.set_rules(rules, overwrite=False)
-
-        # check for success as admin
-        self.controller.create(self.admin_req, body={'server_group': sgroup})
-
-        # check for failure as non-admin
-        exc = self.assertRaises(exception.PolicyNotAuthorized,
-                                self.controller.create, self.req,
-                                body={'server_group': sgroup})
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % rule_name,
-            exc.format_message())
 
     def _create_instance(self, ctx, cell):
         with context.target_cell(ctx, cell) as cctx:
@@ -421,25 +398,6 @@ class ServerGroupTestV21(test.NoDBTestCase):
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller.show, self.foo_req, ig_uuid)
 
-    def test_display_members_rbac_admin_only(self):
-        ctx = context.RequestContext('fake_user', fakes.FAKE_PROJECT_ID)
-        ig_uuid = self._create_groups_and_instances(ctx)[0]
-
-        # override policy to restrict to admin
-        rule_name = sg_policies.POLICY_ROOT % 'show'
-        rules = {rule_name: 'is_admin:True'}
-        self.policy.set_rules(rules, overwrite=False)
-
-        # check for success as admin
-        self.controller.show(self.admin_req, ig_uuid)
-
-        # check for failure as non-admin
-        exc = self.assertRaises(exception.PolicyNotAuthorized,
-                                self.controller.show, self.req, ig_uuid)
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % rule_name,
-            exc.format_message())
-
     def test_create_server_group_with_non_alphanumeric_in_name(self):
         # The fix for bug #1434335 expanded the allowable character set
         # for server group names to include non-alphanumeric characters
@@ -628,22 +586,6 @@ class ServerGroupTestV21(test.NoDBTestCase):
             limited='&limit=dummy&limit=1',
             path='/os-server-groups?all_projects=1')
 
-    def test_list_server_groups_rbac_admin_only(self):
-        # override policy to restrict to admin
-        rule_name = sg_policies.POLICY_ROOT % 'index'
-        rules = {rule_name: 'is_admin:True'}
-        self.policy.set_rules(rules, overwrite=False)
-
-        # check for success as admin
-        self.controller.index(self.admin_req)
-
-        # check for failure as non-admin
-        exc = self.assertRaises(exception.PolicyNotAuthorized,
-                                self.controller.index, self.req)
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % rule_name,
-            exc.format_message())
-
     @mock.patch('nova.objects.InstanceGroup.destroy')
     def test_delete_server_group_by_id(self, mock_destroy):
         sg = server_group_template(id=uuidsentinel.sg1_id)
@@ -680,26 +622,6 @@ class ServerGroupTestV21(test.NoDBTestCase):
         # test as non-admin
         ig_uuid = self._create_groups_and_instances(ctx)[0]
         self.controller.delete(self.req, ig_uuid)
-
-    def test_delete_server_group_rbac_admin_only(self):
-        ctx = context.RequestContext('fake_user', fakes.FAKE_PROJECT_ID)
-
-        # override policy to restrict to admin
-        rule_name = sg_policies.POLICY_ROOT % 'delete'
-        rules = {rule_name: 'is_admin:True'}
-        self.policy.set_rules(rules, overwrite=False)
-
-        # check for success as admin
-        ig_uuid = self._create_groups_and_instances(ctx)[0]
-        self.controller.delete(self.admin_req, ig_uuid)
-
-        # check for failure as non-admin
-        ig_uuid = self._create_groups_and_instances(ctx)[0]
-        exc = self.assertRaises(exception.PolicyNotAuthorized,
-                                self.controller.delete, self.req, ig_uuid)
-        self.assertEqual(
-            "Policy doesn't allow %s to be performed." % rule_name,
-            exc.format_message())
 
 
 class ServerGroupTestV213(ServerGroupTestV21):
@@ -772,8 +694,7 @@ class ServerGroupTestV264(ServerGroupTestV213):
                                        rules={'max_server_per_host': 3})
         result = self.assertRaises(webob.exc.HTTPBadRequest,
             self.controller.create, req, body={'server_group': sgroup})
-        self.assertIn("Only anti-affinity policy supports rules",
-                      six.text_type(result))
+        self.assertIn("Only anti-affinity policy supports rules", str(result))
 
     def test_create_anti_affinity_server_group_with_invalid_rules(self):
         req = fakes.HTTPRequest.blank('', version=self.wsgi_api_version)
@@ -789,7 +710,7 @@ class ServerGroupTestV264(ServerGroupTestV213):
                 self.validation_error, self.controller.create,
                 req, body={'server_group': sgroup})
             self.assertIn(
-                "Invalid input for field/attribute", six.text_type(result)
+                "Invalid input for field/attribute", str(result)
             )
 
     @mock.patch('nova.objects.service.get_minimum_version_all_cells',
@@ -804,7 +725,7 @@ class ServerGroupTestV264(ServerGroupTestV213):
             self.controller.create, req, body={'server_group': sgroup})
         self.assertIn("Creating an anti-affinity group with rule "
                       "max_server_per_host > 1 is not yet supported.",
-                      six.text_type(result))
+                      str(result))
 
     def test_create_server_group(self):
         policies = ['affinity', 'anti-affinity']

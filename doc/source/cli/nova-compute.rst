@@ -2,21 +2,14 @@
 nova-compute
 ============
 
--------------------
-Nova Compute Server
--------------------
-
-:Author: openstack@lists.openstack.org
-:Copyright: OpenStack Foundation
-:Manual section: 1
-:Manual group: cloud computing
+.. program:: nova-compute
 
 Synopsis
 ========
 
 ::
 
-  nova-compute [options]
+  nova-compute [<options>...]
 
 Description
 ===========
@@ -29,20 +22,34 @@ instance's state, attaching persistent storage, and terminating the instance.
 Options
 =======
 
-**General options**
+.. rubric:: General options
+
+.. include:: opts/common.rst
+
+.. rubric:: Debugger options
+
+.. include:: opts/debugger.rst
 
 Files
 =====
 
+.. todo: We shouldn't have policy configuration in this non-API service, but
+   bug #1675486 means we do have one
+
 * ``/etc/nova/nova.conf``
-* ``/etc/nova/policy.json``
+* ``/etc/nova/policy.yaml``
+* ``/etc/nova/policy.d/``
 * ``/etc/nova/rootwrap.conf``
 * ``/etc/nova/rootwrap.d/``
 
 See Also
 ========
 
-* :nova-doc:`OpenStack Nova <>`
+:doc:`nova-conductor(1) <nova-conductor>`,
+:doc:`nova-manage(1) <nova-manage>`,
+:doc:`nova-rootwrap(1) <nova-rootwrap>`,
+:doc:`nova-scheduler(1) <nova-scheduler>`,
+:doc:`nova-status(1) <nova-status>`
 
 Bugs
 ====

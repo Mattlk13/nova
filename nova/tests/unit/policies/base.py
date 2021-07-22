@@ -9,6 +9,7 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+
 import copy
 
 from oslo_log import log as logging
@@ -17,7 +18,7 @@ from oslo_utils.fixture import uuidsentinel as uuids
 from nova import context as nova_context
 from nova import exception
 from nova import test
-from nova.tests.unit import policy_fixture
+from nova.tests import fixtures
 
 
 LOG = logging.getLogger(__name__)
@@ -40,7 +41,7 @@ class BasePolicyTest(test.TestCase):
 
     def setUp(self):
         super(BasePolicyTest, self).setUp()
-        self.policy = self.useFixture(policy_fixture.RealPolicyFixture())
+        self.policy = self.useFixture(fixtures.RealPolicyFixture())
 
         self.admin_project_id = uuids.admin_project_id
         self.project_id = uuids.project_id
@@ -88,13 +89,18 @@ class BasePolicyTest(test.TestCase):
                 project_id=self.project_id_other,
                 roles=['member', 'reader'])
 
+        self.other_project_reader_context = nova_context.RequestContext(
+                user_id="other_project_member",
+                project_id=self.project_id_other,
+                roles=['reader'])
+
         self.all_contexts = [
             self.legacy_admin_context, self.system_admin_context,
             self.system_member_context, self.system_reader_context,
             self.system_foo_context,
             self.project_admin_context, self.project_member_context,
             self.project_reader_context, self.other_project_member_context,
-            self.project_foo_context,
+            self.project_foo_context, self.other_project_reader_context
         ]
 
         if self.without_deprecated_rules:
@@ -109,6 +115,8 @@ class BasePolicyTest(test.TestCase):
                     "role:admin and system_scope:all",
                 "system_reader_api":
                     "role:reader and system_scope:all",
+                "project_member_api":
+                    "role:member and project_id:%(project_id)s",
             })
             self.policy.set_rules(self.rules_without_deprecation,
                                   overwrite=False)
@@ -128,8 +136,8 @@ class BasePolicyTest(test.TestCase):
         self.assertEqual(len(self.all_contexts),
                          len(authorized_contexts) + len(
                              unauthorized_contexts),
-                         "Few context are missing. check all contexts "
-                         "mentioned in self.all_contexts are tested")
+                        "Expected testing context are mismatch. check all "
+                        "contexts mentioned in self.all_contexts are tested")
 
         def ensure_return(req, *args, **kwargs):
             return func(req, *arg, **kwargs)
@@ -137,9 +145,15 @@ class BasePolicyTest(test.TestCase):
         def ensure_raises(req, *args, **kwargs):
             exc = self.assertRaises(
                 exception.PolicyNotAuthorized, func, req, *arg, **kwarg)
-            self.assertEqual(
-                "Policy doesn't allow %s to be performed." %
-                rule_name, exc.format_message())
+            # NOTE(gmann): In case of multi-policy APIs, PolicyNotAuthorized
+            # exception can be raised from either of the policy so checking
+            # the error message, which includes the rule name, can mismatch.
+            # Tests verifying the multi policy can pass rule_name as None
+            # to skip the error message assert.
+            if rule_name is not None:
+                self.assertEqual(
+                    "Policy doesn't allow %s to be performed." %
+                    rule_name, exc.format_message())
         # Verify all the context having allowed scope and roles pass
         # the policy check.
         for context in authorized_contexts:
@@ -161,8 +175,26 @@ class BasePolicyTest(test.TestCase):
             args1 = copy.deepcopy(arg)
             kwargs1 = copy.deepcopy(kwarg)
             if not fatal:
-                unauthorize_response.append(
-                    ensure_return(req, *args1, **kwargs1))
+                try:
+                    unauthorize_response.append(
+                        ensure_return(req, *args1, **kwargs1))
+                    # NOTE(gmann): We need to ignore the PolicyNotAuthorized
+                    # exception here so that we can add the correct response
+                    # in unauthorize_response for the case of fatal=False.
+                    # This handle the case of multi policy checks where tests
+                    # are verifying the second policy via the response of
+                    # fatal-False and ignoring the response checks where the
+                    # first policy itself fail to pass (even test override the
+                    # first policy to allow for everyone but still, scope
+                    # checks can leads to PolicyNotAuthorized error).
+                    # For example: flavor extra specs policy for GET flavor
+                    # API. In that case, flavor extra spec policy is checked
+                    # after the GET flavor policy. So any context failing on
+                    # GET flavor will raise the  PolicyNotAuthorized and for
+                    # that case we do not have any way to verify the flavor
+                    # extra specs so skip that context to check in test.
+                except exception.PolicyNotAuthorized:
+                    continue
             else:
                 ensure_raises(req, *args1, **kwargs1)
 

@@ -13,7 +13,6 @@
 # under the License.
 
 import datetime
-import six
 
 from nova import exception
 from nova import objects
@@ -350,6 +349,22 @@ class TestImageMetaProps(test.NoDBTestCase):
             self.assertRaises(exception.ObjectActionError,
                               obj.obj_to_primitive, '1.0')
 
+    def test_obj_make_compatible_input_bus(self):
+        """Check 'hw_input_bus' compatibility."""
+        # assert that 'hw_input_bus' is supported on a suitably new version
+        obj = objects.ImageMetaProps(
+            hw_input_bus=objects.fields.InputBus.VIRTIO,
+        )
+        primitive = obj.obj_to_primitive('1.29')
+        self.assertIn('hw_input_bus', primitive['nova_object.data'])
+        self.assertEqual(
+            objects.fields.InputBus.VIRTIO,
+            primitive['nova_object.data']['hw_input_bus'])
+
+        # and is absent on older versions
+        primitive = obj.obj_to_primitive('1.28')
+        self.assertNotIn('hw_input_bus', primitive['nova_object.data'])
+
     def test_obj_make_compatible_video_model(self):
         # assert that older video models are preserved.
         obj = objects.ImageMetaProps(
@@ -373,7 +388,7 @@ class TestImageMetaProps(test.NoDBTestCase):
             obj = objects.ImageMetaProps(hw_video_model=model)
             ex = self.assertRaises(exception.ObjectActionError,
                                    obj.obj_to_primitive, '1.21')
-            self.assertIn('hw_video_model', six.text_type(ex))
+            self.assertIn('hw_video_model', str(ex))
 
     def test_obj_make_compatible_watchdog_action_not_disabled(self):
         """Tests that we don't pop the hw_watchdog_action if the value is not
@@ -411,3 +426,22 @@ class TestImageMetaProps(test.NoDBTestCase):
         old_primitive = obj.obj_to_primitive('1.22')
         self.assertIn('hw_pmu', primitive['nova_object.data'])
         self.assertNotIn('hw_pmu', old_primitive['nova_object.data'])
+
+    def test_obj_make_compatible_vtpm(self):
+        """Test that checks if we pop hw_tpm_model and hw_tpm_version."""
+        obj = objects.ImageMetaProps(
+            hw_tpm_model='tpm-tis', hw_tpm_version='1.2',
+        )
+        primitive = obj.obj_to_primitive()
+        self.assertIn('hw_tpm_model', primitive['nova_object.data'])
+        self.assertIn('hw_tpm_version', primitive['nova_object.data'])
+
+        primitive = obj.obj_to_primitive('1.26')
+        self.assertNotIn('hw_tpm_model', primitive['nova_object.data'])
+        self.assertNotIn('hw_tpm_version', primitive['nova_object.data'])
+
+    def test_obj_make_compatible_socket_policy(self):
+        obj = objects.ImageMetaProps(
+            hw_pci_numa_affinity_policy=fields.PCINUMAAffinityPolicy.SOCKET)
+        self.assertRaises(exception.ObjectActionError,
+                          obj.obj_to_primitive, '1.27')

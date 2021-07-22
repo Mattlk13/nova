@@ -12,7 +12,6 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-from __future__ import absolute_import
 
 import collections
 import copy
@@ -22,6 +21,7 @@ import zlib
 
 from keystoneauth1 import adapter
 import mock
+from neutronclient.common import exceptions as neutron_exception
 import os_resource_classes as orc
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -30,28 +30,27 @@ from oslo_serialization import jsonutils
 from oslo_utils import fixture as osloutils_fixture
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
-import six
 
 from nova.compute import api as compute_api
 from nova.compute import instance_actions
 from nova.compute import manager as compute_manager
+from nova.compute import rpcapi as compute_rpcapi
 from nova import context
 from nova import exception
 from nova.network import constants
 from nova.network import neutron as neutronapi
 from nova import objects
 from nova.objects import block_device as block_device_obj
+from nova.policies import base as base_policies
+from nova.policies import servers as servers_policies
 from nova.scheduler import utils
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional.api import client
 from nova.tests.functional import integrated_helpers
 from nova.tests.unit.api.openstack import fakes
-from nova.tests.unit import cast_as_call
 from nova.tests.unit import fake_block_device
-from nova.tests.unit import fake_notifier
 from nova.tests.unit import fake_requests
-from nova.tests.unit.image import fake as fake_image
 from nova.tests.unit.objects import test_instance_info_cache
 from nova import utils as nova_utils
 from nova.virt import fake
@@ -62,31 +61,8 @@ CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 
 
-class ServersTestBase(integrated_helpers._IntegratedTestBase):
+class ServersTest(integrated_helpers._IntegratedTestBase):
     api_major_version = 'v2'
-    _force_delete_parameter = 'forceDelete'
-    _image_ref_parameter = 'imageRef'
-    _flavor_ref_parameter = 'flavorRef'
-    _access_ipv4_parameter = 'accessIPv4'
-    _access_ipv6_parameter = 'accessIPv6'
-    _return_resv_id_parameter = 'return_reservation_id'
-    _min_count_parameter = 'min_count'
-
-    def setUp(self):
-        self.computes = {}
-        super(ServersTestBase, self).setUp()
-
-    def _get_access_ips_params(self):
-        return {self._access_ipv4_parameter: "172.19.0.2",
-                self._access_ipv6_parameter: "fe80::2"}
-
-    def _verify_access_ips(self, server):
-        self.assertEqual('172.19.0.2',
-                         server[self._access_ipv4_parameter])
-        self.assertEqual('fe80::2', server[self._access_ipv6_parameter])
-
-
-class ServersTest(ServersTestBase):
 
     def test_get_servers(self):
         # Simple check that listing servers works.
@@ -100,23 +76,6 @@ class ServersTest(ServersTestBase):
         return {
             node.hypervisor_hostname: int(node.stats.get('failed_builds', 0))
             for node in computes}
-
-    def _run_periodics(self):
-        """Run the update_available_resource task on every compute manager
-
-        This runs periodics on the computes in an undefined order; some child
-        class redefined this function to force a specific order.
-        """
-
-        if self.compute.host not in self.computes:
-            self.computes[self.compute.host] = self.compute
-
-        ctx = context.get_admin_context()
-        for compute in self.computes.values():
-            LOG.info('Running periodic for compute (%s)',
-                compute.manager.host)
-            compute.manager.update_available_resource(ctx)
-        LOG.info('Finished with periodics')
 
     def test_create_server_with_error(self):
         # Create a server which will enter error state.
@@ -142,8 +101,18 @@ class ServersTest(ServersTestBase):
         # We should have no (persisted) build failures until we update
         # resources, after which we should have one
         self.assertEqual([0], list(self._get_node_build_failures().values()))
-        self._run_periodics()
-        self.assertEqual([1], list(self._get_node_build_failures().values()))
+
+        # BuildAbortException will not trigger a reschedule and the build
+        # failure update is the last step in the compute manager after
+        # instance state setting, fault recording and notification sending. So
+        # we have no other way than simply wait to ensure the node build
+        # failure counter updated before we assert it.
+        def failed_counter_updated():
+            self._run_periodics()
+            self.assertEqual(
+                [1], list(self._get_node_build_failures().values()))
+
+        self._wait_for_assert(failed_counter_updated)
 
     def test_create_server_with_image_type_filter(self):
         self.flags(query_placement_for_image_type_support=True,
@@ -169,8 +138,7 @@ class ServersTest(ServersTestBase):
     def _test_create_server_with_error_with_retries(self):
         # Create a server which will enter error state.
 
-        self.compute2 = self.start_service('compute', host='host2')
-        self.computes['compute2'] = self.compute2
+        self._start_compute('host2')
 
         fails = []
 
@@ -206,9 +174,18 @@ class ServersTest(ServersTestBase):
         self.flags(max_attempts=1, group='scheduler')
         fails = self._test_create_server_with_error_with_retries()
         self.assertEqual(1, fails)
-        self._run_periodics()
-        self.assertEqual(
-            [0, 1], list(sorted(self._get_node_build_failures().values())))
+
+        # The build failure update is the last step in build_and_run_instance
+        # in the compute manager after instance state setting, fault
+        # recording and notification sending. So we have no other way than
+        # simply wait to ensure the node build failure counter updated
+        # before we assert it.
+        def failed_counter_updated():
+            self._run_periodics()
+            self.assertEqual(
+                [0, 1], list(sorted(self._get_node_build_failures().values())))
+
+        self._wait_for_assert(failed_counter_updated)
 
     def test_create_and_delete_server(self):
         # Creates and deletes a server.
@@ -226,22 +203,20 @@ class ServersTest(ServersTestBase):
                           self.api.post_server, post)
 
         # With an invalid imageRef, this throws 500.
-        server[self._image_ref_parameter] = uuids.fake
+        server['imageRef'] = uuids.fake
         # TODO(justinsb): Check whatever the spec says should be thrown here
         self.assertRaises(client.OpenStackApiException,
                           self.api.post_server, post)
 
         # Add a valid imageRef
-        server[self._image_ref_parameter] = good_server.get(
-            self._image_ref_parameter)
+        server['imageRef'] = good_server.get('imageRef')
 
         # Without flavorRef, this throws 500
         # TODO(justinsb): Check whatever the spec says should be thrown here
         self.assertRaises(client.OpenStackApiException,
                           self.api.post_server, post)
 
-        server[self._flavor_ref_parameter] = good_server.get(
-            self._flavor_ref_parameter)
+        server['flavorRef'] = good_server.get('flavorRef')
 
         # Without a name, this throws 500
         # TODO(justinsb): Check whatever the spec says should be thrown here
@@ -369,14 +344,7 @@ class ServersTest(ServersTestBase):
                                                     'SOFT_DELETED')
 
         # Create a second server
-        server = self._build_server()
-
-        created_server2 = self.api.post_server({'server': server})
-        LOG.debug("created_server: %s", created_server2)
-        self.assertTrue(created_server2['id'])
-
-        # Wait for it to finish being created
-        self._wait_for_state_change(created_server2, 'ACTIVE')
+        self._create_server()
 
         # Try to restore the first server, it should fail
         ex = self.assertRaises(client.OpenStackApiException,
@@ -408,8 +376,7 @@ class ServersTest(ServersTestBase):
                                                    'SOFT_DELETED')
 
         # Force delete server
-        self.api.post_server_action(created_server_id,
-                                    {self._force_delete_parameter: {}})
+        self.api.post_server_action(created_server_id, {'forceDelete': {}})
 
         # Wait for real deletion
         self._wait_until_deleted(found_server)
@@ -517,13 +484,16 @@ class ServersTest(ServersTestBase):
         # rebuild the server with metadata and other server attributes
         post = {}
         post['rebuild'] = {
-            self._image_ref_parameter: "76fa36fc-c930-4bf3-8c8a-ea2a2420deb6",
-            "name": "blah",
-            self._access_ipv4_parameter: "172.19.0.2",
-            self._access_ipv6_parameter: "fe80::2",
-            "metadata": {'some': 'thing'},
+            'imageRef': '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6',
+            'name': 'blah',
+            'accessIPv4': '172.19.0.2',
+            'accessIPv6': 'fe80::2',
+            'metadata': {'some': 'thing'},
         }
-        post['rebuild'].update(self._get_access_ips_params())
+        post['rebuild'].update({
+            'accessIPv4': '172.19.0.2',
+            'accessIPv6': 'fe80::2',
+        })
 
         self.api.post_server_action(created_server_id, post)
         LOG.debug("rebuilt server: %s", created_server)
@@ -533,14 +503,15 @@ class ServersTest(ServersTestBase):
         self.assertEqual(created_server_id, found_server['id'])
         self.assertEqual({'some': 'thing'}, found_server.get('metadata'))
         self.assertEqual('blah', found_server.get('name'))
-        self.assertEqual(post['rebuild'][self._image_ref_parameter],
+        self.assertEqual(post['rebuild']['imageRef'],
                          found_server.get('image')['id'])
-        self._verify_access_ips(found_server)
+        self.assertEqual('172.19.0.2', found_server['accessIPv4'])
+        self.assertEqual('fe80::2', found_server['accessIPv6'])
 
         # rebuild the server with empty metadata and nothing else
         post = {}
         post['rebuild'] = {
-            self._image_ref_parameter: "76fa36fc-c930-4bf3-8c8a-ea2a2420deb6",
+            'imageRef': "76fa36fc-c930-4bf3-8c8a-ea2a2420deb6",
             "metadata": {},
         }
 
@@ -552,9 +523,10 @@ class ServersTest(ServersTestBase):
         self.assertEqual(created_server_id, found_server['id'])
         self.assertEqual({}, found_server.get('metadata'))
         self.assertEqual('blah', found_server.get('name'))
-        self.assertEqual(post['rebuild'][self._image_ref_parameter],
+        self.assertEqual(post['rebuild']['imageRef'],
                          found_server.get('image')['id'])
-        self._verify_access_ips(found_server)
+        self.assertEqual('172.19.0.2', found_server['accessIPv4'])
+        self.assertEqual('fe80::2', found_server['accessIPv6'])
 
         # Cleanup
         self._delete_server(found_server)
@@ -585,8 +557,8 @@ class ServersTest(ServersTestBase):
         # Create 2 servers, setting 'return_reservation_id, which should
         # return a reservation_id
         server = self._build_server()
-        server[self._min_count_parameter] = 2
-        server[self._return_resv_id_parameter] = True
+        server['min_count'] = 2
+        server['return_reservation_id'] = True
         post = {'server': server}
         response = self.api.post_server(post)
         self.assertIn('reservation_id', response)
@@ -788,8 +760,6 @@ class ServersTest(ServersTestBase):
         self.assertEqual(403, ex.response.status_code)
 
     def test_attach_vol_maximum_disk_devices_exceeded(self):
-        self.useFixture(nova_fixtures.CinderFixture(self))
-
         server = self._build_server()
         created_server = self.api.post_server({"server": server})
         server_id = created_server['id']
@@ -810,14 +780,14 @@ class ServersTest(ServersTestBase):
             expected = ('The maximum allowed number of disk devices (26) to '
                         'attach to a single instance has been exceeded.')
             self.assertEqual(403, ex.response.status_code)
-            self.assertIn(expected, six.text_type(ex))
+            self.assertIn(expected, str(ex))
 
 
 class ServersTestV21(ServersTest):
     api_major_version = 'v2.1'
 
 
-class ServersTestV219(ServersTestBase):
+class ServersTestV219(integrated_helpers._IntegratedTestBase):
     api_major_version = 'v2.1'
 
     def _create_server(self, set_desc = True, desc = None):
@@ -839,13 +809,16 @@ class ServersTestV219(ServersTestBase):
         new_name = integrated_helpers.generate_random_alphanumeric(8)
         post = {}
         post['rebuild'] = {
-            "name": new_name,
-            self._image_ref_parameter: "76fa36fc-c930-4bf3-8c8a-ea2a2420deb6",
-            self._access_ipv4_parameter: "172.19.0.2",
-            self._access_ipv6_parameter: "fe80::2",
-            "metadata": {'some': 'thing'},
+            'name': new_name,
+            'imageRef': '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6',
+            'accessIPv4': '172.19.0.2',
+            'accessIPv6': 'fe80::2',
+            'metadata': {'some': 'thing'},
         }
-        post['rebuild'].update(self._get_access_ips_params())
+        post['rebuild'].update({
+            'accessIPv4': '172.19.0.2',
+            'accessIPv6': 'fe80::2',
+        })
         if set_desc:
             post['rebuild']['description'] = desc
         self.api.api_post('/servers/%s/action' % server_id, post)
@@ -1022,7 +995,7 @@ class ServersTestV219(ServersTestBase):
         self._rebuild_assertRaisesRegex(server_id, 'x' * 256)
 
 
-class ServerTestV220(ServersTestBase):
+class ServerTestV220(integrated_helpers._IntegratedTestBase):
     api_major_version = 'v2.1'
 
     def setUp(self):
@@ -1060,7 +1033,7 @@ class ServerTestV220(ServersTestBase):
         # Test attach volume
         self.stub_out('nova.volume.cinder.API.get', fakes.stub_volume_get)
         with test.nested(mock.patch.object(compute_api.API,
-                            '_check_volume_already_attached_to_instance'),
+                            '_check_volume_already_attached'),
                          mock.patch.object(volume.cinder.API,
                                         'check_availability_zone'),
                          mock.patch.object(volume.cinder.API,
@@ -1097,7 +1070,7 @@ class ServerTestV220(ServersTestBase):
         self._delete_server(found_server)
 
 
-class ServerTestV269(ServersTestBase):
+class ServerTestV269(integrated_helpers._IntegratedTestBase):
     api_major_version = 'v2.1'
     NUMBER_OF_CELLS = 3
 
@@ -1235,7 +1208,7 @@ class ServerTestV269(ServersTestBase):
                                 self.api.get_servers,
                                 search_opts={'limit': 5})
         self.assertEqual(500, exp.response.status_code)
-        self.assertIn('NovaException', six.text_type(exp))
+        self.assertIn('NovaException', str(exp))
 
     def test_get_servers_detail_marker_in_down_cells(self):
         marker = self.down_cell_insts[2]
@@ -1244,7 +1217,7 @@ class ServerTestV269(ServersTestBase):
                                 self.api.get_servers,
                                 search_opts={'marker': marker})
         self.assertEqual(500, exp.response.status_code)
-        self.assertIn('oslo_db.exception.DBError', six.text_type(exp))
+        self.assertIn('oslo_db.exception.DBError', str(exp))
 
     def test_get_servers_detail_marker_sorting(self):
         marker = self.up_cell_insts[1]
@@ -1331,13 +1304,12 @@ class ServerRebuildTestCase(integrated_helpers._IntegratedTestBase):
 
     def _disable_compute_for(self, server):
         # Refresh to get its host
-        server = self.api.get_server(server['id'])
+        server = self.admin_api.get_server(server['id'])
         host = server['OS-EXT-SRV-ATTR:host']
 
         # Disable the service it is on
-        self.api_fixture.admin_api.put_service('disable',
-                                               {'host': host,
-                                                'binary': 'nova-compute'})
+        self.admin_api.put_service(
+            'disable', {'host': host, 'binary': 'nova-compute'})
 
     def test_rebuild_with_image_novalidhost(self):
         """Creates a server with an image that is valid for the single compute
@@ -1372,7 +1344,7 @@ class ServerRebuildTestCase(integrated_helpers._IntegratedTestBase):
         # Now update the image metadata to be something that won't work with
         # the fake compute driver we're using since the fake driver has an
         # "x86_64" architecture.
-        rebuild_image_ref = fake_image.AUTO_DISK_CONFIG_ENABLED_IMAGE_UUID
+        rebuild_image_ref = self.glance.auto_disk_config_enabled_image['id']
         self.api.put_image_meta_key(
             rebuild_image_ref, 'hw_architecture', 'unicore32')
         # Now rebuild the server with that updated image and it should result
@@ -1382,7 +1354,7 @@ class ServerRebuildTestCase(integrated_helpers._IntegratedTestBase):
                 'imageRef': rebuild_image_ref
             }
         }
-        # Since we're using the CastAsCall fixture, the NoValidHost error
+        # Since we're using CastAsCallFixture, the NoValidHost error
         # should actually come back to the API and result in a 500 error.
         # Normally the user would get a 202 response because nova-api RPC casts
         # to nova-conductor which RPC calls the scheduler which raises the
@@ -1402,13 +1374,13 @@ class ServerRebuildTestCase(integrated_helpers._IntegratedTestBase):
         self.assertIn('No valid host', server['fault']['message'])
 
         # Rebuild it again with the same bad image to make sure it's rejected
-        # again. Since we're using CastAsCall here, there is no 202 from the
-        # API, and the exception from conductor gets passed back through the
-        # API.
+        # again. Since we're using CastAsCallFixture here, there is no 202 from
+        # the API, and the exception from conductor gets passed back through
+        # the API.
         ex = self.assertRaises(
             client.OpenStackApiException, self.api.api_post,
             '/servers/%s/action' % server['id'], rebuild_req_body)
-        self.assertIn('NoValidHost', six.text_type(ex))
+        self.assertIn('NoValidHost', str(ex))
 
     # A rebuild to the same host should never attempt a rebuild claim.
     @mock.patch('nova.compute.resource_tracker.ResourceTracker.rebuild_claim',
@@ -1430,19 +1402,19 @@ class ServerRebuildTestCase(integrated_helpers._IntegratedTestBase):
             return resp['hypervisors'][0]['id']
 
         def _get_provider_usages(provider_uuid):
-            return self.placement_api.get(
+            return self.placement.get(
                 '/resource_providers/%s/usages' % provider_uuid).body['usages']
 
         def _get_allocations_by_server_uuid(server_uuid):
-            return self.placement_api.get(
+            return self.placement.get(
                 '/allocations/%s' % server_uuid).body['allocations']
 
         def _set_provider_inventory(rp_uuid, resource_class, inventory):
             # Get the resource provider generation for the inventory update.
-            rp = self.placement_api.get(
+            rp = self.placement.get(
                 '/resource_providers/%s' % rp_uuid).body
             inventory['resource_provider_generation'] = rp['generation']
-            return self.placement_api.put(
+            return self.placement.put(
                 '/resource_providers/%s/inventories/%s' %
                 (rp_uuid, resource_class), inventory).body
 
@@ -1485,7 +1457,7 @@ class ServerRebuildTestCase(integrated_helpers._IntegratedTestBase):
         allocs = allocs[rp_uuid]['resources']
         assertFlavorMatchesAllocation(flavor, allocs)
 
-        rebuild_image_ref = fake_image.AUTO_DISK_CONFIG_ENABLED_IMAGE_UUID
+        rebuild_image_ref = self.glance.auto_disk_config_enabled_image['id']
         # Now rebuild the server with a different image.
         rebuild_req_body = {
             'rebuild': {
@@ -1511,7 +1483,6 @@ class ServerRebuildTestCase(integrated_helpers._IntegratedTestBase):
         different image than what is in the root disk of the root volume
         will result in a 400 BadRequest error.
         """
-        self.useFixture(nova_fixtures.CinderFixture(self))
         # First create our server as normal.
         server_req_body = {
             # There is no imageRef because this is boot from volume.
@@ -1538,7 +1509,7 @@ class ServerRebuildTestCase(integrated_helpers._IntegratedTestBase):
 
         # Now rebuild the server with a different image than was used to create
         # our fake volume.
-        rebuild_image_ref = fake_image.AUTO_DISK_CONFIG_ENABLED_IMAGE_UUID
+        rebuild_image_ref = self.glance.auto_disk_config_enabled_image['id']
         rebuild_req_body = {
             'rebuild': {
                 'imageRef': rebuild_image_ref
@@ -1549,10 +1520,10 @@ class ServerRebuildTestCase(integrated_helpers._IntegratedTestBase):
         # Assert that we failed because of the image change and not something
         # else.
         self.assertIn('Unable to rebuild with a different image for a '
-                      'volume-backed server', six.text_type(resp))
+                      'volume-backed server', str(resp))
 
 
-class ServersTestV280(ServersTestBase):
+class ServersTestV280(integrated_helpers._IntegratedTestBase):
     api_major_version = 'v2.1'
 
     def setUp(self):
@@ -1658,8 +1629,6 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
 
     def setUp(self):
         super(ServerMovingTests, self).setUp()
-        fake_notifier.stub_notifier(self)
-        self.addCleanup(fake_notifier.reset)
 
         self.compute1 = self._start_compute(host='host1')
         self.compute2 = self._start_compute(host='host2')
@@ -1930,10 +1899,16 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
 
         self.api.post_server_action(
             server['id'], resize_req, check_response_status=[202])
-        self._assert_resize_migrate_action_fail(
+        event = self._assert_resize_migrate_action_fail(
             server, instance_actions.RESIZE, 'NoValidHost')
+        self.assertIn('details', event)
+        # This test case works in microversion 2.84.
+        self.assertIn('No valid host was found', event['details'])
         server = self.admin_api.get_server(server['id'])
         self.assertEqual(source_hostname, server['OS-EXT-SRV-ATTR:host'])
+        # The server is still ACTIVE and thus there is no fault message.
+        self.assertEqual('ACTIVE', server['status'])
+        self.assertNotIn('fault', server)
 
         # only the source host shall have usages after the failed resize
         self.assertFlavorMatchesUsage(source_rp_uuid, self.flavor1)
@@ -2031,19 +2006,6 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
         self.assert_hypervisor_usage(
             dest_rp_uuid, self.flavor2, volume_backed=False)
 
-    def _wait_for_notification_event_type(self, event_type, max_retries=50):
-        retry_counter = 0
-        while True:
-            if len(fake_notifier.NOTIFICATIONS) > 0:
-                for notification in fake_notifier.NOTIFICATIONS:
-                    if notification.event_type == event_type:
-                        return
-            if retry_counter == max_retries:
-                self.fail('Wait for notification event type (%s) failed'
-                          % event_type)
-            retry_counter += 1
-            time.sleep(0.1)
-
     def test_evacuate_with_no_compute(self):
         source_hostname = self.compute1.host
         dest_hostname = self.compute2.host
@@ -2065,28 +2027,16 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
         self.admin_api.put_service(
             source_compute_id, {'forced_down': 'true'})
 
-        # Initialize fake_notifier
-        fake_notifier.stub_notifier(self)
-        fake_notifier.reset()
-
         # Initiate evacuation
-        post = {'evacuate': {}}
-        self.api.post_server_action(server['id'], post)
-
-        # NOTE(elod.illes): Should be changed to non-polling solution when
-        # patch https://review.opendev.org/#/c/482629/ gets merged:
-        # fake_notifier.wait_for_versioned_notifications(
-        #     'compute_task.rebuild_server')
-        self._wait_for_notification_event_type('compute_task.rebuild_server')
-
-        self._run_periodics()
-
         # There is no other host to evacuate to so the rebuild should put the
         # VM to ERROR state, but it should remain on source compute
-        expected_params = {'OS-EXT-SRV-ATTR:host': source_hostname,
-                           'status': 'ERROR'}
-        server = self._wait_for_server_parameter(server,
-                                                 expected_params)
+        server = self._evacuate_server(
+            server, expected_state='ERROR', expected_host=source_hostname,
+            expected_migration_status='error')
+
+        self.notifier.wait_for_versioned_notifications(
+            'compute_task.rebuild_server.error')
+        self._run_periodics()
 
         # Check migrations
         migrations = self.api.get_migrations()
@@ -2165,13 +2115,7 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
             source_compute_id, {'forced_down': 'true'})
 
         # evacuate the server
-        post = {'evacuate': {}}
-        self.api.post_server_action(
-            server['id'], post)
-        expected_params = {'OS-EXT-SRV-ATTR:host': dest_hostname,
-                           'status': 'ACTIVE'}
-        server = self._wait_for_server_parameter(server,
-                                                 expected_params)
+        server = self._evacuate_server(server, expected_host=dest_hostname)
 
         # Expect to have allocation and usages on both computes as the
         # source compute is still down
@@ -2314,7 +2258,7 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
         ex = self.assertRaises(client.OpenStackApiException,
                                self.api.post_server_action,
                                server['id'], post)
-        self.assertIn("'force' was unexpected", six.text_type(ex))
+        self.assertIn("'force' was unexpected", str(ex))
 
     # NOTE(gibi): there is a similar test in SchedulerOnlyChecksTargetTest but
     # we want this test here as well because ServerMovingTest is a parent class
@@ -2423,11 +2367,11 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
 
         with mock.patch('nova.compute.claims.MoveClaim', fake_move_claim):
             # evacuate the server
-            self.api.post_server_action(server['id'], {'evacuate': {}})
             # the migration will fail on the dest node and the instance will
             # stay ACTIVE and task_state will be set to None.
-            server = self._wait_for_server_parameter(
-                server, {'status': 'ACTIVE', 'OS-EXT-STS:task_state': None})
+            server = self._evacuate_server(
+                server, expected_task_state=None,
+                expected_migration_status='failed')
 
         # Run the periodics to show those don't modify allocations.
         self._run_periodics()
@@ -2499,10 +2443,11 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
         with mock.patch.object(
                 self.compute2.driver, 'rebuild', fake_rebuild):
             # evacuate the server
-            self.api.post_server_action(server['id'], {'evacuate': {}})
             # the migration will fail on the dest node and the instance will
             # go into error state
-            server = self._wait_for_state_change(server, 'ERROR')
+            server = self._evacuate_server(
+                server, expected_state='ERROR',
+                expected_migration_status='failed')
 
         # Run the periodics to show those don't modify allocations.
         self._run_periodics()
@@ -2740,7 +2685,7 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
         ex = self.assertRaises(client.OpenStackApiException,
                                self.api.post_server_action,
                                server['id'], post)
-        self.assertIn("'force' was unexpected", six.text_type(ex))
+        self.assertIn("'force' was unexpected", str(ex))
 
     def test_live_migrate(self):
         source_hostname = self.compute1.host
@@ -2893,8 +2838,10 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
         }
         self.api.post_server_action(server['id'], post)
         # The compute manager will put the migration record into error status
-        # when pre_live_migration fails, so wait for that to happen.
-        migration = self._wait_for_migration_status(server, ['error'])
+        # when start _cleanup_pre_live_migration, then set it to failed status
+        # at the end of _rollback_live_migration
+        migration = self._wait_for_migration_status(
+            server, ['error', 'failed'])
         # The _rollback_live_migration method in the compute manager will reset
         # the task_state on the instance, so wait for that to happen.
         server = self._wait_for_server_parameter(
@@ -3381,34 +3328,37 @@ class PollUnconfirmedResizesTest(integrated_helpers.ProviderUsageBaseTestCase):
         self.api.put_service(
             source_service['id'], {'status': 'disabled', 'forced_down': True})
         # Now configure auto-confirm and call the method on the target compute
-        # so we do not have to wait for the periodic to run. Also configure
-        # the RPC call from the API to the source compute to timeout after 1
-        # second.
-        self.flags(resize_confirm_window=1, rpc_response_timeout=1)
+        # so we do not have to wait for the periodic to run.
+        self.flags(resize_confirm_window=1)
         # Stub timeutils so the DB API query finds the unconfirmed migration.
         future = timeutils.utcnow() + datetime.timedelta(hours=1)
         ctxt = context.get_admin_context()
         with osloutils_fixture.TimeFixture(future):
-            # Use the CastAsCall fixture since the fake rpc is not going to
-            # simulate a failure from the service being down.
-            with cast_as_call.CastAsCall(self):
-                self.computes['host2'].manager._poll_unconfirmed_resizes(ctxt)
+            self.computes['host2'].manager._poll_unconfirmed_resizes(ctxt)
         self.assertIn('Error auto-confirming resize',
                       self.stdlog.logger.output)
-        self.assertIn('No reply on topic compute', self.stdlog.logger.output)
-        # FIXME(mriedem): This is bug 1855927 where the migration status is
-        # left in "confirming" so the _poll_unconfirmed_resizes task will not
-        # process it again nor can the user confirm the resize in the API since
-        # the migration status is not "finished".
-        self._wait_for_migration_status(server, ['confirming'])
+        self.assertIn('Service is unavailable at this time',
+                      self.stdlog.logger.output)
+        # The source compute service check should have been done before the
+        # migration status was updated so it should still be "finished".
+        self._wait_for_migration_status(server, ['finished'])
+        # Try to confirm in the API while the source compute service is still
+        # down to assert the 409 (rather than a 500) error.
         ex = self.assertRaises(client.OpenStackApiException,
                                self.api.post_server_action,
                                server['id'], {'confirmResize': None})
-        self.assertEqual(400, ex.response.status_code)
-        self.assertIn('Instance has not been resized', six.text_type(ex))
-        # That error message is bogus because the server is resized.
-        server = self.api.get_server(server['id'])
-        self.assertEqual('VERIFY_RESIZE', server['status'])
+        self.assertEqual(409, ex.response.status_code)
+        self.assertIn('Service is unavailable at this time', str(ex))
+        # Bring the source compute back up and try to confirm the resize which
+        # should work since the migration status is still "finished".
+        self.restart_compute_service(self.computes['host1'])
+        self.api.put_service(
+            source_service['id'], {'status': 'enabled', 'forced_down': False})
+        # Use the API to confirm the resize because _poll_unconfirmed_resizes
+        # requires mucking with the current time which causes problems with
+        # the service_is_up check in the API.
+        self.api.post_server_action(server['id'], {'confirmResize': None})
+        self._wait_for_state_change(server, 'ACTIVE')
 
 
 class ServerLiveMigrateForceAndAbort(
@@ -3653,11 +3603,18 @@ class ServerBuildAbortTests(integrated_helpers.ProviderUsageBaseTestCase):
 
         failed_hostname = self.compute1.manager.host
 
-        failed_rp_uuid = self._get_provider_uuid_by_host(failed_hostname)
-        # Expects no allocation records on the failed host.
-        self.assertRequestMatchesUsage({'VCPU': 0,
-                                        'MEMORY_MB': 0,
-                                        'DISK_GB': 0}, failed_rp_uuid)
+        # BuildAbortException coming from the FakeBuildAbortDriver will not
+        # trigger a reschedule and the placement cleanup is the last step in
+        # the compute manager after instance state setting, fault recording
+        # and notification sending. So we have no other way than simply wait
+        # to ensure the placement cleanup happens before we assert it.
+        def placement_cleanup():
+            failed_rp_uuid = self._get_provider_uuid_by_host(failed_hostname)
+            # Expects no allocation records on the failed host.
+            self.assertRequestMatchesUsage({'VCPU': 0,
+                                            'MEMORY_MB': 0,
+                                            'DISK_GB': 0}, failed_rp_uuid)
+        self._wait_for_assert(placement_cleanup)
 
 
 class ServerDeleteBuildTests(integrated_helpers.ProviderUsageBaseTestCase):
@@ -3977,10 +3934,12 @@ class VolumeBackedServerTest(integrated_helpers.ProviderUsageBaseTestCase):
         # 10gb root, 20gb ephemeral, 5gb swap
         expected_usage = 35
         self.assertEqual(expected_usage, resources['DISK_GB'])
-        # Ensure the compute node is reporting the correct disk usage
-        self.assertEqual(
-            expected_usage,
-            self.admin_api.get_hypervisor_stats()['local_gb_used'])
+        # Ensure the compute node is reporting the correct disk usage. We're
+        # using v2.87 explicitly as the api returns 404 starting with 2.88
+        with nova_utils.temporary_mutation(self.api, microversion='2.87'):
+            self.assertEqual(
+                expected_usage,
+                self.admin_api.get_hypervisor_stats()['local_gb_used'])
 
     def test_volume_backed_image_type_filter(self):
         # Enable the image type support filter and ensure that a
@@ -3999,10 +3958,12 @@ class VolumeBackedServerTest(integrated_helpers.ProviderUsageBaseTestCase):
         # 0gb root, 20gb ephemeral, 5gb swap
         expected_usage = 25
         self.assertEqual(expected_usage, resources['DISK_GB'])
-        # Ensure the compute node is reporting the correct disk usage
-        self.assertEqual(
-            expected_usage,
-            self.admin_api.get_hypervisor_stats()['local_gb_used'])
+        # Ensure the compute node is reporting the correct disk usage. We're
+        # using v2.87 explicitly as the api returns 404 starting with 2.88
+        with nova_utils.temporary_mutation(self.api, microversion='2.87'):
+            self.assertEqual(
+                expected_usage,
+                self.admin_api.get_hypervisor_stats()['local_gb_used'])
 
         # Now let's hack the RequestSpec.is_bfv field to mimic migrating an
         # old instance created before RequestSpec.is_bfv was set in the API,
@@ -4036,11 +3997,9 @@ class VolumeBackedServerTest(integrated_helpers.ProviderUsageBaseTestCase):
 
         # Now shelve and unshelve the server to make sure root_gb DISK_GB
         # isn't reported for allocations after we unshelve the server.
-        fake_notifier.stub_notifier(self)
-        self.addCleanup(fake_notifier.reset)
         self.api.post_server_action(server['id'], {'shelve': None})
         self._wait_for_state_change(server, 'SHELVED_OFFLOADED')
-        fake_notifier.wait_for_versioned_notifications(
+        self.notifier.wait_for_versioned_notifications(
                 'instance.shelve_offload.end')
         # The server should not have any allocations since it's not currently
         # hosted on any compute service.
@@ -4538,7 +4497,7 @@ class TraitsBasedSchedulingTest(integrated_helpers.ProviderUsageBaseTestCase):
                          server['fault']['message'])
 
 
-class ServerTestV256Common(ServersTestBase):
+class ServerTestV256Common(integrated_helpers._IntegratedTestBase):
     api_major_version = 'v2.1'
     microversion = '2.56'
     ADMIN_API = True
@@ -4579,7 +4538,7 @@ class ServerTestV256MultiCellTestCase(ServerTestV256Common):
             'host2': 'cell2'}
         for host in sorted(host_to_cell_mappings):
             self.start_service('compute', host=host,
-                               cell=host_to_cell_mappings[host])
+                               cell_name=host_to_cell_mappings[host])
 
     def test_migrate_server_to_host_in_different_cell(self):
         # We target host1 specifically so that we have a predictable target for
@@ -4597,8 +4556,7 @@ class ServerTestV256MultiCellTestCase(ServerTestV256Common):
         # the target host in cell1, it will result in a ComputeHostNotFound
         # error.
         self.assertEqual(400, ex.response.status_code)
-        self.assertIn('Compute host host2 could not be found',
-                      six.text_type(ex))
+        self.assertIn('Compute host host2 could not be found', str(ex))
 
 
 class ServerTestV256SingleCellMultiHostTestCase(ServerTestV256Common):
@@ -4712,14 +4670,8 @@ class ConsumerGenerationConflictTest(
             self._wait_for_server_parameter(server,
                                             {'OS-EXT-STS:task_state': None})
 
-        # The instance action should have failed with details.
-        # save_and_reraise_exception gets different results between py2 and py3
-        # for the traceback but we want to use the more specific
-        # "claim_resources" for py3. We can remove this when we drop support
-        # for py2.
-        error_in_tb = 'claim_resources' if six.PY3 else 'select_destinations'
         self._assert_resize_migrate_action_fail(
-            server, instance_actions.MIGRATE, error_in_tb)
+            server, instance_actions.MIGRATE, 'claim_resources')
 
         # The migration is aborted so the instance is ACTIVE on the source
         # host instead of being in VERIFY_RESIZE state.
@@ -4827,7 +4779,7 @@ class ConsumerGenerationConflictTest(
                       (migrations[0]['uuid'], server['id']),
                       self.stdlog.logger.output)
         self._delete_server(server)
-        fake_notifier.wait_for_versioned_notifications('instance.delete.end')
+        self.notifier.wait_for_versioned_notifications('instance.delete.end')
 
         allocations = self._get_allocations_by_server_uuid(
             migrations[0]['uuid'])
@@ -4875,7 +4827,7 @@ class ConsumerGenerationConflictTest(
                       (migrations[0]['uuid'], server['id']),
                       self.stdlog.logger.output)
         self._delete_server(server)
-        fake_notifier.wait_for_versioned_notifications('instance.delete.end')
+        self.notifier.wait_for_versioned_notifications('instance.delete.end')
 
         allocations = self._get_allocations_by_server_uuid(
             migrations[0]['uuid'])
@@ -4926,7 +4878,7 @@ class ConsumerGenerationConflictTest(
                       (migrations[0]['uuid'], server['id']),
                       self.stdlog.logger.output)
         self._delete_server(server)
-        fake_notifier.wait_for_versioned_notifications('instance.delete.end')
+        self.notifier.wait_for_versioned_notifications('instance.delete.end')
 
         allocations = self._get_allocations_by_server_uuid(
             migrations[0]['uuid'])
@@ -4991,9 +4943,6 @@ class ConsumerGenerationConflictTest(
         server = self._boot_and_check_allocations(
             self.flavor, source_hostname)
 
-        fake_notifier.stub_notifier(self)
-        self.addCleanup(fake_notifier.reset)
-
         orig_put = adapter.Adapter.put
 
         rsp = fake_requests.FakeResponse(
@@ -5035,7 +4984,7 @@ class ConsumerGenerationConflictTest(
                 {'OS-EXT-SRV-ATTR:host': dest_hostname,
                  'status': 'ERROR'})
             self._wait_for_migration_status(server, ['error'])
-            fake_notifier.wait_for_versioned_notifications(
+            self.notifier.wait_for_versioned_notifications(
                 'instance.live_migration_post.end')
 
         # 1 claim on destination, 1 normal delete on dest that fails,
@@ -5062,7 +5011,7 @@ class ConsumerGenerationConflictTest(
                       self.stdlog.logger.output)
 
         self._delete_server(server)
-        fake_notifier.wait_for_versioned_notifications('instance.delete.end')
+        self.notifier.wait_for_versioned_notifications('instance.delete.end')
 
         self.assertFlavorMatchesAllocation(self.flavor, migration_uuid,
                                            source_rp_uuid)
@@ -5653,7 +5602,7 @@ class PortResourceRequestBasedSchedulingTestBase(
         return self.api.post_server({'server': server_req})
 
     def _set_provider_inventories(self, rp_uuid, inventories):
-        rp = self.placement_api.get(
+        rp = self.placement.get(
             '/resource_providers/%s' % rp_uuid).body
         inventories['resource_provider_generation'] = rp['generation']
         return self._update_inventory(rp_uuid, inventories)
@@ -5667,7 +5616,7 @@ class PortResourceRequestBasedSchedulingTestBase(
             "uuid": ovs_agent_rp_uuid,
             "parent_provider_uuid": compute_rp_uuid
         }
-        self.placement_api.post('/resource_providers',
+        self.placement.post('/resource_providers',
                                 body=agent_rp_req,
                                 version='1.20')
         ovs_bridge_rp_uuid = getattr(uuids, ovs_agent_rp_uuid + 'ovs br')
@@ -5676,7 +5625,7 @@ class PortResourceRequestBasedSchedulingTestBase(
             "uuid": ovs_bridge_rp_uuid,
             "parent_provider_uuid": ovs_agent_rp_uuid
         }
-        self.placement_api.post('/resource_providers',
+        self.placement.post('/resource_providers',
                                 body=ovs_bridge_req,
                                 version='1.20')
         self.ovs_bridge_rp_per_host[compute_rp_uuid] = ovs_bridge_rp_uuid
@@ -5710,7 +5659,7 @@ class PortResourceRequestBasedSchedulingTestBase(
             "uuid": device_rp_uuid,
             "parent_provider_uuid": parent_rp_uuid
         }
-        self.placement_api.post('/resource_providers',
+        self.placement.post('/resource_providers',
                                 body=sriov_pf_req,
                                 version='1.20')
 
@@ -5744,7 +5693,7 @@ class PortResourceRequestBasedSchedulingTestBase(
             "uuid": sriov_agent_rp_uuid,
             "parent_provider_uuid": compute_rp_uuid
         }
-        self.placement_api.post('/resource_providers',
+        self.placement.post('/resource_providers',
                                 body=agent_rp_req,
                                 version='1.20')
         dev_rp_name_prefix = ("%s:NIC Switch agent:" % hostname)
@@ -5816,7 +5765,7 @@ class PortResourceRequestBasedSchedulingTestBase(
         updated_qos_sriov_port = self.neutron.show_port(
             qos_sriov_port['id'])['port']
 
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
 
         # if there is new_flavor then we either have an in progress resize or
@@ -5853,7 +5802,7 @@ class PortResourceRequestBasedSchedulingTestBase(
         self.assertEqual({}, updated_non_qos_port['binding:profile'])
 
         if migration_uuid:
-            migration_allocations = self.placement_api.get(
+            migration_allocations = self.placement.get(
                 '/allocations/%s' % migration_uuid).body['allocations']
 
             # We expect one set of allocations for the compute resources on the
@@ -5921,25 +5870,38 @@ class UnsupportedPortResourceRequestBasedSchedulingTest(
             self.neutron.port_with_resource_request[
                 constants.RESOURCE_REQUEST])
 
-    def test_interface_attach_with_port_resource_request(self):
+    def test_interface_attach_with_resource_request_old_compute(self):
         # create a server
         server = self._create_server(
             flavor=self.flavor,
             networks=[{'port': self.neutron.port_1['id']}])
         self._wait_for_state_change(server, 'ACTIVE')
 
-        # try to add a port with resource request
-        post = {
-            'interfaceAttachment': {
-                'port_id': self.neutron.port_with_resource_request['id']
-        }}
-        ex = self.assertRaises(client.OpenStackApiException,
-                               self.api.attach_interface,
-                               server['id'], post)
+        # simulate that the compute the instance is running on is older than
+        # when support is added for attach, older than service version 55
+        orig_get_service = objects.Service.get_by_host_and_binary
+
+        def fake_get_service(context, host, binary):
+            service = orig_get_service(context, host, binary)
+            service.version = 54
+            return service
+
+        with mock.patch(
+            'nova.objects.Service.get_by_host_and_binary',
+            side_effect=fake_get_service
+        ):
+            # try to add a port with resource request
+            post = {
+                'interfaceAttachment': {
+                    'port_id': self.neutron.port_with_resource_request['id']
+                }}
+            ex = self.assertRaises(
+                client.OpenStackApiException, self.api.attach_interface,
+                server['id'], post)
         self.assertEqual(400, ex.response.status_code)
         self.assertIn('Attaching interfaces with QoS policy is '
                       'not supported for instance',
-                      six.text_type(ex))
+                      str(ex))
 
     @mock.patch('nova.tests.fixtures.NeutronFixture.create_port')
     def test_interface_attach_with_network_create_port_has_resource_request(
@@ -5967,7 +5929,7 @@ class UnsupportedPortResourceRequestBasedSchedulingTest(
         self.assertEqual(400, ex.response.status_code)
         self.assertIn('Using networks with QoS policy is not supported for '
                       'instance',
-                      six.text_type(ex))
+                      str(ex))
 
     @mock.patch('nova.tests.fixtures.NeutronFixture.create_port')
     def test_create_server_with_network_create_port_has_resource_request(
@@ -6002,36 +5964,7 @@ class UnsupportedPortResourceRequestBasedSchedulingTest(
             "Creating servers with ports having resource requests, like a "
             "port with a QoS minimum bandwidth policy, is not supported "
             "until microversion 2.72.",
-            six.text_type(ex))
-
-    def test_unshelve_offloaded_server_with_port_resource_request_old_version(
-            self):
-        server = self._create_server(
-            flavor=self.flavor,
-            networks=[{'port': self.neutron.port_1['id']}])
-        self._wait_for_state_change(server, 'ACTIVE')
-
-        # with default config shelve means immediate offload as well
-        req = {
-            'shelve': {}
-        }
-        self.api.post_server_action(server['id'], req)
-        self._wait_for_server_parameter(
-            server, {'status': 'SHELVED_OFFLOADED'})
-
-        # We need to simulate that the above server has a port that has
-        # resource request; we cannot boot with such a port but legacy servers
-        # can exist with such a port.
-        self._add_resource_request_to_a_bound_port(self.neutron.port_1['id'])
-
-        ex = self.assertRaises(
-            client.OpenStackApiException,
-            self.api.post_server_action, server['id'], {'unshelve': None})
-
-        self.assertEqual(400, ex.response.status_code)
-        self.assertIn(
-            'The unshelve action on a server with ports having resource '
-            'requests', six.text_type(ex))
+            str(ex))
 
     def test_unshelve_not_offloaded_server_with_port_resource_request(
             self):
@@ -6075,7 +6008,6 @@ class NonAdminUnsupportedPortResourceRequestBasedSchedulingTest(
 
         # allow non-admin to call the operations
         self.policy.set_rules({
-            'os_compute_api:os-evacuate': '@',
             'os_compute_api:servers:create': '@',
             'os_compute_api:servers:create:attach_network': '@',
             'os_compute_api:servers:show': '@',
@@ -6084,6 +6016,7 @@ class NonAdminUnsupportedPortResourceRequestBasedSchedulingTest(
             'os_compute_api:os-shelve:shelve': '@',
             'os_compute_api:os-shelve:unshelve': '@',
             'os_compute_api:os-migrate-server:migrate_live': '@',
+            'os_compute_api:os-evacuate': '@',
         })
 
 
@@ -6106,7 +6039,7 @@ class PortResourceRequestBasedSchedulingTest(
             non_qos_port['id'])['port']
         updated_qos_port = self.neutron.show_port(qos_port['id'])['port']
 
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
 
         # We expect one set of allocations for the compute resources on the
@@ -6152,7 +6085,7 @@ class PortResourceRequestBasedSchedulingTest(
         ovs_port = self.neutron.show_port(ovs_port['id'])['port']
         sriov_port = self.neutron.show_port(sriov_port['id'])['port']
 
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
 
         # We expect one set of allocations for the compute resources on the
@@ -6183,6 +6116,311 @@ class PortResourceRequestBasedSchedulingTest(
             self.sriov_dev_rp_per_host[self.compute1_rp_uuid][self.PF2],
             sriov_binding['allocation'])
 
+    def test_interface_attach_with_resource_request(self):
+        server = self._create_server(
+            flavor=self.flavor,
+            networks=[{'port': self.neutron.port_1['id']}])
+        self._wait_for_state_change(server, 'ACTIVE')
+
+        # start a second compute to show that resources are only allocated from
+        # the compute the instance currently runs on
+        self.compute2 = self._start_compute('host2')
+        self.compute2_rp_uuid = self._get_provider_uuid_by_host('host2')
+        self._create_networking_rp_tree('host2', self.compute2_rp_uuid)
+        self.compute2_service_id = self.admin_api.get_services(
+            host='host2', binary='nova-compute')[0]['id']
+
+        # attach an OVS port with resource request
+        ovs_port = self.neutron.port_with_resource_request
+        post = {
+            'interfaceAttachment': {
+                'port_id': ovs_port['id']
+        }}
+        self.api.attach_interface(server['id'], post)
+
+        ovs_port = self.neutron.show_port(ovs_port['id'])['port']
+        allocations = self.placement.get(
+            '/allocations/%s' % server['id']).body['allocations']
+
+        # We expect one set of allocations for the compute resources on the
+        # compute RP and one set for the networking resources on the OVS
+        # bridge RP.
+        self.assertEqual(2, len(allocations))
+
+        self.assertComputeAllocationMatchesFlavor(
+            allocations, self.compute1_rp_uuid, self.flavor)
+        ovs_allocations = allocations[
+            self.ovs_bridge_rp_per_host[self.compute1_rp_uuid]]['resources']
+        self.assertPortMatchesAllocation(ovs_port, ovs_allocations)
+
+        # We expect that only the RP uuid of the networking RP having the port
+        # allocation is sent in the port binding for the port having resource
+        # request
+        ovs_binding = ovs_port['binding:profile']
+        self.assertEqual(self.ovs_bridge_rp_per_host[self.compute1_rp_uuid],
+                         ovs_binding['allocation'])
+
+        # now attach an SRIOV port
+        sriov_port = self.neutron.port_with_sriov_resource_request
+        post = {
+            'interfaceAttachment': {
+                'port_id': sriov_port['id']
+        }}
+        self.api.attach_interface(server['id'], post)
+
+        ovs_port = self.neutron.show_port(ovs_port['id'])['port']
+        sriov_port = self.neutron.show_port(sriov_port['id'])['port']
+
+        allocations = self.placement.get(
+            '/allocations/%s' % server['id']).body['allocations']
+
+        # We expect one set of allocations for the compute resources on the
+        # compute RP and one set each for the networking resources on the OVS
+        # bridge RP and on the SRIOV PF RP.
+        self.assertEqual(3, len(allocations))
+
+        self.assertComputeAllocationMatchesFlavor(
+            allocations, self.compute1_rp_uuid, self.flavor)
+
+        ovs_allocations = allocations[
+            self.ovs_bridge_rp_per_host[self.compute1_rp_uuid]]['resources']
+        sriov_allocations = allocations[
+            self.sriov_dev_rp_per_host[
+                self.compute1_rp_uuid][self.PF2]]['resources']
+
+        self.assertPortMatchesAllocation(ovs_port, ovs_allocations)
+        self.assertPortMatchesAllocation(sriov_port, sriov_allocations)
+
+        # We expect that only the RP uuid of the networking RP having the port
+        # allocation is sent in the port binding for the port having resource
+        # request
+        ovs_binding = ovs_port['binding:profile']
+        self.assertEqual(self.ovs_bridge_rp_per_host[self.compute1_rp_uuid],
+                         ovs_binding['allocation'])
+        sriov_binding = sriov_port['binding:profile']
+        self.assertEqual(
+            self.sriov_dev_rp_per_host[self.compute1_rp_uuid][self.PF2],
+            sriov_binding['allocation'])
+
+    def test_interface_attach_with_resource_request_no_candidates(self):
+        server = self._create_server(
+            flavor=self.flavor,
+            networks=[{'port': self.neutron.port_1['id']}])
+        self._wait_for_state_change(server, 'ACTIVE')
+
+        # attach an OVS port with too big resource request
+        ovs_port = self.neutron.port_with_resource_request
+        resources = self.neutron._ports[
+            ovs_port['id']]['resource_request']['resources']
+        resources['NET_BW_IGR_KILOBIT_PER_SEC'] = 1000000
+
+        post = {
+            'interfaceAttachment': {
+                'port_id': ovs_port['id']
+        }}
+        ex = self.assertRaises(
+            client.OpenStackApiException, self.api.attach_interface,
+            server['id'], post)
+
+        self.assertEqual(400, ex.response.status_code)
+        self.assertIn('Failed to allocate additional resources', str(ex))
+
+    def test_interface_attach_with_resource_request_pci_claim_fails(self):
+        # boot a server with a single SRIOV port that has no resource request
+        sriov_port = self.neutron.sriov_port
+        server = self._create_server(
+            flavor=self.flavor,
+            networks=[{'port': sriov_port['id']}])
+
+        self._wait_for_state_change(server, 'ACTIVE')
+        sriov_port = self.neutron.show_port(sriov_port['id'])['port']
+        sriov_binding = sriov_port['binding:profile']
+
+        # We expect that this consume the last available VF from the PF2
+        self.assertEqual(
+            fake.FakeDriverWithPciResources.PCI_ADDR_PF2_VF1,
+            sriov_binding['pci_slot'])
+
+        # Now attach a second port to this server that has resource request
+        # At this point PF2 has available bandwidth but no available VF
+        # and PF3 has available VF but no available bandwidth so we expect
+        # the attach to fail.
+        sriov_port_with_res_req = self.neutron.port_with_sriov_resource_request
+        post = {
+            'interfaceAttachment': {
+                'port_id': sriov_port_with_res_req['id']
+        }}
+        ex = self.assertRaises(
+            client.OpenStackApiException, self.api.attach_interface,
+            server['id'], post)
+
+        self.assertEqual(400, ex.response.status_code)
+        self.assertIn('Failed to claim PCI device', str(ex))
+
+        sriov_port_with_res_req = self.neutron.show_port(
+            sriov_port_with_res_req['id'])['port']
+
+        allocations = self.placement.get(
+            '/allocations/%s' % server['id']).body['allocations']
+
+        # We expect only one allocations that is on the compute RP as the
+        # allocation made towards the PF2 RP has been rolled back when the PCI
+        # claim failed
+        self.assertEqual([self.compute1_rp_uuid], list(allocations))
+        self.assertComputeAllocationMatchesFlavor(
+            allocations, self.compute1_rp_uuid, self.flavor)
+
+        # We expect that the port binding is not updated with any RP uuid as
+        # the attach failed.
+        sriov_binding = sriov_port_with_res_req['binding:profile']
+        self.assertNotIn('allocation', sriov_binding)
+
+    def test_interface_attach_sriov_with_qos_pci_update_fails(self):
+        # Update the name of the network device RP of PF2 on host2 to something
+        # unexpected. This will cause
+        # update_pci_request_spec_with_allocated_interface_name() to raise
+        # when the sriov interface is attached.
+        rsp = self.placement.put(
+            '/resource_providers/%s'
+            % self.sriov_dev_rp_per_host[self.compute1_rp_uuid][self.PF2],
+            {"name": "invalid-device-rp-name"})
+        self.assertEqual(200, rsp.status)
+
+        server = self._create_server(
+            flavor=self.flavor,
+            networks=[{'port': self.neutron.port_1['id']}])
+        self._wait_for_state_change(server, 'ACTIVE')
+
+        sriov_port = self.neutron.port_with_sriov_resource_request
+        post = {
+            'interfaceAttachment': {
+                'port_id': sriov_port['id']
+        }}
+        ex = self.assertRaises(
+            client.OpenStackApiException, self.api.attach_interface,
+            server['id'], post)
+
+        self.assertEqual(500, ex.response.status_code)
+        self.assertIn('UnexpectedResourceProviderNameForPCIRequest', str(ex))
+
+        sriov_port = self.neutron.show_port(sriov_port['id'])['port']
+
+        allocations = self.placement.get(
+            '/allocations/%s' % server['id']).body['allocations']
+
+        # We expect only one allocations that is on the compute RP as the
+        # allocation made towards the PF2 RP has been rolled back when the PCI
+        # update failed
+        self.assertEqual([self.compute1_rp_uuid], list(allocations))
+        self.assertComputeAllocationMatchesFlavor(
+            allocations, self.compute1_rp_uuid, self.flavor)
+
+        # We expect that the port binding is not updated with any RP uuid as
+        # the attach failed.
+        sriov_binding = sriov_port['binding:profile']
+        self.assertNotIn('allocation', sriov_binding)
+
+    def test_interface_attach_sriov_with_qos_pci_update_fails_cleanup_fails(
+        self
+    ):
+        # Update the name of the network device RP of PF2 on host2 to something
+        # unexpected. This will cause
+        # update_pci_request_spec_with_allocated_interface_name() to raise
+        # when the sriov interface is attached.
+        rsp = self.placement.put(
+            '/resource_providers/%s'
+            % self.sriov_dev_rp_per_host[self.compute1_rp_uuid][self.PF2],
+            {"name": "invalid-device-rp-name"})
+        self.assertEqual(200, rsp.status)
+
+        server = self._create_server(
+            flavor=self.flavor,
+            networks=[{'port': self.neutron.port_1['id']}])
+        self._wait_for_state_change(server, 'ACTIVE')
+
+        sriov_port = self.neutron.port_with_sriov_resource_request
+        post = {
+            'interfaceAttachment': {
+                'port_id': sriov_port['id']
+        }}
+
+        orig_put = adapter.Adapter.put
+
+        conflict_rsp = fake_requests.FakeResponse(
+            409,
+            jsonutils.dumps(
+                {'errors': [
+                    {'code': 'placement.concurrent_update',
+                     'detail': 'consumer generation conflict'}]}))
+
+        self.adapter_put_call_count = 0
+
+        def fake_put(_self, url, **kwargs):
+            self.adapter_put_call_count += 1
+            if self.adapter_put_call_count == 1:
+                # allocation update to add the port resource request
+                return orig_put(_self, url, **kwargs)
+            else:
+                # cleanup calls to remove the port resource allocation
+                return conflict_rsp
+
+        # this mock makes sure that the placement cleanup will fail with
+        # conflict
+        with mock.patch('keystoneauth1.adapter.Adapter.put', new=fake_put):
+            ex = self.assertRaises(
+                client.OpenStackApiException, self.api.attach_interface,
+                server['id'], post)
+
+            self.assertEqual(500, ex.response.status_code)
+            self.assertIn('AllocationUpdateFailed', str(ex))
+            # we have a proper log about the leak
+            PF_rp_uuid = self.sriov_dev_rp_per_host[
+                self.compute1_rp_uuid][self.PF2]
+            self.assertIn(
+                "nova.exception.AllocationUpdateFailed: Failed to update "
+                "allocations for consumer %s. Error: Cannot remove "
+                "resources {'%s': "
+                "{'resources': {'NET_BW_EGR_KILOBIT_PER_SEC': 10000, "
+                "'NET_BW_IGR_KILOBIT_PER_SEC': 10000}}} from the allocation "
+                "due to multiple successive generation conflicts in "
+                "placement." % (server['id'], PF_rp_uuid),
+                self.stdlog.logger.output)
+
+            # assert that we retried the cleanup multiple times
+            self.assertEqual(5, self.adapter_put_call_count)
+
+        sriov_port = self.neutron.show_port(sriov_port['id'])['port']
+
+        allocations = self.placement.get(
+            '/allocations/%s' % server['id']).body['allocations']
+
+        # As the cleanup failed we leaked allocation in placement
+        self.assertEqual(2, len(allocations))
+        self.assertComputeAllocationMatchesFlavor(
+            allocations, self.compute1_rp_uuid, self.flavor)
+
+        sriov_dev_rp = self.sriov_dev_rp_per_host[
+            self.compute1_rp_uuid][self.PF2]
+        sriov_allocations = allocations[sriov_dev_rp]['resources']
+
+        # this is the leaked allocation in placement
+        self.assertPortMatchesAllocation(sriov_port, sriov_allocations)
+
+        allocations[sriov_dev_rp].pop('generation')
+        leaked_allocation = {sriov_dev_rp: allocations[sriov_dev_rp]}
+        self.assertIn(
+            f'Failed to update allocations for consumer {server["id"]}. '
+            f'Error: Cannot remove resources {leaked_allocation} from the '
+            f'allocation due to multiple successive generation conflicts in '
+            f'placement. To clean up the leaked resource allocation you can '
+            f'use nova-manage placement audit.',
+            self.stdlog.logger.output)
+
+        # We expect that the port binding is not updated with any RP uuid as
+        # the attach failed.
+        sriov_binding = sriov_port['binding:profile']
+        self.assertNotIn('allocation', sriov_binding)
+
     def test_interface_detach_with_port_with_bandwidth_request(self):
         port = self.neutron.port_with_resource_request
 
@@ -6192,7 +6430,7 @@ class PortResourceRequestBasedSchedulingTest(
             networks=[{'port': port['id']}])
         self._wait_for_state_change(server, 'ACTIVE')
 
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
         # We expect one set of allocations for the compute resources on the
         # compute rp and one set for the networking resources on the ovs bridge
@@ -6217,13 +6455,13 @@ class PortResourceRequestBasedSchedulingTest(
         self.api.detach_interface(
             server['id'], self.neutron.port_with_resource_request['id'])
 
-        fake_notifier.wait_for_versioned_notifications(
+        self.notifier.wait_for_versioned_notifications(
             'instance.interface_detach.end')
 
         updated_port = self.neutron.show_port(
             self.neutron.port_with_resource_request['id'])['port']
 
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
 
         # We expect that the port related resource allocations are removed
@@ -6252,7 +6490,7 @@ class PortResourceRequestBasedSchedulingTest(
             networks=[{'port': port['id']}])
         server = self._wait_for_state_change(server, 'ACTIVE')
 
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
         # We expect one set of allocations for the compute resources on the
         # compute rp and one set for the networking resources on the ovs bridge
@@ -6301,7 +6539,7 @@ class PortResourceRequestBasedSchedulingTest(
                'rp_uuid': port_rp_uuid,
                'server_uuid': server['id']})
 
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
 
         # Nova leaks the port allocation so the server still has the same
@@ -6354,7 +6592,7 @@ class PortResourceRequestBasedSchedulingTest(
         sriov_port_with_res_req = self.neutron.show_port(
             sriov_port_with_res_req['id'])['port']
 
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
 
         # We expect one set of allocations for the compute resources on the
@@ -6451,7 +6689,7 @@ class PortResourceRequestBasedSchedulingTest(
 
         port = self.neutron.show_port(port['id'])['port']
 
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
 
         # We expect one set of allocations for the compute resources on the
@@ -6510,118 +6748,6 @@ class ServerMoveWithPortResourceRequestTest(
             self.flavor_with_group_policy_bigger['id'],
             {'extra_specs': {'group_policy': 'isolate'}})
 
-    def test_migrate_server_with_qos_port_old_dest_compute_no_alternate(self):
-        """Create a situation where the only migration target host returned
-        by the scheduler is too old and therefore the migration fails.
-        """
-        non_qos_normal_port = self.neutron.port_1
-        qos_normal_port = self.neutron.port_with_resource_request
-        qos_sriov_port = self.neutron.port_with_sriov_resource_request
-
-        server = self._create_server_with_ports_and_check_allocation(
-            non_qos_normal_port, qos_normal_port, qos_sriov_port)
-
-        orig_get_service = objects.Service.get_by_host_and_binary
-
-        def fake_get_service(context, host, binary):
-            # host2 is the only migration target, let's make it too old so the
-            # migration will fail
-            if host == 'host2':
-                service = orig_get_service(context, host, binary)
-                service.version = 38
-                return service
-            else:
-                return orig_get_service(context, host, binary)
-
-        with mock.patch(
-                'nova.objects.Service.get_by_host_and_binary',
-                side_effect=fake_get_service):
-
-            self.api.post_server_action(server['id'], {'migrate': None},
-                                        check_response_status=[202])
-            self._wait_for_server_parameter(server,
-                                            {'OS-EXT-STS:task_state': None})
-
-        self._assert_resize_migrate_action_fail(
-            server, instance_actions.MIGRATE, 'NoValidHost')
-
-        # check that the server still allocates from the original host
-        self._check_allocation(
-            server, self.compute1_rp_uuid, non_qos_normal_port,
-            qos_normal_port, qos_sriov_port, self.flavor_with_group_policy)
-
-        # but the migration allocation is gone
-        migration_uuid = self.get_migration_uuid_for_instance(server['id'])
-        migration_allocations = self.placement_api.get(
-            '/allocations/%s' % migration_uuid).body['allocations']
-        self.assertEqual({}, migration_allocations)
-
-        self._delete_server_and_check_allocations(
-            server, qos_normal_port, qos_sriov_port)
-
-    def test_migrate_server_with_qos_port_old_dest_compute_alternate(self):
-        """Create a situation where the first migration target host returned
-        by the scheduler is too old and therefore the second host is selected
-        by the MigrationTask.
-        """
-        self._start_compute('host3')
-        compute3_rp_uuid = self._get_provider_uuid_by_host('host3')
-        self._create_networking_rp_tree('host3', compute3_rp_uuid)
-
-        non_qos_normal_port = self.neutron.port_1
-        qos_normal_port = self.neutron.port_with_resource_request
-        qos_sriov_port = self.neutron.port_with_sriov_resource_request
-
-        server = self._create_server_with_ports_and_check_allocation(
-            non_qos_normal_port, qos_normal_port, qos_sriov_port)
-
-        orig_get_service = objects.Service.get_by_host_and_binary
-
-        def fake_get_service(context, host, binary):
-            # host2 is the first migration target, let's make it too old so the
-            # migration will skip this host
-            if host == 'host2':
-                service = orig_get_service(context, host, binary)
-                service.version = 38
-                return service
-            # host3 is the second migration target, let's make it new enough so
-            # the migration task will choose this host
-            elif host == 'host3':
-                service = orig_get_service(context, host, binary)
-                service.version = 39
-                return service
-            else:
-                return orig_get_service(context, host, binary)
-
-        with mock.patch(
-                'nova.objects.Service.get_by_host_and_binary',
-                side_effect=fake_get_service):
-
-            self.api.post_server_action(server['id'], {'migrate': None})
-            self._wait_for_state_change(server, 'VERIFY_RESIZE')
-
-        migration_uuid = self.get_migration_uuid_for_instance(server['id'])
-
-        # check that server allocates from host3 and the migration allocates
-        # from host1
-        self._check_allocation(
-            server, compute3_rp_uuid, non_qos_normal_port, qos_normal_port,
-            qos_sriov_port, self.flavor_with_group_policy, migration_uuid,
-            source_compute_rp_uuid=self.compute1_rp_uuid)
-
-        self._confirm_resize(server)
-        # check that allocation is still OK
-        self._check_allocation(
-            server, compute3_rp_uuid, non_qos_normal_port,
-            qos_normal_port, qos_sriov_port, self.flavor_with_group_policy)
-        # but the migration allocation is gone
-        migration_allocations = self.placement_api.get(
-            '/allocations/%s' % migration_uuid).body['allocations']
-        self.assertEqual({}, migration_allocations)
-
-        self._delete_server_and_check_allocations(
-            server, qos_normal_port, qos_sriov_port)
-
     def _test_resize_or_migrate_server_with_qos_ports(self, new_flavor=None):
         non_qos_normal_port = self.neutron.port_1
         qos_normal_port = self.neutron.port_with_resource_request
@@ -6656,7 +6782,7 @@ class ServerMoveWithPortResourceRequestTest(
             server, self.compute2_rp_uuid, non_qos_normal_port,
             qos_normal_port, qos_sriov_port, self.flavor_with_group_policy,
             new_flavor=new_flavor)
-        migration_allocations = self.placement_api.get(
+        migration_allocations = self.placement.get(
             '/allocations/%s' % migration_uuid).body['allocations']
         self.assertEqual({}, migration_allocations)
 
@@ -6708,7 +6834,7 @@ class ServerMoveWithPortResourceRequestTest(
             {'VCPU': 0, 'MEMORY_MB': 0, 'DISK_GB': 0,
              'NET_BW_IGR_KILOBIT_PER_SEC': 0, 'NET_BW_EGR_KILOBIT_PER_SEC': 0},
             self.compute2_rp_uuid)
-        migration_allocations = self.placement_api.get(
+        migration_allocations = self.placement.get(
             '/allocations/%s' % migration_uuid).body['allocations']
         self.assertEqual({}, migration_allocations)
 
@@ -6783,7 +6909,7 @@ class ServerMoveWithPortResourceRequestTest(
         self._check_allocation(
             server, compute3_rp_uuid, non_qos_port, qos_port, qos_sriov_port,
             self.flavor_with_group_policy, new_flavor=new_flavor)
-        migration_allocations = self.placement_api.get(
+        migration_allocations = self.placement.get(
             '/allocations/%s' % migration_uuid).body['allocations']
         self.assertEqual({}, migration_allocations)
 
@@ -6827,7 +6953,7 @@ class ServerMoveWithPortResourceRequestTest(
 
         # as the migration is failed we expect that the migration allocation
         # is deleted
-        migration_allocations = self.placement_api.get(
+        migration_allocations = self.placement.get(
             '/allocations/%s' % migration_uuid).body['allocations']
         self.assertEqual({}, migration_allocations)
 
@@ -6848,7 +6974,7 @@ class ServerMoveWithPortResourceRequestTest(
         # unexpected. This will cause
         # update_pci_request_spec_with_allocated_interface_name() to raise
         # when the instance is migrated to the host2.
-        rsp = self.placement_api.put(
+        rsp = self.placement.put(
             '/resource_providers/%s'
             % self.sriov_dev_rp_per_host[self.compute2_rp_uuid][self.PF2],
             {"name": "invalid-device-rp-name"})
@@ -6885,16 +7011,16 @@ class ServerMoveWithPortResourceRequestTest(
         self._wait_for_action_fail_completion(
             server, instance_actions.MIGRATE, 'compute_prep_resize')
 
-        fake_notifier.wait_for_versioned_notifications(
+        self.notifier.wait_for_versioned_notifications(
             'instance.resize_prep.end')
-        fake_notifier.wait_for_versioned_notifications(
+        self.notifier.wait_for_versioned_notifications(
             'compute.exception')
 
         migration_uuid = self.get_migration_uuid_for_instance(server['id'])
 
         # as the migration is failed we expect that the migration allocation
         # is deleted
-        migration_allocations = self.placement_api.get(
+        migration_allocations = self.placement.get(
             '/allocations/%s' % migration_uuid).body['allocations']
         self.assertEqual({}, migration_allocations)
 
@@ -6902,69 +7028,6 @@ class ServerMoveWithPortResourceRequestTest(
         self._check_allocation(
             server, self.compute1_rp_uuid, non_qos_port, qos_port,
             qos_sriov_port, self.flavor_with_group_policy)
-
-    def test_migrate_server_with_qos_port_pinned_compute_rpc(self):
-        # Pin the compute rpc version to 5.1 to test what happens if
-        # resize RPC is called without RequestSpec.
-        # It is OK to set this after the nova services has started in setUp()
-        # as no compute rpc call is made so far.
-        self.flags(compute='5.1', group='upgrade_levels')
-
-        non_qos_normal_port = self.neutron.port_1
-        qos_normal_port = self.neutron.port_with_resource_request
-
-        server = self._create_server_with_ports(
-            non_qos_normal_port, qos_normal_port)
-
-        # This migration expected to fail as the old RPC does not provide
-        # enough information to do a proper port binding on the target host.
-        # The MigrationTask in the conductor checks that the RPC is new enough
-        # for this request for each possible destination provided by the
-        # scheduler and skips the old hosts. The actual response will be a 202
-        # so we have to wait for the failed instance action event.
-        self.api.post_server_action(server['id'], {'migrate': None})
-        self._assert_resize_migrate_action_fail(
-            server, instance_actions.MIGRATE, 'NoValidHost')
-
-        # The migration is put into error
-        self._wait_for_migration_status(server, ['error'])
-
-        # The migration is rejected so the instance remains on the source host
-        server = self.api.get_server(server['id'])
-        self.assertEqual('ACTIVE', server['status'])
-        self.assertEqual('host1', server['OS-EXT-SRV-ATTR:host'])
-
-        migration_uuid = self.get_migration_uuid_for_instance(server['id'])
-
-        # The migration allocation is deleted
-        migration_allocations = self.placement_api.get(
-            '/allocations/%s' % migration_uuid).body['allocations']
-        self.assertEqual({}, migration_allocations)
-
-        # The instance is still allocated from the source host
-        updated_non_qos_port = self.neutron.show_port(
-            non_qos_normal_port['id'])['port']
-        updated_qos_port = self.neutron.show_port(
-            qos_normal_port['id'])['port']
-        allocations = self.placement_api.get(
-            '/allocations/%s' % server['id']).body['allocations']
-        # We expect one set of allocations for the compute resources on the
-        # compute rp and one set for the networking resources on the ovs
-        # bridge rp due to the qos_port resource request
-        self.assertEqual(2, len(allocations))
-        self.assertComputeAllocationMatchesFlavor(
-            allocations, self.compute1_rp_uuid, self.flavor_with_group_policy)
-        ovs_allocations = allocations[
-            self.ovs_bridge_rp_per_host[self.compute1_rp_uuid]]['resources']
-        self.assertPortMatchesAllocation(qos_normal_port, ovs_allocations)
-
-        # binding:profile still points to the networking RP on the source host
-        qos_binding_profile = updated_qos_port['binding:profile']
-        self.assertEqual(self.ovs_bridge_rp_per_host[self.compute1_rp_uuid],
-                         qos_binding_profile['allocation'])
-        # And we expect not to have any allocation set in the port binding for
-        # the port that doesn't have resource request
-        self.assertEqual({}, updated_non_qos_port['binding:profile'])
 
     def _check_allocation_during_evacuate(
             self, server, flavor, source_compute_rp_uuid, dest_compute_rp_uuid,
@@ -6978,7 +7041,7 @@ class ServerMoveWithPortResourceRequestTest(
         updated_qos_sriov_port = self.neutron.show_port(
             qos_sriov_port['id'])['port']
 
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
 
         # We expect two sets of allocations. One set for the source compute
@@ -7049,7 +7112,7 @@ class ServerMoveWithPortResourceRequestTest(
         updated_qos_sriov_port = self.neutron.show_port(
             qos_sriov_port['id'])['port']
 
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
 
         self.assertEqual(3, len(allocations), allocations)
@@ -7100,14 +7163,8 @@ class ServerMoveWithPortResourceRequestTest(
         self.admin_api.put_service(
             self.compute1_service_id, {'forced_down': 'true'})
 
-        req = {'evacuate': {}}
-        if host:
-            req['evacuate']['host'] = host
-
-        self.api.post_server_action(server['id'], req)
-        self._wait_for_server_parameter(server,
-            {'OS-EXT-SRV-ATTR:host': 'host2',
-             'status': 'ACTIVE'})
+        self._evacuate_server(
+            server, {'host': host} if host else {}, expected_host='host2')
 
         self._check_allocation_during_evacuate(
             server, self.flavor_with_group_policy, self.compute1_rp_uuid,
@@ -7117,9 +7174,9 @@ class ServerMoveWithPortResourceRequestTest(
         self._assert_pci_request_pf_device_name(server, 'host2-ens2')
 
         # recover source compute
+        self.compute1 = self.restart_compute_service(self.compute1)
         self.admin_api.put_service(
             self.compute1_service_id, {'forced_down': 'false'})
-        self.compute1 = self.restart_compute_service(self.compute1)
 
         # check that source allocation is cleaned up and the dest allocation
         # and the port bindings are not touched.
@@ -7150,16 +7207,11 @@ class ServerMoveWithPortResourceRequestTest(
                 'nova.compute.resource_tracker.ResourceTracker.rebuild_claim',
                 side_effect=exception.ComputeResourcesUnavailable(
                     reason='test evacuate failure')):
-            req = {'evacuate': {}}
-            self.api.post_server_action(server['id'], req)
             # Evacuate does not have reschedule loop so evacuate expected to
             # simply fail and the server remains on the source host
-            server = self._wait_for_server_parameter(server,
-                {'OS-EXT-SRV-ATTR:host': 'host1',
-                 'status': 'ACTIVE',
-                 'OS-EXT-STS:task_state': None})
-
-        self._wait_for_migration_status(server, ['failed'])
+            server = self._evacuate_server(
+                server, expected_host='host1', expected_task_state=None,
+                expected_migration_status='failed')
 
         # As evacuation failed the resource allocation should be untouched
         self._check_allocation(
@@ -7167,9 +7219,9 @@ class ServerMoveWithPortResourceRequestTest(
             qos_normal_port, qos_sriov_port, self.flavor_with_group_policy)
 
         # recover source compute
+        self.compute1 = self.restart_compute_service(self.compute1)
         self.admin_api.put_service(
             self.compute1_service_id, {'forced_down': 'false'})
-        self.compute1 = self.restart_compute_service(self.compute1)
 
         # check again that even after source host recovery the source
         # allocation is intact
@@ -7185,7 +7237,7 @@ class ServerMoveWithPortResourceRequestTest(
         # unexpected. This will cause
         # update_pci_request_spec_with_allocated_interface_name() to raise
         # when the instance is evacuated to the host2.
-        rsp = self.placement_api.put(
+        rsp = self.placement.put(
             '/resource_providers/%s'
             % self.sriov_dev_rp_per_host[self.compute2_rp_uuid][self.PF2],
             {"name": "invalid-device-rp-name"})
@@ -7205,12 +7257,9 @@ class ServerMoveWithPortResourceRequestTest(
 
         # The compute manager on host2 will raise from
         # update_pci_request_spec_with_allocated_interface_name
-        self.api.post_server_action(server['id'], {'evacuate': {}})
-        server = self._wait_for_server_parameter(server,
-            {'OS-EXT-SRV-ATTR:host': 'host1',
-             'OS-EXT-STS:task_state': None,
-             'status': 'ERROR'})
-        self._wait_for_migration_status(server, ['failed'])
+        server = self._evacuate_server(
+            server, expected_host='host1', expected_state='ERROR',
+            expected_task_state=None, expected_migration_status='failed')
 
         self.assertIn(
             'does not have a properly formatted name',
@@ -7219,9 +7268,9 @@ class ServerMoveWithPortResourceRequestTest(
         self._wait_for_action_fail_completion(
             server, instance_actions.EVACUATE, 'compute_rebuild_instance')
 
-        fake_notifier.wait_for_versioned_notifications(
+        self.notifier.wait_for_versioned_notifications(
             'instance.rebuild.error')
-        fake_notifier.wait_for_versioned_notifications(
+        self.notifier.wait_for_versioned_notifications(
             'compute.exception')
 
         # and the instance allocates from the source host
@@ -7365,7 +7414,7 @@ class ServerMoveWithPortResourceRequestTest(
         # unexpected. This will cause
         # update_pci_request_spec_with_allocated_interface_name() to raise
         # when the instance is live migrated to the host2.
-        rsp = self.placement_api.put(
+        rsp = self.placement.put(
             '/resource_providers/%s'
             % self.sriov_dev_rp_per_host[self.compute2_rp_uuid][self.PF2],
             {"name": "invalid-device-rp-name"})
@@ -7404,6 +7453,167 @@ class ServerMoveWithPortResourceRequestTest(
 
         # Assert that the InstancePCIRequests still point to host1
         self._assert_pci_request_pf_device_name(server, 'host1-ens2')
+
+        self._delete_server_and_check_allocations(
+            server, qos_normal_port, qos_sriov_port)
+
+    def test_unshelve_offloaded_server_with_qos_port(self):
+        non_qos_normal_port = self.neutron.port_1
+        qos_normal_port = self.neutron.port_with_resource_request
+        qos_sriov_port = self.neutron.port_with_sriov_resource_request
+
+        server = self._create_server_with_ports_and_check_allocation(
+            non_qos_normal_port, qos_normal_port, qos_sriov_port)
+
+        # with default config shelve means immediate offload as well
+        req = {
+            'shelve': {}
+        }
+        self.api.post_server_action(server['id'], req)
+        self._wait_for_server_parameter(
+            server, {'status': 'SHELVED_OFFLOADED'})
+        allocations = self.placement.get(
+            '/allocations/%s' % server['id']).body['allocations']
+        self.assertEqual(0, len(allocations))
+
+        self.api.post_server_action(server['id'], {'unshelve': None})
+        self._wait_for_server_parameter(
+            server,
+            {'OS-EXT-SRV-ATTR:host': 'host1',
+             'status': 'ACTIVE'})
+        self._check_allocation(
+            server, self.compute1_rp_uuid, non_qos_normal_port,
+            qos_normal_port, qos_sriov_port, self.flavor_with_group_policy)
+
+        self._assert_pci_request_pf_device_name(server, 'host1-ens2')
+
+        # shelve offload again and then make host1 unusable so the subsequent
+        # unshelve needs to select host2
+        req = {
+            'shelve': {}
+        }
+        self.api.post_server_action(server['id'], req)
+        self._wait_for_server_parameter(
+            server, {'status': 'SHELVED_OFFLOADED'})
+        allocations = self.placement.get(
+            '/allocations/%s' % server['id']).body['allocations']
+        self.assertEqual(0, len(allocations))
+
+        self.admin_api.put_service(
+            self.compute1_service_id, {"status": "disabled"})
+
+        self.api.post_server_action(server['id'], {'unshelve': None})
+        self._wait_for_server_parameter(
+            server,
+            {'OS-EXT-SRV-ATTR:host': 'host2',
+             'status': 'ACTIVE'})
+
+        self._check_allocation(
+            server, self.compute2_rp_uuid, non_qos_normal_port,
+            qos_normal_port, qos_sriov_port, self.flavor_with_group_policy)
+
+        self._assert_pci_request_pf_device_name(server, 'host2-ens2')
+
+        self._delete_server_and_check_allocations(
+            server, qos_normal_port, qos_sriov_port)
+
+    def test_unshelve_offloaded_server_with_qos_port_pci_update_fails(self):
+        # Update the name of the network device RP of PF2 on host2 to something
+        # unexpected. This will cause
+        # update_pci_request_spec_with_allocated_interface_name() to raise
+        # when the instance is unshelved to the host2.
+        rsp = self.placement.put(
+            '/resource_providers/%s'
+            % self.sriov_dev_rp_per_host[self.compute2_rp_uuid][self.PF2],
+            {"name": "invalid-device-rp-name"})
+        self.assertEqual(200, rsp.status)
+
+        non_qos_normal_port = self.neutron.port_1
+        qos_normal_port = self.neutron.port_with_resource_request
+        qos_sriov_port = self.neutron.port_with_sriov_resource_request
+
+        server = self._create_server_with_ports_and_check_allocation(
+            non_qos_normal_port, qos_normal_port, qos_sriov_port)
+
+        # with default config shelve means immediate offload as well
+        req = {
+            'shelve': {}
+        }
+        self.api.post_server_action(server['id'], req)
+        self._wait_for_server_parameter(
+            server, {'status': 'SHELVED_OFFLOADED'})
+        allocations = self.placement.get(
+            '/allocations/%s' % server['id']).body['allocations']
+        self.assertEqual(0, len(allocations))
+
+        # make host1 unusable so the subsequent unshelve needs to select host2
+        self.admin_api.put_service(
+            self.compute1_service_id, {"status": "disabled"})
+
+        self.api.post_server_action(server['id'], {'unshelve': None})
+
+        # Unshelve fails on host2 due to
+        # update_pci_request_spec_with_allocated_interface_name fails so the
+        # instance goes back to shelve offloaded state
+        self.notifier.wait_for_versioned_notifications(
+            'instance.unshelve.start')
+        error_notification = self.notifier.wait_for_versioned_notifications(
+            'compute.exception')[0]
+        self.assertEqual(
+            'UnexpectedResourceProviderNameForPCIRequest',
+            error_notification['payload']['nova_object.data']['exception'])
+        server = self._wait_for_server_parameter(
+            server,
+            {'OS-EXT-STS:task_state': None,
+             'status': 'SHELVED_OFFLOADED'})
+
+        allocations = self.placement.get(
+            '/allocations/%s' % server['id']).body['allocations']
+        self.assertEqual(0, len(allocations))
+
+        self._delete_server_and_check_allocations(
+            server, qos_normal_port, qos_sriov_port)
+
+    def test_unshelve_offloaded_server_with_qos_port_fails_due_to_neutron(
+            self):
+        non_qos_normal_port = self.neutron.port_1
+        qos_normal_port = self.neutron.port_with_resource_request
+        qos_sriov_port = self.neutron.port_with_sriov_resource_request
+
+        server = self._create_server_with_ports_and_check_allocation(
+            non_qos_normal_port, qos_normal_port, qos_sriov_port)
+
+        # with default config shelve means immediate offload as well
+        req = {
+            'shelve': {}
+        }
+        self.api.post_server_action(server['id'], req)
+        self._wait_for_server_parameter(
+            server, {'status': 'SHELVED_OFFLOADED'})
+        allocations = self.placement.get(
+            '/allocations/%s' % server['id']).body['allocations']
+        self.assertEqual(0, len(allocations))
+
+        # Simulate that port update fails during unshelve due to neutron is
+        # unavailable
+        with mock.patch(
+                'nova.tests.fixtures.NeutronFixture.'
+                'update_port') as mock_update_port:
+            mock_update_port.side_effect = neutron_exception.ConnectionFailed(
+                reason='test')
+            req = {'unshelve': None}
+            self.api.post_server_action(server['id'], req)
+            self.notifier.wait_for_versioned_notifications(
+                'instance.unshelve.start')
+            self._wait_for_server_parameter(
+                server,
+                {'status': 'SHELVED_OFFLOADED',
+                 'OS-EXT-STS:task_state': None})
+
+        # As the instance went back to offloaded state we expect no allocation
+        allocations = self.placement.get(
+            '/allocations/%s' % server['id']).body['allocations']
+        self.assertEqual(0, len(allocations))
 
         self._delete_server_and_check_allocations(
             server, qos_normal_port, qos_sriov_port)
@@ -7505,7 +7715,7 @@ class PortResourceRequestReSchedulingTest(
                              if dest_compute_rp_uuid == self.compute2_rp_uuid
                              else self.compute2_rp_uuid)
 
-        allocations = self.placement_api.get(
+        allocations = self.placement.get(
             '/allocations/%s' % server['id']).body['allocations']
 
         # We expect one set of allocations for the compute resources on the
@@ -7579,3 +7789,666 @@ class PortResourceRequestReSchedulingTest(
         updated_port = self.neutron.show_port(port['id'])['port']
         binding_profile = neutronapi.get_binding_profile(updated_port)
         self.assertNotIn('allocation', binding_profile)
+
+
+class AcceleratorServerBase(integrated_helpers.ProviderUsageBaseTestCase):
+
+    compute_driver = 'fake.SmallFakeDriver'
+
+    def setUp(self):
+        super(AcceleratorServerBase, self).setUp()
+        self.cyborg = self.useFixture(nova_fixtures.CyborgFixture())
+        # dict of form {$compute_rp_uuid: $device_rp_uuid}
+        self.device_rp_map = {}
+        # self.NUM_HOSTS should be set up by derived classes
+        if not hasattr(self, 'NUM_HOSTS'):
+            self.NUM_HOSTS = 1
+        self._setup_compute_nodes_and_device_rps()
+
+    def _setup_compute_nodes_and_device_rps(self):
+        self.compute_services = []
+        for i in range(self.NUM_HOSTS):
+            svc = self._start_compute(host='accel_host' + str(i))
+            self.compute_services.append(svc)
+        self.compute_rp_uuids = [
+           rp['uuid'] for rp in self._get_all_providers()
+           if rp['uuid'] == rp['root_provider_uuid']]
+        for index, uuid in enumerate(self.compute_rp_uuids):
+            device_rp_uuid = self._create_device_rp(index, uuid)
+            self.device_rp_map[uuid] = device_rp_uuid
+        self.device_rp_uuids = list(self.device_rp_map.values())
+
+    def _create_device_rp(self, index, compute_rp_uuid,
+                          resource='FPGA', res_amt=2):
+        """Created nested RP for a device. There is one per host.
+
+        :param index: Number of the device rp uuid for this setup
+        :param compute_rp_uuid: Resource provider UUID of the host.
+        :param resource: Placement resource name.
+            Assumed to be a standard resource class.
+        :param res_amt: Amount of the resource.
+        :returns: Device RP UUID
+        """
+        resp = self._post_nested_resource_provider(
+            'FakeDevice' + str(index), parent_rp_uuid=compute_rp_uuid)
+        device_rp_uuid = resp['uuid']
+        inventory = {
+            'resource_provider_generation': 0,
+            'inventories': {
+                resource: {
+                    'total': res_amt,
+                    'allocation_ratio': 1.0,
+                    'max_unit': res_amt,
+                    'min_unit': 1,
+                    'reserved': 0,
+                    'step_size': 1,
+                 }
+             },
+        }
+        self._update_inventory(device_rp_uuid, inventory)
+        self._create_trait(self.cyborg.trait)
+        self._set_provider_traits(device_rp_uuid, [self.cyborg.trait])
+        return device_rp_uuid
+
+    def _post_nested_resource_provider(self, rp_name, parent_rp_uuid):
+        body = {'name': rp_name, 'parent_provider_uuid': parent_rp_uuid}
+        return self.placement.post(
+            url='/resource_providers', version='1.20', body=body).body
+
+    def _create_acc_flavor(self):
+        extra_specs = {'accel:device_profile': self.cyborg.dp_name}
+        flavor_id = self._create_flavor(name='acc.tiny',
+                                        extra_spec=extra_specs)
+        return flavor_id
+
+    def _check_allocations_usage(self, server, check_other_host_alloc=True):
+        # Check allocations on host where instance is running
+        server_uuid = server['id']
+
+        hostname = server['OS-EXT-SRV-ATTR:host']
+        server_host_rp_uuid = self._get_provider_uuid_by_host(hostname)
+        expected_host_alloc = {
+            'resources': {'VCPU': 2, 'MEMORY_MB': 2048, 'DISK_GB': 20},
+        }
+        expected_device_alloc = {'resources': {'FPGA': 1}}
+
+        for i in range(self.NUM_HOSTS):
+            compute_uuid = self.compute_rp_uuids[i]
+            device_uuid = self.device_rp_map[compute_uuid]
+            host_alloc = self._get_allocations_by_provider_uuid(compute_uuid)
+            device_alloc = self._get_allocations_by_provider_uuid(device_uuid)
+            if compute_uuid == server_host_rp_uuid:
+                self.assertEqual(expected_host_alloc, host_alloc[server_uuid])
+                self.assertEqual(expected_device_alloc,
+                                 device_alloc[server_uuid])
+            else:
+                if check_other_host_alloc:
+                    self.assertEqual({}, host_alloc)
+                self.assertEqual({}, device_alloc)
+
+        # NOTE(Sundar): ARQs for an instance could come from different
+        # devices in the same host, in general. But, in this test case,
+        # there is only one device in the host. So, we check for that.
+        device_rp_uuid = self.device_rp_map[server_host_rp_uuid]
+        expected_arq_bind_info = set([('Bound', hostname,
+                                       device_rp_uuid, server_uuid)])
+        arqs = nova_fixtures.CyborgFixture.fake_get_arqs_for_instance(
+            server_uuid)
+        # The state is hardcoded but other fields come from the test case.
+        arq_bind_info = {(arq['state'], arq['hostname'],
+                          arq['device_rp_uuid'], arq['instance_uuid'])
+                         for arq in arqs}
+        self.assertSetEqual(expected_arq_bind_info, arq_bind_info)
+
+    def _check_no_allocs_usage(self, server_uuid):
+        allocs = self._get_allocations_by_server_uuid(server_uuid)
+        self.assertEqual({}, allocs)
+
+        for i in range(self.NUM_HOSTS):
+            host_alloc = self._get_allocations_by_provider_uuid(
+                    self.compute_rp_uuids[i])
+            self.assertEqual({}, host_alloc)
+            device_alloc = self._get_allocations_by_provider_uuid(
+                    self.device_rp_uuids[i])
+            self.assertEqual({}, device_alloc)
+            usage = self._get_provider_usages(
+                self.device_rp_uuids[i]).get('FPGA')
+            self.assertEqual(0, usage)
+
+
+class AcceleratorServerTest(AcceleratorServerBase):
+    def setUp(self):
+        self.NUM_HOSTS = 1
+        super(AcceleratorServerTest, self).setUp()
+
+    def _get_server(self, expected_state='ACTIVE'):
+        flavor_id = self._create_acc_flavor()
+        server_name = 'accel_server1'
+        server = self._create_server(
+            server_name, flavor_id=flavor_id,
+            image_uuid='155d900f-4e14-4e4c-a73d-069cbf4541e6',
+            networks='none', expected_state=expected_state)
+        return server
+
+    def test_create_delete_server_ok(self):
+        server = self._get_server()
+
+        # Verify that the host name and the device rp UUID are set properly.
+        # Other fields in the ARQ are hardcoded data from the fixture.
+        arqs = self.cyborg.fake_get_arqs_for_instance(server['id'])
+        self.assertEqual(self.device_rp_uuids[0], arqs[0]['device_rp_uuid'])
+        self.assertEqual(server['OS-EXT-SRV-ATTR:host'], arqs[0]['hostname'])
+
+        # Check allocations and usage
+        self._check_allocations_usage(server)
+
+        # Delete server and check that ARQs got deleted
+        self.api.delete_server(server['id'])
+        self._wait_until_deleted(server)
+        self.cyborg.mock_del_arqs.assert_called_once_with(server['id'])
+
+        # Check that resources are freed
+        self._check_no_allocs_usage(server['id'])
+
+    def test_create_server_with_error(self):
+
+        def throw_error(*args, **kwargs):
+            raise exception.BuildAbortException(reason='',
+                    instance_uuid='fake')
+
+        self.stub_out('nova.virt.fake.FakeDriver.spawn', throw_error)
+
+        server = self._get_server(expected_state='ERROR')
+        server_uuid = server['id']
+        # Check that Cyborg was called to delete ARQs
+        self.cyborg.mock_del_arqs.assert_called_once_with(server_uuid)
+
+        # BuildAbortException will not trigger a reschedule and the placement
+        # cleanup is the last step in the compute manager after instance state
+        # setting, fault recording and notification sending. So we have no
+        # other way than simply wait to ensure the placement cleanup happens
+        # before we assert it.
+        def placement_cleanup():
+            # An instance in error state should consume no resources
+            self._check_no_allocs_usage(server_uuid)
+
+        self._wait_for_assert(placement_cleanup)
+
+        self.api.delete_server(server_uuid)
+        self._wait_until_deleted(server)
+        # Verify that there is one more call to delete ARQs
+        self.cyborg.mock_del_arqs.assert_has_calls(
+            [mock.call(server_uuid), mock.call(server_uuid)])
+
+        # Verify that no allocations/usages remain after deletion
+        self._check_no_allocs_usage(server_uuid)
+
+    def test_create_server_with_local_delete(self):
+        """Delete the server when compute service is down."""
+        server = self._get_server()
+        server_uuid = server['id']
+
+        # Stop the server.
+        self.api.post_server_action(server_uuid, {'os-stop': {}})
+        self._wait_for_state_change(server, 'SHUTOFF')
+        self._check_allocations_usage(server)
+        # Stop and force down the compute service.
+        compute_id = self.admin_api.get_services(
+            host='accel_host0', binary='nova-compute')[0]['id']
+        self.compute_services[0].stop()
+        self.admin_api.put_service(compute_id, {'forced_down': 'true'})
+
+        # Delete the server with compute service down.
+        self.api.delete_server(server_uuid)
+        self.cyborg.mock_del_arqs.assert_called_once_with(server_uuid)
+        self._check_no_allocs_usage(server_uuid)
+
+        # Restart the compute service to see if anything fails.
+        self.admin_api.put_service(compute_id, {'forced_down': 'false'})
+        self.compute_services[0].start()
+
+
+class AcceleratorServerReschedTest(AcceleratorServerBase):
+
+    def setUp(self):
+        self.NUM_HOSTS = 2
+        super(AcceleratorServerReschedTest, self).setUp()
+
+    def test_resched(self):
+        orig_spawn = fake.FakeDriver.spawn
+
+        def fake_spawn(*args, **kwargs):
+            fake_spawn.count += 1
+            if fake_spawn.count == 1:
+                raise exception.ComputeResourcesUnavailable(
+                    reason='First host fake fail.', instance_uuid='fake')
+            else:
+                orig_spawn(*args, **kwargs)
+        fake_spawn.count = 0
+
+        with mock.patch('nova.virt.fake.FakeDriver.spawn', new=fake_spawn):
+            flavor_id = self._create_acc_flavor()
+            server_name = 'accel_server1'
+            server = self._create_server(
+                server_name, flavor_id=flavor_id,
+                image_uuid='155d900f-4e14-4e4c-a73d-069cbf4541e6',
+                networks='none', expected_state='ACTIVE')
+
+        self.assertEqual(2, fake_spawn.count)
+        self._check_allocations_usage(server)
+        self.cyborg.mock_del_arqs.assert_called_once_with(server['id'])
+
+    def test_resched_fails(self):
+
+        def throw_error(*args, **kwargs):
+            raise exception.ComputeResourcesUnavailable(reason='',
+                    instance_uuid='fake')
+
+        self.stub_out('nova.virt.fake.FakeDriver.spawn', throw_error)
+
+        flavor_id = self._create_acc_flavor()
+        server_name = 'accel_server1'
+        server = self._create_server(
+            server_name, flavor_id=flavor_id,
+            image_uuid='155d900f-4e14-4e4c-a73d-069cbf4541e6',
+            networks='none', expected_state='ERROR')
+
+        server_uuid = server['id']
+        self._check_no_allocs_usage(server_uuid)
+        self.cyborg.mock_del_arqs.assert_has_calls(
+            [mock.call(server_uuid),
+             mock.call(server_uuid),
+             mock.call(server_uuid)])
+
+
+class AcceleratorServerOpsTest(AcceleratorServerBase):
+
+    def setUp(self):
+        self.NUM_HOSTS = 2  # 2nd host needed for evacuate
+        super(AcceleratorServerOpsTest, self).setUp()
+        flavor_id = self._create_acc_flavor()
+        server_name = 'accel_server1'
+        self.server = self._create_server(
+            server_name, flavor_id=flavor_id,
+            image_uuid='155d900f-4e14-4e4c-a73d-069cbf4541e6',
+            networks='none', expected_state='ACTIVE')
+
+    def _test_evacuate(self, server, num_hosts):
+        server_hostname = server['OS-EXT-SRV-ATTR:host']
+        for i in range(num_hosts):
+            if self.compute_services[i].host == server_hostname:
+                compute_to_stop = self.compute_services[i]
+            else:
+                compute_to_evacuate = self.compute_services[i]
+        # Stop and force down the compute service.
+        compute_id = self.admin_api.get_services(
+            host=server_hostname, binary='nova-compute')[0]['id']
+        compute_to_stop.stop()
+        self.admin_api.put_service(compute_id, {'forced_down': 'true'})
+        return compute_to_stop, compute_to_evacuate
+
+    def test_soft_reboot_ok(self):
+        self._reboot_server(self.server)
+        self._check_allocations_usage(self.server)
+
+    def test_hard_reboot_ok(self):
+        self._reboot_server(self.server, hard=True)
+        self._check_allocations_usage(self.server)
+
+    def test_pause_unpause_ok(self):
+        # Pause and unpause should work with accelerators.
+        # This is not a general test of un/pause functionality.
+        self.api.post_server_action(self.server['id'], {'pause': {}})
+        self._wait_for_state_change(self.server, 'PAUSED')
+        self._check_allocations_usage(self.server)
+        # ARQs didn't get deleted (and so didn't have to be re-created).
+        self.cyborg.mock_del_arqs.assert_not_called()
+
+        self.api.post_server_action(self.server['id'], {'unpause': {}})
+        self._wait_for_state_change(self.server, 'ACTIVE')
+        self._check_allocations_usage(self.server)
+
+    def test_stop_start_ok(self):
+        # Stop and start should work with accelerators.
+        # This is not a general test of start/stop functionality.
+        self.api.post_server_action(self.server['id'], {'os-stop': {}})
+        self._wait_for_state_change(self.server, 'SHUTOFF')
+        self._check_allocations_usage(self.server)
+        # ARQs didn't get deleted (and so didn't have to be re-created).
+        self.cyborg.mock_del_arqs.assert_not_called()
+
+        self.api.post_server_action(self.server['id'], {'os-start': {}})
+        self._wait_for_state_change(self.server, 'ACTIVE')
+        self._check_allocations_usage(self.server)
+
+    def test_lock_unlock_ok(self):
+        # Lock/unlock are no-ops for accelerators.
+        self.api.post_server_action(self.server['id'], {'lock': {}})
+        server = self.api.get_server(self.server['id'])
+        self.assertTrue(server['locked'])
+        self._check_allocations_usage(self.server)
+
+        self.api.post_server_action(self.server['id'], {'unlock': {}})
+        server = self.api.get_server(self.server['id'])
+        self.assertTrue(not server['locked'])
+        self._check_allocations_usage(self.server)
+
+    def test_backup_ok(self):
+        self.api.post_server_action(self.server['id'],
+            {'createBackup': {
+                'name': 'Backup 1',
+                'backup_type': 'daily',
+                'rotation': 1}})
+        self._check_allocations_usage(self.server)
+
+    def test_create_image_ok(self):  # snapshot
+        self.api.post_server_action(self.server['id'],
+            {'createImage': {
+                'name': 'foo-image',
+                'metadata': {'meta_var': 'meta_val'}}})
+        self._check_allocations_usage(self.server)
+
+    def test_rescue_unrescue_ok(self):
+        self.api.post_server_action(self.server['id'],
+            {'rescue': {
+                'adminPass': 'MySecretPass',
+                'rescue_image_ref': '70a599e0-31e7-49b7-b260-868f441e862b'}})
+        self._check_allocations_usage(self.server)
+        # ARQs didn't get deleted (and so didn't have to be re-created).
+        self.cyborg.mock_del_arqs.assert_not_called()
+        self._wait_for_state_change(self.server, 'RESCUE')
+
+        self.api.post_server_action(self.server['id'], {'unrescue': {}})
+        self._check_allocations_usage(self.server)
+
+    def test_evacuate_ok(self):
+        server_hostname = self.server['OS-EXT-SRV-ATTR:host']
+        arqs = self.cyborg.fake_get_arqs_for_instance(self.server['id'])
+        compute_to_stop, compute_to_evacuate = self._test_evacuate(
+            self.server, self.NUM_HOSTS)
+        self._evacuate_server(self.server, {'host': compute_to_evacuate.host})
+        compute_to_stop.start()
+        self.server = self.api.get_server(self.server['id'])
+        arqs_new = self.cyborg.fake_get_arqs_for_instance(self.server['id'])
+        evac_hostname = self.server['OS-EXT-SRV-ATTR:host']
+        self.assertNotEqual(server_hostname, evac_hostname)
+        self.assertEqual(server_hostname, arqs[0]['hostname'])
+        self.assertEqual(evac_hostname, arqs_new[0]['hostname'])
+
+    def test_rebuild_ok(self):
+        rebuild_image_ref = self.glance.auto_disk_config_enabled_image['id']
+        self.api.post_server_action(self.server['id'],
+            {'rebuild': {
+                'imageRef': rebuild_image_ref,
+                'OS-DCF:diskConfig': 'AUTO'}})
+        self.notifier.wait_for_versioned_notifications('instance.rebuild.end')
+        self._wait_for_state_change(self.server, 'ACTIVE')
+        self._check_allocations_usage(self.server)
+
+    def test_shelve_and_unshelve_ok(self):
+        self.flags(shelved_offload_time=1)
+        arqs = self.cyborg.fake_get_arqs_for_instance(self.server['id'])
+        self.assertEqual(len(arqs), 1)
+        self._shelve_server(self.server, 'SHELVED')
+        arqs = self.cyborg.fake_get_arqs_for_instance(self.server['id'])
+        self.assertEqual(len(arqs), 1)
+        self._unshelve_server(self.server)
+        arqs = self.cyborg.fake_get_arqs_for_instance(self.server['id'])
+        self.assertEqual(len(arqs), 1)
+
+    def test_shelve_offload_and_unshelve_ok(self):
+        self.flags(shelved_offload_time=-1)
+        arqs = self.cyborg.fake_get_arqs_for_instance(self.server['id'])
+        self.assertEqual(len(arqs), 1)
+        self._shelve_server(self.server, 'SHELVED')
+        self._shelve_offload_server(self.server)
+        arqs = self.cyborg.fake_get_arqs_for_instance(self.server['id'])
+        self.assertEqual(len(arqs), 0)
+        self._unshelve_server(self.server)
+        arqs = self.cyborg.fake_get_arqs_for_instance(self.server['id'])
+        self.assertEqual(len(arqs), 1)
+
+    def test_resize_fails(self):
+        ex = self.assertRaises(client.OpenStackApiException,
+            self.api.post_server_action, self.server['id'],
+            {'resize': {'flavorRef': '2', 'OS-DCF:diskConfig': 'AUTO'}})
+        self.assertEqual(403, ex.response.status_code)
+        self._check_allocations_usage(self.server)
+
+    def test_suspend_fails(self):
+        ex = self.assertRaises(client.OpenStackApiException,
+            self.api.post_server_action, self.server['id'], {'suspend': {}})
+        self.assertEqual(403, ex.response.status_code)
+        self._check_allocations_usage(self.server)
+
+    def test_migrate_fails(self):
+        ex = self.assertRaises(client.OpenStackApiException,
+            self.api.post_server_action, self.server['id'], {'migrate': {}})
+        self.assertEqual(403, ex.response.status_code)
+        self._check_allocations_usage(self.server)
+
+    def test_live_migrate_fails(self):
+        ex = self.assertRaises(client.OpenStackApiException,
+            self.api.post_server_action, self.server['id'],
+            {'migrate': {'host': 'accel_host1'}})
+        self.assertEqual(403, ex.response.status_code)
+        self._check_allocations_usage(self.server)
+
+    @mock.patch.object(objects.service, 'get_minimum_version_all_cells')
+    def test_evacuate_old_compute(self, old_compute_version):
+        """Tests when the source compute service is too old to call
+        evacuate so OpenStackApiException is raised.
+        """
+        old_compute_version.return_value = 52
+        _, compute_to_evacuate = self._test_evacuate(
+            self.server, self.NUM_HOSTS)
+
+        ex = self.assertRaises(client.OpenStackApiException,
+            self.api.post_server_action, self.server['id'],
+            {'evacuate': {
+                 'host': compute_to_evacuate.host,
+                 'adminPass': 'MySecretPass'}})
+        self.assertEqual(403, ex.response.status_code)
+        self._check_allocations_usage(self.server)
+
+    @mock.patch.object(objects.service, 'get_minimum_version_all_cells')
+    def test_rebuild_old_compute(self, old_compute_version):
+        """Tests when the source compute service is too old to call
+        rebuild so OpenStackApiException is raised.
+        """
+        old_compute_version.return_value = 52
+        rebuild_image_ref = self.glance.auto_disk_config_enabled_image['id']
+
+        ex = self.assertRaises(client.OpenStackApiException,
+            self.api.post_server_action, self.server['id'],
+            {'rebuild': {
+                'imageRef': rebuild_image_ref,
+                'OS-DCF:diskConfig': 'AUTO'}})
+        self.assertEqual(403, ex.response.status_code)
+        self._check_allocations_usage(self.server)
+
+    @mock.patch.object(objects.service, 'get_minimum_version_all_cells')
+    def test_shelve_old_compute(self, old_compute_version):
+        """Tests when the source compute service is too old to call
+        shelve so OpenStackApiException is raised.
+        """
+        old_compute_version.return_value = 53
+        ex = self.assertRaises(client.OpenStackApiException,
+            self.api.post_server_action, self.server['id'],
+            {'shelve': {}})
+        self.assertEqual(403, ex.response.status_code)
+        self._check_allocations_usage(self.server)
+
+    def _test_shelve_instance_with_compute_rpc_pin(
+            self, version_cap, body=None):
+        self.flags(compute=version_cap, group='upgrade_levels')
+
+        self.flags(shelved_offload_time=-1)
+        self.api.post_server_action(self.server['id'], body)
+        self._wait_for_state_change(self.server, 'SHELVED')
+
+    def test_shelve_with_compute_rpc_pin_5_0(self):
+        self.flags(compute=5.0, group='upgrade_levels')
+        compute_rpcapi.reset_globals()
+        ex = self.assertRaises(
+            client.OpenStackApiException, self.api.post_server_action,
+            self.server['id'], {'shelve': {}})
+        self.assertEqual(403, ex.response.status_code)
+
+    def test_shelve_instance_5_13(self):
+        body = {'shelve': {}}
+        self._test_shelve_instance_with_compute_rpc_pin(
+                '5.13', body=body)
+
+    def _test_shelve_offload_instance_with_compute_rpc_pin(self, version_cap):
+        self.flags(compute=version_cap, group='upgrade_levels')
+
+        self.flags(shelved_offload_time=2)
+        self.api.post_server_action(self.server['id'], {'shelve': {}})
+        self._wait_for_state_change(self.server, 'SHELVED')
+
+        self.api.post_server_action(self.server['id'], {'shelveOffload': {}})
+        self._wait_for_state_change(self.server, 'SHELVED_OFFLOADED')
+
+    def test_shelve_offload_instance_5_0(self):
+        self._test_shelve_offload_instance_with_compute_rpc_pin('5.0')
+
+    def test_shelve_offload_instance_5_13(self):
+        self._test_shelve_offload_instance_with_compute_rpc_pin('5.13')
+
+    def _test_unshelve_instance_with_compute_rpc_pin(
+            self, version_cap, body=None):
+        self.flags(compute=version_cap, group='upgrade_levels')
+
+        self.api.microversion = '2.87'
+        self.api.post_server_action(self.server['id'], {'shelve': {}})
+        self._wait_for_state_change(self.server, 'SHELVED_OFFLOADED')
+
+        self.api.post_server_action(self.server['id'], body)
+        self._wait_for_state_change(self.server, 'ACTIVE')
+
+    def test_unshelve_instance_5_0(self):
+        body = {'unshelve': None}
+        self._test_unshelve_instance_with_compute_rpc_pin(
+                '5.0', body=body)
+
+    def test_unshelve_instance_5_2(self):
+        body = {'unshelve': None}
+        self._test_unshelve_instance_with_compute_rpc_pin(
+                '5.2', body=body)
+
+    def test_unshelve_instance_5_13(self):
+        body = {'unshelve': None}
+        self._test_unshelve_instance_with_compute_rpc_pin(
+                '5.13', body=body)
+
+
+class CrossCellResizeWithQoSPort(PortResourceRequestBasedSchedulingTestBase):
+    NUMBER_OF_CELLS = 2
+
+    def setUp(self):
+        # Use our custom weigher defined above to make sure that we have
+        # a predictable host order in the alternate list returned by the
+        # scheduler for migration.
+        self.useFixture(nova_fixtures.HostNameWeigherFixture())
+        super(CrossCellResizeWithQoSPort, self).setUp()
+        # start compute2 in cell2, compute1 is started in cell1 by default
+        self.compute2 = self._start_compute('host2', cell_name='cell2')
+        self.compute2_rp_uuid = self._get_provider_uuid_by_host('host2')
+        self._create_networking_rp_tree('host2', self.compute2_rp_uuid)
+        self.compute2_service_id = self.admin_api.get_services(
+            host='host2', binary='nova-compute')[0]['id']
+
+        # Enable cross-cell resize policy since it defaults to not allow
+        # anyone to perform that type of operation. For these tests we'll
+        # just allow admins to perform cross-cell resize.
+        self.policy.set_rules({
+            servers_policies.CROSS_CELL_RESIZE:
+                base_policies.RULE_ADMIN_API},
+            overwrite=False)
+
+    def test_cross_cell_migrate_server_with_qos_ports(self):
+        """Test that cross cell migration is not supported with qos ports and
+        nova therefore falls back to do a same cell migration instead.
+        To test this properly we first make sure that there is no valid host
+        in the same cell but there is valid host in another cell and observe
+        that the migration fails with NoValidHost. Then we start a new compute
+        in the same cell the instance is in and retry the migration that is now
+        expected to pass.
+        """
+
+        non_qos_normal_port = self.neutron.port_1
+        qos_normal_port = self.neutron.port_with_resource_request
+        qos_sriov_port = self.neutron.port_with_sriov_resource_request
+
+        server = self._create_server_with_ports_and_check_allocation(
+            non_qos_normal_port, qos_normal_port, qos_sriov_port)
+
+        orig_create_binding = self.neutron.create_port_binding
+
+        hosts = {
+            'host1': self.compute1_rp_uuid, 'host2': self.compute2_rp_uuid,
+        }
+
+        # Add an extra check to our neutron fixture. This check makes sure that
+        # the RP sent in the binding corresponds to host of the binding. In a
+        # real deployment this is checked by the Neutron server. As bug
+        # 1907522 showed we fail this check for cross cell migration with qos
+        # ports in a real deployment. So to reproduce that bug we need to have
+        # the same check in our test env too.
+        def spy_on_create_binding(port_id, data):
+            host_rp_uuid = hosts[data['binding']['host']]
+            device_rp_uuid = data['binding']['profile'].get('allocation')
+            if port_id == qos_normal_port['id']:
+                if device_rp_uuid != self.ovs_bridge_rp_per_host[host_rp_uuid]:
+                    raise exception.PortBindingFailed(port_id=port_id)
+            elif port_id == qos_sriov_port['id']:
+                if (
+                    device_rp_uuid not in
+                    self.sriov_dev_rp_per_host[host_rp_uuid].values()
+                ):
+                    raise exception.PortBindingFailed(port_id=port_id)
+
+            return orig_create_binding(port_id, data)
+
+        with mock.patch(
+            'nova.tests.fixtures.NeutronFixture.create_port_binding',
+            side_effect=spy_on_create_binding, autospec=True
+        ):
+            # We expect the migration to fail as the only available target
+            # host is in a different cell and while cross cell migration is
+            # enabled it is not supported for neutron ports with resource
+            # request.
+            self.api.post_server_action(server['id'], {'migrate': None})
+            self._wait_for_migration_status(server, ['error'])
+            self._wait_for_server_parameter(
+                server,
+                {'status': 'ACTIVE', 'OS-EXT-SRV-ATTR:host': 'host1'})
+            event = self._wait_for_action_fail_completion(
+                server, 'migrate', 'conductor_migrate_server')
+            self.assertIn(
+                'exception.NoValidHost', event['traceback'])
+            self.assertIn(
+                'Request is allowed by policy to perform cross-cell resize '
+                'but the instance has ports with resource request and '
+                'cross-cell resize is not supported with such ports.',
+                self.stdlog.logger.output)
+            self.assertNotIn(
+                'nova.exception.PortBindingFailed: Binding failed for port',
+                self.stdlog.logger.output)
+
+        # Now start a new compute in the same cell as the instance and retry
+        # the migration.
+        self._start_compute('host3', cell_name='cell1')
+        self.compute3_rp_uuid = self._get_provider_uuid_by_host('host3')
+        self._create_networking_rp_tree('host3', self.compute3_rp_uuid)
+
+        with mock.patch(
+            'nova.tests.fixtures.NeutronFixture.create_port_binding',
+            side_effect=spy_on_create_binding, autospec=True
+        ):
+            server = self._migrate_server(server)
+            self.assertEqual('host3', server['OS-EXT-SRV-ATTR:host'])
+
+        self._delete_server_and_check_allocations(
+            server, qos_normal_port, qos_sriov_port)

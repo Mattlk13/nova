@@ -19,7 +19,6 @@ import fixtures as fx
 import testtools
 
 from nova.tests import fixtures
-from nova.tests.unit import conf_fixture
 
 """Test request logging middleware under various conditions.
 
@@ -42,7 +41,8 @@ class TestRequestLogMiddleware(testtools.TestCase):
         # this is the minimal set of magic mocks needed to convince
         # the API service it can start on it's own without a database.
         mocks = ['nova.objects.Service.get_by_host_and_binary',
-                 'nova.objects.Service.create']
+                 'nova.objects.Service.create',
+                 'nova.utils.raise_if_old_compute']
         self.stdlog = fixtures.StandardLogging()
         self.useFixture(self.stdlog)
         for m in mocks:
@@ -58,7 +58,7 @@ class TestRequestLogMiddleware(testtools.TestCase):
         """
 
         emit.return_value = True
-        self.useFixture(conf_fixture.ConfFixture())
+        conf = self.useFixture(fixtures.ConfFixture()).conf
         self.useFixture(fixtures.RPCFixture('nova.test'))
         api = self.useFixture(fixtures.OSAPIFixture()).api
 
@@ -73,6 +73,25 @@ class TestRequestLogMiddleware(testtools.TestCase):
                 '"GET /" status: 200 len: %s' % content_length)
         self.assertIn(log1, self.stdlog.logger.output)
 
+        # Verify handling of X-Forwarded-For header, example: load balancer.
+        # First, try without setting CONF.api.use_forwarded_for, it should not
+        # use the header value.
+        headers = {'X-Forwarded-For': '1.2.3.4'}
+        resp = api.api_request('/', strip_version=True, headers=headers)
+        content_length = resp.headers['content-length']
+        log2 = ('INFO [nova.api.openstack.requestlog] 127.0.0.1 '
+                '"GET /" status: 200 len: %s' % content_length)
+        self.assertIn(log2, self.stdlog.logger.output)
+
+        # Now set CONF.api.use_forwarded_for, it should use the header value.
+        conf.set_override('use_forwarded_for', True, 'api')
+        headers = {'X-Forwarded-For': '1.2.3.4'}
+        resp = api.api_request('/', strip_version=True, headers=headers)
+        content_length = resp.headers['content-length']
+        log3 = ('INFO [nova.api.openstack.requestlog] 1.2.3.4 '
+                '"GET /" status: 200 len: %s' % content_length)
+        self.assertIn(log3, self.stdlog.logger.output)
+
     @mock.patch('nova.api.openstack.requestlog.RequestLog._should_emit')
     def test_logs_mv(self, emit):
         """Ensure logs register microversion if passed.
@@ -82,7 +101,7 @@ class TestRequestLogMiddleware(testtools.TestCase):
         """
 
         emit.return_value = True
-        self.useFixture(conf_fixture.ConfFixture())
+        self.useFixture(fixtures.ConfFixture())
         # NOTE(sdague): all these tests are using the
         self.useFixture(
             fx.MonkeyPatch(
@@ -114,7 +133,7 @@ class TestRequestLogMiddleware(testtools.TestCase):
 
         emit.return_value = True
         v_index.side_effect = Exception("Unexpected Error")
-        self.useFixture(conf_fixture.ConfFixture())
+        self.useFixture(fixtures.ConfFixture())
         self.useFixture(fixtures.RPCFixture('nova.test'))
         api = self.useFixture(fixtures.OSAPIFixture()).api
 
@@ -136,7 +155,7 @@ class TestRequestLogMiddleware(testtools.TestCase):
         """
 
         emit.return_value = False
-        self.useFixture(conf_fixture.ConfFixture())
+        self.useFixture(fixtures.ConfFixture())
         self.useFixture(fixtures.RPCFixture('nova.test'))
         api = self.useFixture(fixtures.OSAPIFixture()).api
 

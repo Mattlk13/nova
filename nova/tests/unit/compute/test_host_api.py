@@ -27,7 +27,6 @@ from nova import objects
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.unit.api.openstack import fakes
-from nova.tests.unit import fake_notifier
 from nova.tests.unit.objects import test_objects
 from nova.tests.unit.objects import test_service
 
@@ -38,8 +37,8 @@ class ComputeHostAPITestCase(test.TestCase):
         self.host_api = compute.HostAPI()
         self.aggregate_api = compute.AggregateAPI()
         self.ctxt = context.get_admin_context()
-        fake_notifier.stub_notifier(self)
-        self.addCleanup(fake_notifier.reset)
+        self.notifier = self.useFixture(
+            nova_fixtures.NotificationFixture(self))
         self.req = fakes.HTTPRequest.blank('')
         self.controller = services.ServiceController()
         self.useFixture(nova_fixtures.SingleCellSimple())
@@ -55,7 +54,6 @@ class ComputeHostAPITestCase(test.TestCase):
             self._compare_obj(obj, db_obj_list[index])
 
     def test_set_host_enabled(self):
-        fake_notifier.NOTIFICATIONS = []
 
         @mock.patch.object(self.host_api.rpcapi, 'set_host_enabled',
                            return_value='fake-result')
@@ -65,14 +63,14 @@ class ComputeHostAPITestCase(test.TestCase):
             result = self.host_api.set_host_enabled(self.ctxt, 'fake_host',
                                                     'fake_enabled')
             self.assertEqual('fake-result', result)
-            self.assertEqual(2, len(fake_notifier.NOTIFICATIONS))
-            msg = fake_notifier.NOTIFICATIONS[0]
+            self.assertEqual(2, len(self.notifier.notifications))
+            msg = self.notifier.notifications[0]
             self.assertEqual('HostAPI.set_enabled.start', msg.event_type)
             self.assertEqual('api.fake_host', msg.publisher_id)
             self.assertEqual('INFO', msg.priority)
             self.assertEqual('fake_enabled', msg.payload['enabled'])
             self.assertEqual('fake_host', msg.payload['host_name'])
-            msg = fake_notifier.NOTIFICATIONS[1]
+            msg = self.notifier.notifications[1]
             self.assertEqual('HostAPI.set_enabled.end', msg.event_type)
             self.assertEqual('api.fake_host', msg.publisher_id)
             self.assertEqual('INFO', msg.priority)
@@ -104,20 +102,22 @@ class ComputeHostAPITestCase(test.TestCase):
 
         _do_test()
 
-    def test_get_host_uptime_service_down(self):
-        @mock.patch.object(self.host_api.db, 'service_get_by_compute_host',
-                           return_value=dict(test_service.fake_service, id=1))
-        @mock.patch.object(self.host_api.servicegroup_api, 'service_is_up',
-                           return_value=False)
-        def _do_test(mock_service_is_up, mock_service_get_by_compute_host):
+    @mock.patch('nova.db.api.service_get_by_compute_host')
+    def test_get_host_uptime_service_down(
+        self, mock_get_service_get_by_compute_host,
+    ):
+        mock_get_service_get_by_compute_host.return_value = dict(
+            test_service.fake_service, id=1)
+
+        with mock.patch.object(
+            self.host_api.servicegroup_api, 'service_is_up',
+            return_value=False,
+        ):
             self.assertRaises(exception.ComputeServiceUnavailable,
                               self.host_api.get_host_uptime, self.ctxt,
                               'fake_host')
 
-        _do_test()
-
     def test_host_power_action(self):
-        fake_notifier.NOTIFICATIONS = []
 
         @mock.patch.object(self.host_api.rpcapi, 'host_power_action',
                            return_value='fake-result')
@@ -127,14 +127,14 @@ class ComputeHostAPITestCase(test.TestCase):
             result = self.host_api.host_power_action(self.ctxt, 'fake_host',
                                                      'fake_action')
             self.assertEqual('fake-result', result)
-            self.assertEqual(2, len(fake_notifier.NOTIFICATIONS))
-            msg = fake_notifier.NOTIFICATIONS[0]
+            self.assertEqual(2, len(self.notifier.notifications))
+            msg = self.notifier.notifications[0]
             self.assertEqual('HostAPI.power_action.start', msg.event_type)
             self.assertEqual('api.fake_host', msg.publisher_id)
             self.assertEqual('INFO', msg.priority)
             self.assertEqual('fake_action', msg.payload['action'])
             self.assertEqual('fake_host', msg.payload['host_name'])
-            msg = fake_notifier.NOTIFICATIONS[1]
+            msg = self.notifier.notifications[1]
             self.assertEqual('HostAPI.power_action.end', msg.event_type)
             self.assertEqual('api.fake_host', msg.publisher_id)
             self.assertEqual('INFO', msg.priority)
@@ -144,7 +144,6 @@ class ComputeHostAPITestCase(test.TestCase):
         _do_test()
 
     def test_set_host_maintenance(self):
-        fake_notifier.NOTIFICATIONS = []
 
         @mock.patch.object(self.host_api.rpcapi, 'host_maintenance_mode',
                            return_value='fake-result')
@@ -154,14 +153,14 @@ class ComputeHostAPITestCase(test.TestCase):
             result = self.host_api.set_host_maintenance(self.ctxt, 'fake_host',
                                                         'fake_mode')
             self.assertEqual('fake-result', result)
-            self.assertEqual(2, len(fake_notifier.NOTIFICATIONS))
-            msg = fake_notifier.NOTIFICATIONS[0]
+            self.assertEqual(2, len(self.notifier.notifications))
+            msg = self.notifier.notifications[0]
             self.assertEqual('HostAPI.set_maintenance.start', msg.event_type)
             self.assertEqual('api.fake_host', msg.publisher_id)
             self.assertEqual('INFO', msg.priority)
             self.assertEqual('fake_host', msg.payload['host_name'])
             self.assertEqual('fake_mode', msg.payload['mode'])
-            msg = fake_notifier.NOTIFICATIONS[1]
+            msg = self.notifier.notifications[1]
             self.assertEqual('HostAPI.set_maintenance.end', msg.event_type)
             self.assertEqual('api.fake_host', msg.publisher_id)
             self.assertEqual('INFO', msg.priority)
@@ -230,39 +229,37 @@ class ComputeHostAPITestCase(test.TestCase):
                                         None, set_zones=False)
         mock_get_hm.assert_called_once_with(self.ctxt, cells[1].id)
 
-    def test_service_get_all_no_zones(self):
+    @mock.patch('nova.db.api.service_get_all')
+    def test_service_get_all_no_zones(self, mock_service_get_all):
         services = [dict(test_service.fake_service,
                          id=1, topic='compute', host='host1'),
                     dict(test_service.fake_service,
                          topic='compute', host='host2')]
 
-        @mock.patch.object(self.host_api.db, 'service_get_all')
-        def _do_test(mock_service_get_all):
-            mock_service_get_all.return_value = services
-            # Test no filters
-            result = self.host_api.service_get_all(self.ctxt)
-            mock_service_get_all.assert_called_once_with(self.ctxt,
-                                                         disabled=None)
-            self._compare_objs(result, services)
+        mock_service_get_all.return_value = services
+        # Test no filters
+        result = self.host_api.service_get_all(self.ctxt)
+        mock_service_get_all.assert_called_once_with(self.ctxt,
+                                                     disabled=None)
+        self._compare_objs(result, services)
 
-            # Test no filters #2
-            mock_service_get_all.reset_mock()
-            result = self.host_api.service_get_all(self.ctxt, filters={})
-            mock_service_get_all.assert_called_once_with(self.ctxt,
-                                                         disabled=None)
-            self._compare_objs(result, services)
+        # Test no filters #2
+        mock_service_get_all.reset_mock()
+        result = self.host_api.service_get_all(self.ctxt, filters={})
+        mock_service_get_all.assert_called_once_with(self.ctxt,
+                                                     disabled=None)
+        self._compare_objs(result, services)
 
-            # Test w/ filter
-            mock_service_get_all.reset_mock()
-            result = self.host_api.service_get_all(self.ctxt,
-                                                   filters=dict(host='host2'))
-            mock_service_get_all.assert_called_once_with(self.ctxt,
-                                                         disabled=None)
-            self._compare_objs(result, [services[1]])
+        # Test w/ filter
+        mock_service_get_all.reset_mock()
+        result = self.host_api.service_get_all(self.ctxt,
+                                               filters=dict(host='host2'))
+        mock_service_get_all.assert_called_once_with(self.ctxt,
+                                                     disabled=None)
+        self._compare_objs(result, [services[1]])
 
-        _do_test()
-
-    def test_service_get_all(self):
+    @mock.patch('nova.db.api.service_get_all')
+    def test_service_get_all(self, mock_service_get_all):
         services = [dict(test_service.fake_service,
                          topic='compute', host='host1'),
                     dict(test_service.fake_service,
@@ -273,76 +270,73 @@ class ComputeHostAPITestCase(test.TestCase):
             exp_service.update(availability_zone='nova', **service)
             exp_services.append(exp_service)
 
-        @mock.patch.object(self.host_api.db, 'service_get_all')
-        def _do_test(mock_service_get_all):
-            mock_service_get_all.return_value = services
+        mock_service_get_all.return_value = services
 
-            # Test no filters
-            result = self.host_api.service_get_all(self.ctxt, set_zones=True)
-            mock_service_get_all.assert_called_once_with(self.ctxt,
-                                                         disabled=None)
-            self._compare_objs(result, exp_services)
+        # Test no filters
+        result = self.host_api.service_get_all(self.ctxt, set_zones=True)
+        mock_service_get_all.assert_called_once_with(self.ctxt,
+                                                     disabled=None)
+        self._compare_objs(result, exp_services)
 
-            # Test no filters #2
-            mock_service_get_all.reset_mock()
-            result = self.host_api.service_get_all(self.ctxt, filters={},
-                                                   set_zones=True)
-            mock_service_get_all.assert_called_once_with(self.ctxt,
-                                                         disabled=None)
-            self._compare_objs(result, exp_services)
+        # Test no filters #2
+        mock_service_get_all.reset_mock()
+        result = self.host_api.service_get_all(self.ctxt, filters={},
+                                               set_zones=True)
+        mock_service_get_all.assert_called_once_with(self.ctxt,
+                                                     disabled=None)
+        self._compare_objs(result, exp_services)
 
-            # Test w/ filter
-            mock_service_get_all.reset_mock()
-            result = self.host_api.service_get_all(self.ctxt,
-                                                   filters=dict(host='host2'),
-                                                   set_zones=True)
-            mock_service_get_all.assert_called_once_with(self.ctxt,
-                                                         disabled=None)
-            self._compare_objs(result, [exp_services[1]])
+        # Test w/ filter
+        mock_service_get_all.reset_mock()
+        result = self.host_api.service_get_all(self.ctxt,
+                                               filters=dict(host='host2'),
+                                               set_zones=True)
+        mock_service_get_all.assert_called_once_with(self.ctxt,
+                                                     disabled=None)
+        self._compare_objs(result, [exp_services[1]])
 
-            # Test w/ zone filter but no set_zones arg.
-            mock_service_get_all.reset_mock()
-            filters = {'availability_zone': 'nova'}
-            result = self.host_api.service_get_all(self.ctxt,
-                                                   filters=filters)
-            mock_service_get_all.assert_called_once_with(self.ctxt,
-                                                         disabled=None)
-            self._compare_objs(result, exp_services)
+        # Test w/ zone filter but no set_zones arg.
+        mock_service_get_all.reset_mock()
+        filters = {'availability_zone': 'nova'}
+        result = self.host_api.service_get_all(self.ctxt,
+                                               filters=filters)
+        mock_service_get_all.assert_called_once_with(self.ctxt,
+                                                     disabled=None)
+        self._compare_objs(result, exp_services)
 
-        _do_test()
+    @mock.patch(
+        'nova.db.api.service_get_by_compute_host',
+        return_value=test_service.fake_service)
+    def test_service_get_by_compute_host(
+        self, mock_service_get_by_compute_host,
+    ):
+        result = self.host_api.service_get_by_compute_host(
+            self.ctxt, 'fake-host')
+        self.assertEqual(test_service.fake_service['id'], result.id)
 
-    def test_service_get_by_compute_host(self):
-        @mock.patch.object(self.host_api.db, 'service_get_by_compute_host',
-                           return_value=test_service.fake_service)
-        def _do_test(mock_service_get_by_compute_host):
-            result = self.host_api.service_get_by_compute_host(self.ctxt,
-                                                               'fake-host')
-            self.assertEqual(test_service.fake_service['id'], result.id)
-
-        _do_test()
-
-    def test_service_update_by_host_and_binary(self):
+    @mock.patch('nova.db.api.service_get_by_host_and_binary')
+    @mock.patch('nova.db.api.service_update')
+    def test_service_update_by_host_and_binary(
+        self, mock_service_update, mock_service_get_by_host_and_binary,
+    ):
         host_name = 'fake-host'
         binary = 'nova-compute'
         params_to_update = dict(disabled=True)
         service_id = 42
         expected_result = dict(test_service.fake_service, id=service_id)
 
-        @mock.patch.object(self.host_api, '_update_compute_provider_status')
-        @mock.patch.object(self.host_api.db, 'service_get_by_host_and_binary')
-        @mock.patch.object(self.host_api.db, 'service_update')
-        def _do_test(mock_service_update, mock_service_get_by_host_and_binary,
-                     mock_update_compute_provider_status):
-            mock_service_get_by_host_and_binary.return_value = expected_result
-            mock_service_update.return_value = expected_result
+        mock_service_get_by_host_and_binary.return_value = expected_result
+        mock_service_update.return_value = expected_result
 
+        with mock.patch.object(
+            self.host_api, '_update_compute_provider_status',
+        ) as mock_update_compute_provider_status:
             result = self.host_api.service_update_by_host_and_binary(
                 self.ctxt, host_name, binary, params_to_update)
+
             self._compare_obj(result, expected_result)
             mock_update_compute_provider_status.assert_called_once_with(
                 self.ctxt, test.MatchType(objects.Service))
-
-        _do_test()
 
     @mock.patch('nova.compute.api.HostAPI._update_compute_provider_status',
                 new_callable=mock.NonCallableMock)
@@ -403,17 +397,13 @@ class ComputeHostAPITestCase(test.TestCase):
                                                         'fake-host')
         self.assertEqual(['fake-responses'], result)
 
-    def test_task_log_get_all(self):
-        @mock.patch.object(self.host_api.db, 'task_log_get_all',
-                           return_value='fake-response')
-        def _do_test(mock_task_log_get_all):
-            result = self.host_api.task_log_get_all(self.ctxt, 'fake-name',
-                                                    'fake-begin', 'fake-end',
-                                                    host='fake-host',
-                                                    state='fake-state')
-            self.assertEqual('fake-response', result)
-
-        _do_test()
+    @mock.patch('nova.db.api.task_log_get_all', return_value='fake-response')
+    def test_task_log_get_all(self, mock_task_log_get_all):
+        result = self.host_api.task_log_get_all(self.ctxt, 'fake-name',
+                                                'fake-begin', 'fake-end',
+                                                host='fake-host',
+                                                state='fake-state')
+        self.assertEqual('fake-response', result)
 
     @mock.patch.object(objects.CellMappingList, 'get_all',
                        return_value=objects.CellMappingList(objects=[
@@ -592,12 +582,17 @@ class ComputeAggregateAPITestCase(test.TestCase):
         mock_service_get_by_compute_host.return_value = (
             objects.Service(host='fake-host'))
 
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
                 'aggregate_add_host')
     @mock.patch.object(compute.LOG, 'warning')
     def test_aggregate_add_host_placement_missing_provider(
-            self, mock_log, mock_pc_add_host):
+            self, mock_log, mock_pc_add_host, mock_get_all_by_host):
         hostname = 'fake-host'
+        mock_get_all_by_host.return_value = objects.ComputeNodeList(
+            objects=[objects.ComputeNode(
+                     host=hostname,
+                     hypervisor_hostname=hostname)])
         err = exception.ResourceProviderNotFound(name_or_uuid=hostname)
         mock_pc_add_host.side_effect = err
         aggregate = self.aggregate_api.create_aggregate(
@@ -610,10 +605,16 @@ class ComputeAggregateAPITestCase(test.TestCase):
                "nova-manage placement sync_aggregates.")
         mock_log.assert_called_with(msg, hostname, err)
 
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
                 'aggregate_add_host')
-    def test_aggregate_add_host_bad_placement(self, mock_pc_add_host):
+    def test_aggregate_add_host_bad_placement(self, mock_pc_add_host,
+                                              mock_get_all_by_host):
         hostname = 'fake-host'
+        mock_get_all_by_host.return_value = objects.ComputeNodeList(
+            objects=[objects.ComputeNode(
+                     host=hostname,
+                     hypervisor_hostname=hostname)])
         mock_pc_add_host.side_effect = exception.PlacementAPIConnectFailure
         aggregate = self.aggregate_api.create_aggregate(
             self.ctxt, 'aggregate', None)
@@ -624,12 +625,18 @@ class ComputeAggregateAPITestCase(test.TestCase):
         mock_pc_add_host.assert_called_once_with(
             self.ctxt, agg_uuid, host_name=hostname)
 
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
     @mock.patch('nova.objects.Aggregate.delete_host')
     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
                 'aggregate_remove_host')
     def test_aggregate_remove_host_bad_placement(
-            self, mock_pc_remove_host, mock_agg_obj_delete_host):
+            self, mock_pc_remove_host, mock_agg_obj_delete_host,
+            mock_get_all_by_host):
         hostname = 'fake-host'
+        mock_get_all_by_host.return_value = objects.ComputeNodeList(
+            objects=[objects.ComputeNode(
+                host=hostname,
+                hypervisor_hostname=hostname)])
         mock_pc_remove_host.side_effect = exception.PlacementAPIConnectFailure
         aggregate = self.aggregate_api.create_aggregate(
             self.ctxt, 'aggregate', None)
@@ -643,13 +650,19 @@ class ComputeAggregateAPITestCase(test.TestCase):
         # should be tried first and failed with a server failure.
         mock_agg_obj_delete_host.assert_not_called()
 
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
     @mock.patch('nova.objects.Aggregate.delete_host')
     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
                 'aggregate_remove_host')
     @mock.patch.object(compute.LOG, 'warning')
     def test_aggregate_remove_host_placement_missing_provider(
-            self, mock_log, mock_pc_remove_host, mock_agg_obj_delete_host):
+            self, mock_log, mock_pc_remove_host, mock_agg_obj_delete_host,
+            mock_get_all_by_host):
         hostname = 'fake-host'
+        mock_get_all_by_host.return_value = objects.ComputeNodeList(
+            objects=[objects.ComputeNode(
+                host=hostname,
+                hypervisor_hostname=hostname)])
         err = exception.ResourceProviderNotFound(name_or_uuid=hostname)
         mock_pc_remove_host.side_effect = err
         aggregate = self.aggregate_api.create_aggregate(

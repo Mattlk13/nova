@@ -29,8 +29,8 @@ from oslo_serialization import jsonutils
 from oslo_utils import excutils
 from oslo_utils import timeutils
 from oslo_utils import versionutils
-import six
 
+from nova.accelerator import cyborg
 from nova import availability_zones
 from nova.compute import instance_actions
 from nova.compute import rpcapi as compute_rpcapi
@@ -42,7 +42,6 @@ from nova.conductor.tasks import cross_cell_migrate
 from nova.conductor.tasks import live_migrate
 from nova.conductor.tasks import migrate
 from nova import context as nova_context
-from nova.db import base
 from nova import exception
 from nova.i18n import _
 from nova.image import glance
@@ -224,7 +223,7 @@ def obj_target_cell(obj, cell):
 
 
 @profiler.trace_cls("rpc")
-class ComputeTaskManager(base.Base):
+class ComputeTaskManager:
     """Namespace for compute methods.
 
     This class presents an rpc API for nova-conductor under the 'compute_task'
@@ -236,7 +235,6 @@ class ComputeTaskManager(base.Base):
     target = messaging.Target(namespace='compute_task', version='1.23')
 
     def __init__(self):
-        super(ComputeTaskManager, self).__init__()
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
         self.volume_api = cinder.API()
         self.image_api = glance.API()
@@ -244,7 +242,7 @@ class ComputeTaskManager(base.Base):
         self.servicegroup_api = servicegroup.API()
         self.query_client = query.SchedulerQueryClient()
         self.report_client = report.SchedulerReportClient()
-        self.notifier = rpc.get_notifier('compute', CONF.host)
+        self.notifier = rpc.get_notifier('compute')
         # Help us to record host in EventReporter
         self.host = CONF.host
 
@@ -455,7 +453,7 @@ class ComputeTaskManager(base.Base):
         migration.status = 'accepted'
         migration.instance_uuid = instance.uuid
         migration.source_compute = instance.host
-        migration.migration_type = 'live-migration'
+        migration.migration_type = fields.MigrationType.LIVE_MIGRATION
         if instance.obj_attr_is_set('flavor'):
             migration.old_instance_type_id = instance.flavor.id
             migration.new_instance_type_id = instance.flavor.id
@@ -497,7 +495,7 @@ class ComputeTaskManager(base.Base):
                           task_state=None)
             migration.status = 'error'
             migration.save()
-            raise exception.MigrationError(reason=six.text_type(ex))
+            raise exception.MigrationError(reason=str(ex))
 
     def _build_live_migrate_task(self, context, instance, destination,
                                  block_migration, disk_over_commit, migration,
@@ -594,6 +592,7 @@ class ComputeTaskManager(base.Base):
             legacy_request_spec)
         self._cleanup_allocated_networks(
             context, instance, requested_networks)
+        compute_utils.delete_arqs_if_needed(context, instance)
 
     # NOTE(danms): This is never cell-targeted because it is only used for
     # n-cpu reschedules which go to the cell conductor and thus are always
@@ -700,7 +699,7 @@ class ComputeTaskManager(base.Base):
             return
 
         elevated = context.elevated()
-        for (instance, host_list) in six.moves.zip(instances, host_lists):
+        for (instance, host_list) in zip(instances, host_lists):
             host = host_list.pop(0)
             if is_reschedule:
                 # If this runs in the superconductor, the first instance will
@@ -835,6 +834,16 @@ class ComputeTaskManager(base.Base):
             LOG.debug("Selected host: %s; Selected node: %s; Alternates: %s",
                     host.service_host, host.nodename, alts, instance=instance)
 
+            try:
+                accel_uuids = self._create_and_bind_arq_for_instance(
+                    context, instance, host.nodename, local_reqspec)
+            except Exception as exc:
+                LOG.exception('Failed to reschedule. Reason: %s', exc)
+                self._cleanup_when_reschedule_fails(
+                        context, instance, exc, legacy_request_spec,
+                        requested_networks)
+                continue
+
             self.compute_rpcapi.build_and_run_instance(context,
                     instance=instance, host=host.service_host, image=image,
                     request_spec=local_reqspec,
@@ -844,7 +853,24 @@ class ComputeTaskManager(base.Base):
                     requested_networks=requested_networks,
                     security_groups=security_groups,
                     block_device_mapping=bdms, node=host.nodename,
-                    limits=host.limits, host_list=host_list)
+                    limits=host.limits, host_list=host_list,
+                    accel_uuids=accel_uuids)
+
+    def _create_and_bind_arq_for_instance(self, context, instance, hostname,
+                                          request_spec):
+        try:
+            resource_provider_mapping = (
+                request_spec.get_request_group_mapping())
+            # Using nodename instead of hostname. See:
+            # http://lists.openstack.org/pipermail/openstack-discuss/2019-November/011044.html  # noqa
+            return self._create_and_bind_arqs(
+                context, instance.uuid, instance.flavor.extra_specs,
+                hostname, resource_provider_mapping)
+        except exception.AcceleratorRequestBindingFailed as exc:
+            # If anything failed here we need to cleanup and bail out.
+            cyclient = cyborg.get_client(context)
+            cyclient.delete_arqs_by_uuid(exc.arqs)
+            raise
 
     def _schedule_instances(self, context, request_spec,
                             instance_uuids=None, return_alternates=False):
@@ -935,9 +961,19 @@ class ComputeTaskManager(base.Base):
                     filter_properties = request_spec.\
                         to_legacy_filter_properties_dict()
 
-                    # TODO(gibi): We need to make sure that the
-                    # requested_resources field is re calculated based on
-                    # neutron ports.
+                    external_resources = (
+                        self.network_api.get_requested_resource_for_instance(
+                            context, instance.uuid))
+                    extra_specs = request_spec.flavor.extra_specs
+                    device_profile = extra_specs.get('accel:device_profile')
+                    external_resources.extend(
+                        cyborg.get_device_profile_request_groups(
+                            context, device_profile) if device_profile else [])
+                    # NOTE(gibi): When other modules want to handle similar
+                    # non-nova resources then here we have to collect all
+                    # the external resource requests in a single list and
+                    # add them to the RequestSpec.
+                    request_spec.requested_resources = external_resources
 
                     # NOTE(cfriesen): Ensure that we restrict the scheduler to
                     # the cell specified by the instance mapping.
@@ -945,7 +981,7 @@ class ComputeTaskManager(base.Base):
                         context, instance, request_spec)
 
                     request_spec.ensure_project_and_user_id(instance)
-                    request_spec.ensure_network_metadata(instance)
+                    request_spec.ensure_network_information(instance)
                     compute_utils.heal_reqspec_is_bfv(
                         context, request_spec, instance)
                     host_lists = self._schedule_instances(context,
@@ -959,9 +995,18 @@ class ComputeTaskManager(base.Base):
                     instance.availability_zone = (
                         availability_zones.get_host_availability_zone(
                             context, host))
+
+                    scheduler_utils.fill_provider_mapping(
+                        request_spec, selection)
+
+                    # NOTE(brinzhang): For unshelve operation we should
+                    # re-create-and-bound the arqs for the instance.
+                    accel_uuids = self._create_and_bind_arq_for_instance(
+                        context, instance, node, request_spec)
                     self.compute_rpcapi.unshelve_instance(
                         context, instance, host, request_spec, image=image,
-                        filter_properties=filter_properties, node=node)
+                        filter_properties=filter_properties, node=node,
+                        accel_uuids=accel_uuids)
             except (exception.NoValidHost,
                     exception.UnsupportedPolicyException):
                 instance.task_state = None
@@ -969,7 +1014,11 @@ class ComputeTaskManager(base.Base):
                 LOG.warning("No valid host found for unshelve instance",
                             instance=instance)
                 return
-            except Exception:
+            except Exception as exc:
+                if isinstance(exc, exception.AcceleratorRequestBindingFailed):
+                    cyclient = cyborg.get_client(context)
+                    cyclient.delete_arqs_by_uuid(exc.arqs)
+                LOG.exception('Failed to unshelve. Reason: %s', exc)
                 with excutils.save_and_reraise_exception():
                     instance.task_state = None
                     instance.save()
@@ -1084,7 +1133,7 @@ class ComputeTaskManager(base.Base):
                                 {'vm_state': vm_states.ERROR,
                                  'task_state': None}, ex, request_spec)
                             LOG.warning('Rebuild failed: %s',
-                                        six.text_type(ex), instance=instance)
+                                        str(ex), instance=instance)
                     except exception.NoValidHost:
                         with excutils.save_and_reraise_exception():
                             if migration:
@@ -1109,14 +1158,21 @@ class ComputeTaskManager(base.Base):
                     # is not forced to be the original host
                     request_spec.reset_forced_destinations()
 
-                    port_res_req = (
+                    external_resources = []
+                    external_resources += (
                         self.network_api.get_requested_resource_for_instance(
                             context, instance.uuid))
-                    # NOTE(gibi): When cyborg or other module wants to handle
-                    # similar non-nova resources then here we have to collect
-                    # all the external resource requests in a single list and
+                    extra_specs = request_spec.flavor.extra_specs
+                    device_profile = extra_specs.get('accel:device_profile')
+                    external_resources.extend(
+                        cyborg.get_device_profile_request_groups(
+                            context, device_profile)
+                        if device_profile else [])
+                    # NOTE(gibi): When other modules want to handle similar
+                    # non-nova resources then here we have to collect all
+                    # the external resource requests in a single list and
                     # add them to the RequestSpec.
-                    request_spec.requested_resources = port_res_req
+                    request_spec.requested_resources = external_resources
 
                 try:
                     # if this is a rebuild of instance on the same host with
@@ -1128,7 +1184,7 @@ class ComputeTaskManager(base.Base):
                     self._restrict_request_spec_to_cell(
                         context, instance, request_spec)
                     request_spec.ensure_project_and_user_id(instance)
-                    request_spec.ensure_network_metadata(instance)
+                    request_spec.ensure_network_information(instance)
                     compute_utils.heal_reqspec_is_bfv(
                         context, request_spec, instance)
 
@@ -1169,7 +1225,7 @@ class ComputeTaskManager(base.Base):
                                 {'vm_state': vm_states.ERROR,
                                  'task_state': None}, ex, request_spec)
                         LOG.warning('Rebuild failed: %s',
-                                    six.text_type(ex), instance=instance)
+                                    str(ex), instance=instance)
 
             compute_utils.notify_about_instance_usage(
                 self.notifier, context, instance, "rebuild.scheduled")
@@ -1181,21 +1237,45 @@ class ComputeTaskManager(base.Base):
             instance.availability_zone = (
                 availability_zones.get_host_availability_zone(
                     context, host))
+            accel_uuids = []
+            try:
+                if instance.flavor.extra_specs.get('accel:device_profile'):
+                    cyclient = cyborg.get_client(context)
+                    if evacuate:
+                        # NOTE(brinzhang): For evacuate operation we should
+                        # delete the bound arqs, then re-create-and-bound the
+                        # arqs for the instance.
+                        cyclient.delete_arqs_for_instance(instance.uuid)
+                        accel_uuids = self._create_and_bind_arq_for_instance(
+                            context, instance, node, request_spec)
+                    else:
+                        accel_uuids = cyclient.get_arq_uuids_for_instance(
+                            instance)
+            except Exception as exc:
+                if isinstance(exc, exception.AcceleratorRequestBindingFailed):
+                    cyclient = cyborg.get_client(context)
+                    cyclient.delete_arqs_by_uuid(exc.arqs)
+                LOG.exception('Failed to rebuild. Reason: %s', exc)
+                raise exc
 
-            self.compute_rpcapi.rebuild_instance(context,
-                    instance=instance,
-                    new_pass=new_pass,
-                    injected_files=injected_files,
-                    image_ref=image_ref,
-                    orig_image_ref=orig_image_ref,
-                    orig_sys_metadata=orig_sys_metadata,
-                    bdms=bdms,
-                    recreate=evacuate,
-                    on_shared_storage=on_shared_storage,
-                    preserve_ephemeral=preserve_ephemeral,
-                    migration=migration,
-                    host=host, node=node, limits=limits,
-                    request_spec=request_spec)
+            self.compute_rpcapi.rebuild_instance(
+                context,
+                instance=instance,
+                new_pass=new_pass,
+                injected_files=injected_files,
+                image_ref=image_ref,
+                orig_image_ref=orig_image_ref,
+                orig_sys_metadata=orig_sys_metadata,
+                bdms=bdms,
+                recreate=evacuate,
+                on_shared_storage=on_shared_storage,
+                preserve_ephemeral=preserve_ephemeral,
+                migration=migration,
+                host=host,
+                node=node,
+                limits=limits,
+                request_spec=request_spec,
+                accel_uuids=accel_uuids)
 
     def _validate_image_traits_for_rebuild(self, context, instance, image_ref):
         """Validates that the traits specified in the image can be satisfied
@@ -1269,18 +1349,18 @@ class ComputeTaskManager(base.Base):
 
     # TODO(avolkov): move method to bdm
     @staticmethod
-    def _volume_size(instance_type, bdm):
+    def _volume_size(flavor, bdm):
         size = bdm.get('volume_size')
         # NOTE (ndipanov): inherit flavor size only for swap and ephemeral
         if (size is None and bdm.get('source_type') == 'blank' and
                 bdm.get('destination_type') == 'local'):
             if bdm.get('guest_format') == 'swap':
-                size = instance_type.get('swap', 0)
+                size = flavor.get('swap', 0)
             else:
-                size = instance_type.get('ephemeral_gb', 0)
+                size = flavor.get('ephemeral_gb', 0)
         return size
 
-    def _create_block_device_mapping(self, cell, instance_type, instance_uuid,
+    def _create_block_device_mapping(self, cell, flavor, instance_uuid,
                                      block_device_mapping):
         """Create the BlockDeviceMapping objects in the db.
 
@@ -1291,7 +1371,7 @@ class ComputeTaskManager(base.Base):
                   instance_uuid=instance_uuid)
         instance_block_device_mapping = copy.deepcopy(block_device_mapping)
         for bdm in instance_block_device_mapping:
-            bdm.volume_size = self._volume_size(instance_type, bdm)
+            bdm.volume_size = self._volume_size(flavor, bdm)
             bdm.instance_uuid = instance_uuid
             with obj_target_cell(bdm, cell):
                 bdm.update_or_create()
@@ -1450,7 +1530,7 @@ class ComputeTaskManager(base.Base):
         instances = []
         host_az = {}  # host=az cache to optimize multi-create
 
-        for (build_request, request_spec, host_list) in six.moves.zip(
+        for (build_request, request_spec, host_list) in zip(
                 build_requests, request_specs, host_lists):
             instance = build_request.get_new_instance(context)
             # host_list is a list of one or more Selection objects, the first
@@ -1532,8 +1612,7 @@ class ComputeTaskManager(base.Base):
                                                   block_device_mapping, tags,
                                                   cell_mapping_cache)
 
-        zipped = six.moves.zip(build_requests, request_specs, host_lists,
-                              instances)
+        zipped = zip(build_requests, request_specs, host_lists, instances)
         for (build_request, request_spec, host_list, instance) in zipped:
             if instance is None:
                 # Skip placeholders that were buried in cell0 or had their
@@ -1595,6 +1674,15 @@ class ComputeTaskManager(base.Base):
                 # this one.
                 continue
 
+            try:
+                accel_uuids = self._create_and_bind_arq_for_instance(
+                        context, instance, host.nodename, request_spec)
+            except Exception as exc:
+                with excutils.save_and_reraise_exception():
+                    self._cleanup_build_artifacts(
+                        context, exc, instances, build_requests, request_specs,
+                        block_device_mapping, tags, cell_mapping_cache)
+
             # NOTE(danms): Compute RPC expects security group names or ids
             # not objects, so convert this to a list of names until we can
             # pass the objects.
@@ -1611,7 +1699,36 @@ class ComputeTaskManager(base.Base):
                     security_groups=legacy_secgroups,
                     block_device_mapping=instance_bdms,
                     host=host.service_host, node=host.nodename,
-                    limits=host.limits, host_list=host_list)
+                    limits=host.limits, host_list=host_list,
+                    accel_uuids=accel_uuids)
+
+    def _create_and_bind_arqs(self, context, instance_uuid, extra_specs,
+                              hostname, resource_provider_mapping):
+        """Create ARQs, determine their RPs and initiate ARQ binding.
+
+           The binding is asynchronous; Cyborg will notify on completion.
+           The notification will be handled in the compute manager.
+        """
+        dp_name = extra_specs.get('accel:device_profile')
+        if not dp_name:
+            return []
+
+        LOG.debug('Calling Cyborg to get ARQs. dp_name=%s instance=%s',
+                  dp_name, instance_uuid)
+        cyclient = cyborg.get_client(context)
+        arqs = cyclient.create_arqs_and_match_resource_providers(
+            dp_name, resource_provider_mapping)
+        LOG.debug('Got ARQs with resource provider mapping %s', arqs)
+
+        bindings = {arq['uuid']:
+                       {"hostname": hostname,
+                        "device_rp_uuid": arq['device_rp_uuid'],
+                        "instance_uuid": instance_uuid
+                       }
+                    for arq in arqs}
+        # Initiate Cyborg binding asynchronously
+        cyclient.bind_arqs(bindings=bindings)
+        return [arq['uuid'] for arq in arqs]
 
     @staticmethod
     def _map_instance_to_cell(context, instance, cell):
@@ -1647,7 +1764,7 @@ class ComputeTaskManager(base.Base):
     def _cleanup_build_artifacts(self, context, exc, instances, build_requests,
                                  request_specs, block_device_mappings, tags,
                                  cell_mapping_cache):
-        for (instance, build_request, request_spec) in six.moves.zip(
+        for (instance, build_request, request_spec) in zip(
                 instances, build_requests, request_specs):
             # Skip placeholders that were buried in cell0 or had their
             # build requests deleted by the user before instance create.

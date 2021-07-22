@@ -37,12 +37,6 @@ LOG = logging.getLogger(__name__)
 SG_NOT_FOUND = object()
 
 
-def _authorize_context(req):
-    context = req.environ['nova.context']
-    context.can(sg_policies.BASE_POLICY_NAME)
-    return context
-
-
 class SecurityGroupControllerBase(object):
     """Base class for Security Group controllers."""
 
@@ -155,12 +149,13 @@ class SecurityGroupController(SecurityGroupControllerBase, wsgi.Controller):
     @wsgi.expected_errors((400, 404))
     def show(self, req, id):
         """Return data about the given security group."""
-        context = _authorize_context(req)
+        context = req.environ['nova.context']
+        context.can(sg_policies.POLICY_NAME % 'show',
+                    target={'project_id': context.project_id})
 
         try:
             id = security_group_api.validate_id(id)
-            security_group = security_group_api.get(
-                context, None, id, map_exception=True)
+            security_group = security_group_api.get(context, id)
         except exception.SecurityGroupNotFound as exp:
             raise exc.HTTPNotFound(explanation=exp.format_message())
         except exception.Invalid as exp:
@@ -174,12 +169,13 @@ class SecurityGroupController(SecurityGroupControllerBase, wsgi.Controller):
     @wsgi.response(202)
     def delete(self, req, id):
         """Delete a security group."""
-        context = _authorize_context(req)
+        context = req.environ['nova.context']
+        context.can(sg_policies.POLICY_NAME % 'delete',
+                    target={'project_id': context.project_id})
 
         try:
             id = security_group_api.validate_id(id)
-            security_group = security_group_api.get(
-                context, None, id, map_exception=True)
+            security_group = security_group_api.get(context, id)
             security_group_api.destroy(context, security_group)
         except exception.SecurityGroupNotFound as exp:
             raise exc.HTTPNotFound(explanation=exp.format_message())
@@ -191,7 +187,9 @@ class SecurityGroupController(SecurityGroupControllerBase, wsgi.Controller):
     @wsgi.expected_errors(404)
     def index(self, req):
         """Returns a list of security groups."""
-        context = _authorize_context(req)
+        context = req.environ['nova.context']
+        context.can(sg_policies.POLICY_NAME % 'get',
+                    target={'project_id': context.project_id})
 
         search_opts = {}
         search_opts.update(req.GET)
@@ -212,7 +210,9 @@ class SecurityGroupController(SecurityGroupControllerBase, wsgi.Controller):
     @wsgi.expected_errors((400, 403))
     def create(self, req, body):
         """Creates a new security group."""
-        context = _authorize_context(req)
+        context = req.environ['nova.context']
+        context.can(sg_policies.POLICY_NAME % 'create',
+                    target={'project_id': context.project_id})
 
         security_group = self._from_body(body, 'security_group')
 
@@ -222,7 +222,7 @@ class SecurityGroupController(SecurityGroupControllerBase, wsgi.Controller):
         try:
             security_group_api.validate_property(group_name, 'name', None)
             security_group_api.validate_property(group_description,
-                                                      'description', None)
+                                                 'description', None)
             group_ref = security_group_api.create_security_group(
                 context, group_name, group_description)
         except exception.Invalid as exp:
@@ -237,12 +237,13 @@ class SecurityGroupController(SecurityGroupControllerBase, wsgi.Controller):
     @wsgi.expected_errors((400, 404))
     def update(self, req, id, body):
         """Update a security group."""
-        context = _authorize_context(req)
+        context = req.environ['nova.context']
+        context.can(sg_policies.POLICY_NAME % 'update',
+                    target={'project_id': context.project_id})
 
         try:
             id = security_group_api.validate_id(id)
-            security_group = security_group_api.get(
-                context, None, id, map_exception=True)
+            security_group = security_group_api.get(context, id)
         except exception.SecurityGroupNotFound as exp:
             raise exc.HTTPNotFound(explanation=exp.format_message())
         except exception.Invalid as exp:
@@ -273,8 +274,9 @@ class SecurityGroupRulesController(SecurityGroupControllerBase,
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
     @wsgi.expected_errors((400, 403, 404))
     def create(self, req, body):
-        context = _authorize_context(req)
-
+        context = req.environ['nova.context']
+        context.can(sg_policies.POLICY_NAME % 'rule:create',
+                    target={'project_id': context.project_id})
         sg_rule = self._from_body(body, 'security_group_rule')
         group_id = sg_rule.get('group_id')
         source_group = {}
@@ -283,7 +285,7 @@ class SecurityGroupRulesController(SecurityGroupControllerBase,
             parent_group_id = security_group_api.validate_id(
                 sg_rule.get('parent_group_id'))
             security_group = security_group_api.get(
-                context, None, parent_group_id, map_exception=True)
+                context, parent_group_id)
             if group_id is not None:
                 group_id = security_group_api.validate_id(group_id)
 
@@ -348,14 +350,15 @@ class SecurityGroupRulesController(SecurityGroupControllerBase,
     @wsgi.expected_errors((400, 404, 409))
     @wsgi.response(202)
     def delete(self, req, id):
-        context = _authorize_context(req)
+        context = req.environ['nova.context']
+        context.can(sg_policies.POLICY_NAME % 'rule:delete',
+                    target={'project_id': context.project_id})
 
         try:
             id = security_group_api.validate_id(id)
             rule = security_group_api.get_rule(context, id)
             group_id = rule['parent_group_id']
-            security_group = security_group_api.get(
-                context, None, group_id, map_exception=True)
+            security_group = security_group_api.get(context, group_id)
             security_group_api.remove_rules(
                 context, security_group, [rule['id']])
         except exception.SecurityGroupNotFound as exp:
@@ -371,9 +374,10 @@ class ServerSecurityGroupController(SecurityGroupControllerBase):
     @wsgi.expected_errors(404)
     def index(self, req, server_id):
         """Returns a list of security groups for the given instance."""
-        context = _authorize_context(req)
-
+        context = req.environ['nova.context']
         instance = common.get_instance(self.compute_api, context, server_id)
+        context.can(sg_policies.POLICY_NAME % 'list',
+                    target={'project_id': instance.project_id})
         try:
             groups = security_group_api.get_instance_security_groups(
                 context, instance, True)
@@ -419,21 +423,19 @@ class SecurityGroupActionController(wsgi.Controller):
 
         return group_name
 
-    def _invoke(self, method, context, id, group_name):
-        instance = common.get_instance(self.compute_api, context, id)
-        method(context, instance, group_name)
-
     @wsgi.expected_errors((400, 404, 409))
     @wsgi.response(202)
     @wsgi.action('addSecurityGroup')
     def _addSecurityGroup(self, req, id, body):
         context = req.environ['nova.context']
-        context.can(sg_policies.BASE_POLICY_NAME)
+        instance = common.get_instance(self.compute_api, context, id)
+        context.can(sg_policies.POLICY_NAME % 'add',
+                    target={'project_id': instance.project_id})
 
         group_name = self._parse(body, 'addSecurityGroup')
         try:
-            return self._invoke(security_group_api.add_to_instance,
-                                context, id, group_name)
+            return security_group_api.add_to_instance(context, instance,
+                                                      group_name)
         except (exception.SecurityGroupNotFound,
                 exception.InstanceNotFound) as exp:
             raise exc.HTTPNotFound(explanation=exp.format_message())
@@ -447,13 +449,15 @@ class SecurityGroupActionController(wsgi.Controller):
     @wsgi.action('removeSecurityGroup')
     def _removeSecurityGroup(self, req, id, body):
         context = req.environ['nova.context']
-        context.can(sg_policies.BASE_POLICY_NAME)
+        instance = common.get_instance(self.compute_api, context, id)
+        context.can(sg_policies.POLICY_NAME % 'remove',
+                    target={'project_id': instance.project_id})
 
         group_name = self._parse(body, 'removeSecurityGroup')
 
         try:
-            return self._invoke(security_group_api.remove_from_instance,
-                                context, id, group_name)
+            return security_group_api.remove_from_instance(context, instance,
+                                                           group_name)
         except (exception.SecurityGroupNotFound,
                 exception.InstanceNotFound) as exp:
             raise exc.HTTPNotFound(explanation=exp.format_message())

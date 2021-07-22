@@ -65,13 +65,15 @@ class PrivsepFilesystemHelpersTestCase(test.NoDBTestCase):
         nova.privsep.fs.vginfo('vg')
         mock_execute.assert_called_with('vgs', '--noheadings', '--nosuffix',
                                         '--separator', '|', '--units', 'b',
-                                        '-o', 'vg_size,vg_free', 'vg')
+                                        '-o', 'vg_size,vg_free', 'vg',
+                                        attempts=3, delay_on_retry=True)
 
     @mock.patch('oslo_concurrency.processutils.execute')
     def test_lvlist(self, mock_execute):
         nova.privsep.fs.lvlist('vg')
         mock_execute.assert_called_with('lvs', '--noheadings', '-o',
-                                        'lv_name', 'vg')
+                                        'lv_name', 'vg',
+                                        attempts=3, delay_on_retry=True)
 
     @mock.patch('oslo_concurrency.processutils.execute')
     def test_lvinfo(self, mock_execute):
@@ -141,13 +143,6 @@ class PrivsepFilesystemHelpersTestCase(test.NoDBTestCase):
     def test_remove_device_maps(self, mock_execute):
         nova.privsep.fs.remove_device_maps('/dev/nosuch')
         mock_execute.assert_called_with('kpartx', '-d', '/dev/nosuch')
-
-    @mock.patch('oslo_concurrency.processutils.execute')
-    def test_get_filesystem_type(self, mock_execute):
-        nova.privsep.fs.get_filesystem_type('/dev/nosuch')
-        mock_execute.assert_called_with('blkid', '-o', 'value', '-s',
-                                        'TYPE', '/dev/nosuch',
-                                        check_exit_code=[0, 2])
 
     @mock.patch('oslo_concurrency.processutils.execute')
     def test_privileged_e2fsck(self, mock_execute):

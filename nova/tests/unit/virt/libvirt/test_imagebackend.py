@@ -15,6 +15,7 @@
 
 import base64
 import errno
+import inspect
 import os
 import shutil
 import tempfile
@@ -25,6 +26,7 @@ import fixtures
 import mock
 from oslo_concurrency import lockutils
 from oslo_config import fixture as config_fixture
+from oslo_service import loopingcall
 from oslo_utils import imageutils
 from oslo_utils import units
 from oslo_utils import uuidutils
@@ -34,14 +36,13 @@ import nova.conf
 from nova import context
 from nova import exception
 from nova import objects
+from nova.storage import rbd_utils
 from nova import test
 from nova.tests.unit import fake_processutils
-from nova import utils
 from nova.virt.image import model as imgmodel
 from nova.virt import images
 from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt import imagebackend
-from nova.virt.libvirt.storage import rbd_utils
 from nova.virt.libvirt import utils as libvirt_utils
 
 CONF = nova.conf.CONF
@@ -177,11 +178,9 @@ class _ImageTestCase(object):
             'type': 'cdrom',
         }
 
-        disk = image.libvirt_info(disk_info,
-                                  cache_mode="none",
-                                  extra_specs=extra_specs,
-                                  hypervisor_version=4004001,
-                                  boot_order="1")
+        disk = image.libvirt_info(
+            disk_info, cache_mode="none", extra_specs=extra_specs,
+            boot_order="1")
 
         self.assertIsInstance(disk, vconfig.LibvirtConfigGuestDisk)
         self.assertEqual("/dev/vda", disk.target_dev)
@@ -214,9 +213,8 @@ class _ImageTestCase(object):
             'dev': '/dev/sda',
             'type': 'disk',
         }
-        disk = image.libvirt_info(disk_info, cache_mode='none', extra_specs={},
-                                  hypervisor_version=4004001,
-                                  disk_unit=disk_unit)
+        disk = image.libvirt_info(
+            disk_info, cache_mode='none', extra_specs={}, disk_unit=disk_unit)
         if disk_unit:
             self.assertEqual(0, disk.device_addr.controller)
             self.assertEqual(disk_unit, disk.device_addr.unit)
@@ -1490,8 +1488,10 @@ class RbdTestCase(_ImageTestCase, test.NoDBTestCase):
         self.assertEqual(fake_processutils.fake_execute_get_log(), [])
 
     def test_parent_compatible(self):
-        self.assertEqual(utils.getargspec(imagebackend.Image.libvirt_info),
-                         utils.getargspec(self.image_class.libvirt_info))
+        self.assertEqual(
+            inspect.getfullargspec(imagebackend.Image.libvirt_info),
+            inspect.getfullargspec(self.image_class.libvirt_info)
+        )
 
     def test_image_path(self):
 
@@ -1767,6 +1767,230 @@ class RbdTestCase(_ImageTestCase, test.NoDBTestCase):
                                             pool=image.driver.pool)
             mock_destroy.assert_called_once_with(image.rbd_name,
                                                  pool=image.driver.pool)
+
+    @mock.patch('nova.virt.libvirt.imagebackend.IMAGE_API')
+    def test_copy_to_store(self, mock_imgapi):
+        # Test copy_to_store() happy path where we ask for the image
+        # to be copied, it goes into progress and then completes.
+        self.flags(images_rbd_glance_copy_poll_interval=0,
+                   group='libvirt')
+        self.flags(images_rbd_glance_store_name='store',
+                   group='libvirt')
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_imgapi.get.side_effect = [
+            # Simulate a race between starting the copy and the first poll
+            {'stores': []},
+            # Second poll shows it in progress
+            {'os_glance_importing_to_stores': ['store'],
+             'stores': []},
+            # Third poll shows it has also been copied to a non-local store
+            {'os_glance_importing_to_stores': ['store'],
+             'stores': ['other']},
+            # Should-be-last poll shows it complete
+            {'os_glance_importing_to_stores': [],
+             'stores': ['other', 'store']},
+        ]
+        image.copy_to_store(self.CONTEXT, {'id': 'foo'})
+        mock_imgapi.copy_image_to_store.assert_called_once_with(
+            self.CONTEXT, 'foo', 'store')
+        self.assertEqual(4, mock_imgapi.get.call_count)
+
+    @mock.patch('nova.virt.libvirt.imagebackend.IMAGE_API')
+    def test_copy_to_store_race_with_existing(self, mock_imgapi):
+        # Test copy_to_store() where we race to ask Glance to do the
+        # copy with another node. One of us will get a BadRequest, which
+        # should not cause us to fail. If our desired store is now
+        # in progress, continue to wait like we would have if we had
+        # won the race.
+        self.flags(images_rbd_glance_copy_poll_interval=0,
+                   group='libvirt')
+        self.flags(images_rbd_glance_store_name='store',
+                   group='libvirt')
+        image = self.image_class(self.INSTANCE, self.NAME)
+
+        mock_imgapi.copy_image_to_store.side_effect = (
+            exception.ImageBadRequest(image_id='foo',
+                                      response='already in progress'))
+        # Make the first poll indicate that the image has already
+        # been copied
+        mock_imgapi.get.return_value = {'stores': ['store', 'other']}
+
+        # Despite the (expected) exception from the copy, we should
+        # not raise here if the subsequent poll works.
+        image.copy_to_store(self.CONTEXT, {'id': 'foo'})
+
+        mock_imgapi.get.assert_called_once_with(self.CONTEXT,
+                                                'foo',
+                                                include_locations=True)
+        mock_imgapi.copy_image_to_store.assert_called_once_with(
+            self.CONTEXT, 'foo', 'store')
+
+    @mock.patch('nova.virt.libvirt.imagebackend.IMAGE_API')
+    def test_copy_to_store_import_impossible(self, mock_imgapi):
+        # Test copy_to_store() where Glance tells us that the image
+        # is not copy-able for some reason (like it is not active yet
+        # or some other workflow reason).
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_imgapi.copy_image_to_store.side_effect = (
+            exception.ImageImportImpossible(image_id='foo',
+                                            reason='because tests'))
+        self.assertRaises(exception.ImageUnacceptable,
+                          image.copy_to_store,
+                          self.CONTEXT, {'id': 'foo'})
+
+    @mock.patch('nova.virt.libvirt.imagebackend.IMAGE_API')
+    def test_copy_to_store_import_failed_other_reason(self, mock_imgapi):
+        # Test copy_to_store() where some unexpected failure gets raised.
+        # We should bubble that up so it gets all the way back to the caller
+        # of the clone() itself, which can handle it independent of one of
+        # the image-specific exceptions.
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_imgapi.copy_image_to_store.side_effect = test.TestingException
+        # Make sure any other exception makes it through, as those are already
+        # expected failures by the callers of the imagebackend code.
+        self.assertRaises(test.TestingException,
+                          image.copy_to_store,
+                          self.CONTEXT, {'id': 'foo'})
+
+    @mock.patch('nova.virt.libvirt.imagebackend.IMAGE_API')
+    def test_copy_to_store_import_failed_in_progress(self, mock_imgapi):
+        # Test copy_to_store() in the situation where we ask for the copy,
+        # things start to look good (in progress) and later get reported
+        # as failed.
+        self.flags(images_rbd_glance_copy_poll_interval=0,
+                   group='libvirt')
+        self.flags(images_rbd_glance_store_name='store',
+                   group='libvirt')
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_imgapi.get.side_effect = [
+            # First poll shows it in progress
+            {'os_glance_importing_to_stores': ['store'],
+             'stores': []},
+            # Second poll shows it failed
+            {'os_glance_failed_import': ['store'],
+             'stores': []},
+        ]
+        exc = self.assertRaises(exception.ImageUnacceptable,
+                                image.copy_to_store,
+                                self.CONTEXT, {'id': 'foo'})
+        self.assertIn('unsuccessful because', str(exc))
+
+    @mock.patch.object(loopingcall.FixedIntervalWithTimeoutLoopingCall,
+                       'start')
+    @mock.patch('nova.virt.libvirt.imagebackend.IMAGE_API')
+    def test_copy_to_store_import_failed_timeout(self, mock_imgapi,
+                                                 mock_timer_start):
+        # Test copy_to_store() simulating the case where we timeout waiting
+        # for Glance to do the copy.
+        self.flags(images_rbd_glance_store_name='store',
+                   group='libvirt')
+        image = self.image_class(self.INSTANCE, self.NAME)
+        mock_timer_start.side_effect = loopingcall.LoopingCallTimeOut()
+        exc = self.assertRaises(exception.ImageUnacceptable,
+                                image.copy_to_store,
+                                self.CONTEXT, {'id': 'foo'})
+        self.assertIn('timed out', str(exc))
+        mock_imgapi.copy_image_to_store.assert_called_once_with(
+            self.CONTEXT, 'foo', 'store')
+
+    @mock.patch('nova.storage.rbd_utils.RBDDriver')
+    @mock.patch('nova.virt.libvirt.imagebackend.IMAGE_API')
+    def test_clone_copy_to_store(self, mock_imgapi, mock_driver_):
+        # Call image.clone() in a way that will cause it to fall through
+        # the locations check to the copy-to-store behavior, and assert
+        # that after the copy, we recurse (without becoming infinite) and
+        # do the check again.
+        self.flags(images_rbd_glance_store_name='store', group='libvirt')
+        fake_image = {
+            'id': 'foo',
+            'disk_format': 'raw',
+            'locations': ['fake'],
+        }
+        mock_imgapi.get.return_value = fake_image
+        mock_driver = mock_driver_.return_value
+        mock_driver.is_cloneable.side_effect = [False, True]
+        image = self.image_class(self.INSTANCE, self.NAME)
+        with mock.patch.object(image, 'copy_to_store') as mock_copy:
+            image.clone(self.CONTEXT, 'foo')
+            mock_copy.assert_called_once_with(self.CONTEXT, fake_image)
+        mock_driver.is_cloneable.assert_has_calls([
+            # First call is the initial check
+            mock.call('fake', fake_image),
+            # Second call with the same location must be because we
+            # recursed after the copy-to-store operation
+            mock.call('fake', fake_image)])
+
+    @mock.patch('nova.storage.rbd_utils.RBDDriver')
+    @mock.patch('nova.virt.libvirt.imagebackend.IMAGE_API')
+    def test_clone_copy_to_store_failed(self, mock_imgapi, mock_driver_):
+        # Call image.clone() in a way that will cause it to fall through
+        # the locations check to the copy-to-store behavior, but simulate
+        # some situation where we didn't actually copy the image and the
+        # recursed check does not succeed. Assert that we do not copy again,
+        # nor recurse again, and raise the expected error.
+        self.flags(images_rbd_glance_store_name='store', group='libvirt')
+        fake_image = {
+            'id': 'foo',
+            'disk_format': 'raw',
+            'locations': ['fake'],
+        }
+        mock_imgapi.get.return_value = fake_image
+        mock_driver = mock_driver_.return_value
+        mock_driver.is_cloneable.side_effect = [False, False]
+        image = self.image_class(self.INSTANCE, self.NAME)
+        with mock.patch.object(image, 'copy_to_store') as mock_copy:
+            self.assertRaises(exception.ImageUnacceptable,
+                              image.clone, self.CONTEXT, 'foo')
+            mock_copy.assert_called_once_with(self.CONTEXT, fake_image)
+        mock_driver.is_cloneable.assert_has_calls([
+            # First call is the initial check
+            mock.call('fake', fake_image),
+            # Second call with the same location must be because we
+            # recursed after the copy-to-store operation
+            mock.call('fake', fake_image)])
+
+    @mock.patch('nova.storage.rbd_utils.RBDDriver')
+    @mock.patch('nova.virt.libvirt.imagebackend.IMAGE_API')
+    def test_clone_without_needed_copy(self, mock_imgapi, mock_driver_):
+        # Call image.clone() in a way that will cause it to pass the locations
+        # check the first time. Assert that we do not call copy-to-store
+        # nor recurse.
+        self.flags(images_rbd_glance_store_name='store', group='libvirt')
+        fake_image = {
+            'id': 'foo',
+            'disk_format': 'raw',
+            'locations': ['fake'],
+        }
+        mock_imgapi.get.return_value = fake_image
+        mock_driver = mock_driver_.return_value
+        mock_driver.is_cloneable.return_value = True
+        image = self.image_class(self.INSTANCE, self.NAME)
+        with mock.patch.object(image, 'copy_to_store') as mock_copy:
+            image.clone(self.CONTEXT, 'foo')
+            mock_copy.assert_not_called()
+        mock_driver.is_cloneable.assert_called_once_with('fake', fake_image)
+
+    @mock.patch('nova.storage.rbd_utils.RBDDriver')
+    @mock.patch('nova.virt.libvirt.imagebackend.IMAGE_API')
+    def test_clone_copy_not_configured(self, mock_imgapi, mock_driver_):
+        # Call image.clone() in a way that will cause it to fail the locations
+        # check the first time. Assert that if the store name is not configured
+        # we do not try to copy-to-store and just raise the original exception
+        # indicating that the image is not reachable.
+        fake_image = {
+            'id': 'foo',
+            'disk_format': 'raw',
+            'locations': ['fake'],
+        }
+        mock_imgapi.get.return_value = fake_image
+        mock_driver = mock_driver_.return_value
+        mock_driver.is_cloneable.return_value = False
+        image = self.image_class(self.INSTANCE, self.NAME)
+        with mock.patch.object(image, 'copy_to_store') as mock_copy:
+            self.assertRaises(exception.ImageUnacceptable,
+                              image.clone, self.CONTEXT, 'foo')
+            mock_copy.assert_not_called()
+        mock_driver.is_cloneable.assert_called_once_with('fake', fake_image)
 
 
 class PloopTestCase(_ImageTestCase, test.NoDBTestCase):

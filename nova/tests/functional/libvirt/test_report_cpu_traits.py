@@ -21,8 +21,8 @@ import os_traits as ost
 from nova import conf
 from nova.db import constants as db_const
 from nova import test
+from nova.tests.fixtures import libvirt as fakelibvirt
 from nova.tests.functional.libvirt import integrated_helpers
-from nova.tests.unit.virt.libvirt import fakelibvirt
 from nova.virt.libvirt.host import SEV_KERNEL_PARAM_FILE
 
 CONF = conf.CONF
@@ -51,6 +51,28 @@ class LibvirtReportTraitsTestBase(
 
 
 class LibvirtReportTraitsTests(LibvirtReportTraitsTestBase):
+    # These must match the capabilities in
+    # nova.virt.libvirt.driver.LibvirtDriver.capabilities
+    expected_libvirt_driver_capability_traits = set([
+        trait for trait in [
+            ost.COMPUTE_ACCELERATORS,
+            ost.COMPUTE_DEVICE_TAGGING,
+            ost.COMPUTE_NET_ATTACH_INTERFACE,
+            ost.COMPUTE_NET_ATTACH_INTERFACE_WITH_TAG,
+            ost.COMPUTE_VOLUME_ATTACH_WITH_TAG,
+            ost.COMPUTE_VOLUME_EXTEND,
+            ost.COMPUTE_VOLUME_MULTI_ATTACH,
+            ost.COMPUTE_TRUSTED_CERTS,
+            ost.COMPUTE_IMAGE_TYPE_AKI,
+            ost.COMPUTE_IMAGE_TYPE_AMI,
+            ost.COMPUTE_IMAGE_TYPE_ARI,
+            ost.COMPUTE_IMAGE_TYPE_ISO,
+            ost.COMPUTE_IMAGE_TYPE_QCOW2,
+            ost.COMPUTE_IMAGE_TYPE_RAW,
+            ost.COMPUTE_RESCUE_BFV,
+        ]
+    ])
+
     def test_report_cpu_traits(self):
         self.assertEqual([], self._get_all_providers())
         self.start_compute()
@@ -59,7 +81,10 @@ class LibvirtReportTraitsTests(LibvirtReportTraitsTestBase):
         # trait values are coming from fakelibvirt's baselineCPU result.
         # COMPUTE_NODE is always set on the compute node provider.
         traits = self._get_provider_traits(self.host_uuid)
-        for trait in ('HW_CPU_X86_VMX', 'HW_CPU_X86_AESNI', 'COMPUTE_NODE'):
+        for trait in (
+            'HW_CPU_X86_VMX', 'HW_CPU_X86_INTEL_VMX', 'HW_CPU_X86_AESNI',
+            'COMPUTE_NODE',
+        ):
             self.assertIn(trait, traits)
 
         self._create_trait('CUSTOM_TRAITS')
@@ -74,11 +99,16 @@ class LibvirtReportTraitsTests(LibvirtReportTraitsTestBase):
         # and it's not in the baseline for the host.
         traits = set(self._get_provider_traits(self.host_uuid))
         expected_traits = self.expected_libvirt_driver_capability_traits.union(
-            [u'HW_CPU_X86_VMX', u'HW_CPU_X86_AESNI', u'CUSTOM_TRAITS',
-             # The periodic restored the COMPUTE_NODE trait.
-             u'COMPUTE_NODE']
-        )
-        self.assertItemsEqual(expected_traits, traits)
+            [
+                'HW_CPU_X86_VMX',
+                'HW_CPU_X86_INTEL_VMX',
+                'HW_CPU_X86_AESNI',
+                'CUSTOM_TRAITS',
+                # The periodic restored the COMPUTE_NODE trait.
+                'COMPUTE_NODE',
+            ])
+        for trait in expected_traits:
+            self.assertIn(trait, traits)
 
 
 class LibvirtReportNoSevTraitsTests(LibvirtReportTraitsTestBase):
@@ -132,7 +162,10 @@ class LibvirtReportNoSevTraitsTests(LibvirtReportTraitsTestBase):
         ) as (mock_exists, mock_open, mock_features):
             # Retrigger the detection code.  In the real world this
             # would be a restart of the compute service.
-            self.compute.driver._host._set_amd_sev_support()
+            # As we are changing the domain caps we need to clear the
+            # cache in the host object.
+            self.compute.driver._host._domain_caps = None
+            self.compute.driver._host._supports_amd_sev = None
             self.assertTrue(self.compute.driver._host.supports_amd_sev)
 
             mock_exists.assert_has_calls([mock.call(SEV_KERNEL_PARAM_FILE)])
@@ -141,6 +174,8 @@ class LibvirtReportNoSevTraitsTests(LibvirtReportTraitsTestBase):
             # However it won't disappear in the provider tree and get synced
             # back to placement until we force a reinventory:
             self.compute.manager.reset()
+            # reset cached traits so they are recalculated.
+            self.compute.driver._static_traits = None
             self._run_periodics()
 
             traits = self._get_provider_traits(self.host_uuid)
@@ -199,7 +234,8 @@ class LibvirtReportSevTraitsTests(LibvirtReportTraitsTestBase):
         with self.patch_exists(SEV_KERNEL_PARAM_FILE, False) as mock_exists:
             # Retrigger the detection code.  In the real world this
             # would be a restart of the compute service.
-            self.compute.driver._host._set_amd_sev_support()
+            self.compute.driver._host._domain_caps = None
+            self.compute.driver._host._supports_amd_sev = None
             self.assertFalse(self.compute.driver._host.supports_amd_sev)
 
             mock_exists.assert_has_calls([mock.call(SEV_KERNEL_PARAM_FILE)])
@@ -207,6 +243,8 @@ class LibvirtReportSevTraitsTests(LibvirtReportTraitsTestBase):
             # However it won't disappear in the provider tree and get synced
             # back to placement until we force a reinventory:
             self.compute.manager.reset()
+            # reset cached traits so they are recalculated.
+            self.compute.driver._static_traits = None
             self._run_periodics()
 
             traits = self._get_provider_traits(self.host_uuid)

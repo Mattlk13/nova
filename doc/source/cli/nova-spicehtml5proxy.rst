@@ -2,21 +2,14 @@
 nova-spicehtml5proxy
 ====================
 
--------------------------------------------------------
-Websocket Proxy for OpenStack Nova SPICE HTML5 consoles
--------------------------------------------------------
-
-:Author: openstack@lists.openstack.org
-:Copyright: OpenStack Foundation
-:Manual section: 1
-:Manual group: cloud computing
+.. program:: nova-spicehtml5proxy
 
 Synopsis
 ========
 
 ::
 
-  nova-spicehtml5proxy [options]
+  nova-spicehtml5proxy [<options>...]
 
 Description
 ===========
@@ -28,20 +21,47 @@ compatible with OpenStack Nova SPICE HTML5 consoles.
 Options
 =======
 
-**General options**
+.. rubric:: General options
+
+.. include:: opts/common.rst
+
+.. rubric:: Websockify options
+
+.. include:: opts/websockify.rst
+
+.. rubric:: Spice options
+
+.. option:: --spice-html5proxy_host SPICE_HTML5PROXY_HOST
+
+    IP address or a hostname on which the ``nova-spicehtml5proxy`` service
+    listens for incoming requests. This option depends on the ``[spice]
+    html5proxy_base_url`` option in ``nova.conf``. The ``nova-spicehtml5proxy``
+    service must be listening on a host that is accessible from the HTML5
+    client.
+
+.. option:: --spice-html5proxy_port SPICE_HTML5PROXY_PORT
+
+    Port on which the ``nova-spicehtml5proxy`` service listens for incoming
+    requests. This option depends on the ``[spice] html5proxy_base_url`` option
+    in ``nova.conf``.  The ``nova-spicehtml5proxy`` service must be listening
+    on a port that is accessible from the HTML5 client.
+
+.. rubric:: Debugger options
+
+.. include:: opts/debugger.rst
 
 Files
 =====
 
 * ``/etc/nova/nova.conf``
-* ``/etc/nova/policy.json``
 * ``/etc/nova/rootwrap.conf``
 * ``/etc/nova/rootwrap.d/``
 
 See Also
 ========
 
-* :nova-doc:`OpenStack Nova <>`
+:doc:`nova-novncproxy(1) <nova-novncproxy>`,
+:doc:`nova-serialproxy(1) <nova-serialproxy>`
 
 Bugs
 ====

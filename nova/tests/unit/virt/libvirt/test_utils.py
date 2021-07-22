@@ -14,17 +14,17 @@
 #    under the License.
 
 import functools
+import grp
 import os
+import pwd
 import tempfile
 
 import ddt
 import mock
 import os_traits
-from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_utils import fileutils
 from oslo_utils.fixture import uuidsentinel as uuids
-import six
 
 from nova.compute import utils as compute_utils
 from nova import context
@@ -32,11 +32,10 @@ from nova import exception
 from nova import objects
 from nova.objects import fields as obj_fields
 import nova.privsep.fs
+import nova.privsep.qemu
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.unit import fake_instance
-from nova.tests.unit.virt.libvirt import fakelibvirt
-from nova.virt.disk import api as disk
 from nova.virt import images
 from nova.virt.libvirt import guest as libvirt_guest
 from nova.virt.libvirt import utils as libvirt_utils
@@ -91,244 +90,6 @@ class LibvirtUtilsTestCase(test.NoDBTestCase):
         mock_isdir.assert_called_once_with(path)
         mock_exists.assert_called_once_with("%s/DiskDescriptor.xml" % path)
         self.assertEqual('ploop', d_type)
-
-    @mock.patch('os.path.exists', return_value=True)
-    @mock.patch('oslo_concurrency.processutils.execute')
-    def test_disk_backing(self, mock_execute, mock_exists):
-        path = '/myhome/disk.config'
-        template_output = """image: %(path)s
-file format: raw
-virtual size: 2K (2048 bytes)
-cluster_size: 65536
-disk size: 96K
-"""
-        output = template_output % ({
-            'path': path,
-        })
-        mock_execute.return_value = (output, '')
-        d_backing = libvirt_utils.get_disk_backing_file(path)
-        mock_execute.assert_called_once_with('env', 'LC_ALL=C', 'LANG=C',
-                                             'qemu-img', 'info', path,
-                                             prlimit=images.QEMU_IMG_LIMITS)
-        mock_exists.assert_called_once_with(path)
-        self.assertIsNone(d_backing)
-
-    def _test_disk_size(self, mock_execute, path, expected_size):
-        d_size = libvirt_utils.get_disk_size(path)
-        self.assertEqual(expected_size, d_size)
-        mock_execute.assert_called_once_with('env', 'LC_ALL=C', 'LANG=C',
-                                             'qemu-img', 'info', path,
-                                             prlimit=images.QEMU_IMG_LIMITS)
-
-    @mock.patch('os.path.exists', return_value=True)
-    def test_disk_size(self, mock_exists):
-        path = '/myhome/disk.config'
-        template_output = """image: %(path)s
-file format: raw
-virtual size: %(v_size)s (%(vsize_b)s bytes)
-cluster_size: 65536
-disk size: 96K
-"""
-        for i in range(0, 128):
-            bytes = i * 65336
-            kbytes = bytes / 1024
-            mbytes = kbytes / 1024
-            output = template_output % ({
-                'v_size': "%sM" % (mbytes),
-                'vsize_b': i,
-                'path': path,
-            })
-            with mock.patch('oslo_concurrency.processutils.execute',
-                return_value=(output, '')) as mock_execute:
-                self._test_disk_size(mock_execute, path, i)
-            output = template_output % ({
-                'v_size': "%sK" % (kbytes),
-                'vsize_b': i,
-                'path': path,
-            })
-            with mock.patch('oslo_concurrency.processutils.execute',
-                return_value=(output, '')) as mock_execute:
-                self._test_disk_size(mock_execute, path, i)
-
-    @mock.patch('os.path.exists', return_value=True)
-    @mock.patch('oslo_concurrency.processutils.execute')
-    def test_qemu_info_canon(self, mock_execute, mock_exists):
-        path = "disk.config"
-        example_output = """image: disk.config
-file format: raw
-virtual size: 64M (67108864 bytes)
-cluster_size: 65536
-disk size: 96K
-blah BLAH: bb
-"""
-        mock_execute.return_value = (example_output, '')
-        image_info = images.qemu_img_info(path)
-        mock_execute.assert_called_once_with('env', 'LC_ALL=C', 'LANG=C',
-                                             'qemu-img', 'info', path,
-                                             prlimit=images.QEMU_IMG_LIMITS)
-        mock_exists.assert_called_once_with(path)
-        self.assertEqual('disk.config', image_info.image)
-        self.assertEqual('raw', image_info.file_format)
-        self.assertEqual(67108864, image_info.virtual_size)
-        self.assertEqual(98304, image_info.disk_size)
-        self.assertEqual(65536, image_info.cluster_size)
-
-    @mock.patch('os.path.exists', return_value=True)
-    @mock.patch('oslo_concurrency.processutils.execute')
-    def test_qemu_info_canon_qemu_2_10(self, mock_execute, mock_exists):
-        images.QEMU_VERSION = images.QEMU_VERSION_REQ_SHARED
-        path = "disk.config"
-        example_output = """image: disk.config
-file format: raw
-virtual size: 64M (67108864 bytes)
-cluster_size: 65536
-disk size: 96K
-blah BLAH: bb
-"""
-        mock_execute.return_value = (example_output, '')
-        image_info = images.qemu_img_info(path)
-        mock_execute.assert_called_once_with('env', 'LC_ALL=C', 'LANG=C',
-                                             'qemu-img', 'info', path,
-                                             '--force-share',
-                                             prlimit=images.QEMU_IMG_LIMITS)
-        mock_exists.assert_called_once_with(path)
-        self.assertEqual('disk.config', image_info.image)
-        self.assertEqual('raw', image_info.file_format)
-        self.assertEqual(67108864, image_info.virtual_size)
-        self.assertEqual(98304, image_info.disk_size)
-        self.assertEqual(65536, image_info.cluster_size)
-
-    @mock.patch('os.path.exists', return_value=True)
-    @mock.patch('oslo_concurrency.processutils.execute')
-    def test_qemu_info_canon2(self, mock_execute, mock_exists):
-        path = "disk.config"
-        example_output = """image: disk.config
-file format: QCOW2
-virtual size: 67108844
-cluster_size: 65536
-disk size: 963434
-backing file: /var/lib/nova/a328c7998805951a_2
-"""
-        mock_execute.return_value = (example_output, '')
-        image_info = images.qemu_img_info(path)
-        mock_execute.assert_called_once_with('env', 'LC_ALL=C', 'LANG=C',
-                                             'qemu-img', 'info', path,
-                                             prlimit=images.QEMU_IMG_LIMITS)
-        mock_exists.assert_called_once_with(path)
-        self.assertEqual('disk.config', image_info.image)
-        self.assertEqual('qcow2', image_info.file_format)
-        self.assertEqual(67108844, image_info.virtual_size)
-        self.assertEqual(963434, image_info.disk_size)
-        self.assertEqual(65536, image_info.cluster_size)
-        self.assertEqual('/var/lib/nova/a328c7998805951a_2',
-                         image_info.backing_file)
-
-    @mock.patch('os.path.exists', return_value=True)
-    @mock.patch('os.path.isdir', return_value=True)
-    @mock.patch('oslo_concurrency.processutils.execute')
-    def test_qemu_info_ploop(self, mock_execute, mock_isdir, mock_exists):
-        path = "/var/lib/nova"
-        example_output = """image: root.hds
-file format: parallels
-virtual size: 3.0G (3221225472 bytes)
-disk size: 706M
-"""
-        mock_execute.return_value = (example_output, '')
-        image_info = images.qemu_img_info(path)
-        mock_execute.assert_called_once_with('env', 'LC_ALL=C', 'LANG=C',
-                                             'qemu-img', 'info',
-                                             os.path.join(path, 'root.hds'),
-                                             prlimit=images.QEMU_IMG_LIMITS)
-        mock_isdir.assert_called_once_with(path)
-        self.assertEqual(2, mock_exists.call_count)
-        self.assertEqual(path, mock_exists.call_args_list[0][0][0])
-        self.assertEqual(os.path.join(path, 'DiskDescriptor.xml'),
-                             mock_exists.call_args_list[1][0][0])
-        self.assertEqual('root.hds', image_info.image)
-        self.assertEqual('parallels', image_info.file_format)
-        self.assertEqual(3221225472, image_info.virtual_size)
-        self.assertEqual(740294656, image_info.disk_size)
-
-    @mock.patch('os.path.exists', return_value=True)
-    @mock.patch('oslo_concurrency.processutils.execute')
-    def test_qemu_backing_file_actual(self,
-                                      mock_execute, mock_exists):
-        path = "disk.config"
-        example_output = """image: disk.config
-file format: raw
-virtual size: 64M (67108864 bytes)
-cluster_size: 65536
-disk size: 96K
-Snapshot list:
-ID        TAG                 VM SIZE                DATE       VM CLOCK
-1     d9a9784a500742a7bb95627bb3aace38      0 2012-08-20 10:52:46 00:00:00.000
-backing file: /var/lib/nova/a328c7998805951a_2 (actual path: /b/3a988059e51a_2)
-"""
-        mock_execute.return_value = (example_output, '')
-        image_info = images.qemu_img_info(path)
-        mock_execute.assert_called_once_with('env', 'LC_ALL=C', 'LANG=C',
-                                             'qemu-img', 'info', path,
-                                             prlimit=images.QEMU_IMG_LIMITS)
-        mock_exists.assert_called_once_with(path)
-        self.assertEqual('disk.config', image_info.image)
-        self.assertEqual('raw', image_info.file_format)
-        self.assertEqual(67108864, image_info.virtual_size)
-        self.assertEqual(98304, image_info.disk_size)
-        self.assertEqual(1, len(image_info.snapshots))
-        self.assertEqual('/b/3a988059e51a_2',
-                         image_info.backing_file)
-
-    @mock.patch('os.path.exists', return_value=True)
-    @mock.patch('oslo_concurrency.processutils.execute')
-    def test_qemu_info_convert(self, mock_execute, mock_exists):
-        path = "disk.config"
-        example_output = """image: disk.config
-file format: raw
-virtual size: 64M
-disk size: 96K
-Snapshot list:
-ID        TAG                 VM SIZE                DATE       VM CLOCK
-1        d9a9784a500742a7bb95627bb3aace38    0 2012-08-20 10:52:46 00:00:00.000
-3        d9a9784a500742a7bb95627bb3aace38    0 2012-08-20 10:52:46 00:00:00.000
-4        d9a9784a500742a7bb95627bb3aace38    0 2012-08-20 10:52:46 00:00:00.000
-junk stuff: bbb
-"""
-        mock_execute.return_value = (example_output, '')
-        image_info = images.qemu_img_info(path)
-        mock_execute.assert_called_once_with('env', 'LC_ALL=C', 'LANG=C',
-                                             'qemu-img', 'info', path,
-                                             prlimit=images.QEMU_IMG_LIMITS)
-        mock_exists.assert_called_once_with(path)
-        self.assertEqual('disk.config', image_info.image)
-        self.assertEqual('raw', image_info.file_format)
-        self.assertEqual(67108864, image_info.virtual_size)
-        self.assertEqual(98304, image_info.disk_size)
-
-    @mock.patch('os.path.exists', return_value=True)
-    @mock.patch('oslo_concurrency.processutils.execute')
-    def test_qemu_info_snaps(self, mock_execute, mock_exists):
-        path = "disk.config"
-        example_output = """image: disk.config
-file format: raw
-virtual size: 64M (67108864 bytes)
-disk size: 96K
-Snapshot list:
-ID        TAG                 VM SIZE                DATE       VM CLOCK
-1        d9a9784a500742a7bb95627bb3aace38    0 2012-08-20 10:52:46 00:00:00.000
-3        d9a9784a500742a7bb95627bb3aace38    0 2012-08-20 10:52:46 00:00:00.000
-4        d9a9784a500742a7bb95627bb3aace38    0 2012-08-20 10:52:46 00:00:00.000
-"""
-        mock_execute.return_value = (example_output, '')
-        image_info = images.qemu_img_info(path)
-        mock_execute.assert_called_once_with('env', 'LC_ALL=C', 'LANG=C',
-                                             'qemu-img', 'info', path,
-                                             prlimit=images.QEMU_IMG_LIMITS)
-        mock_exists.assert_called_once_with(path)
-        self.assertEqual('disk.config', image_info.image)
-        self.assertEqual('raw', image_info.file_format)
-        self.assertEqual(67108864, image_info.virtual_size)
-        self.assertEqual(98304, image_info.disk_size)
-        self.assertEqual(3, len(image_info.snapshots))
 
     def test_valid_hostname_normal(self):
         self.assertTrue(libvirt_utils.is_valid_hostname("hello.world.com"))
@@ -395,93 +156,6 @@ ID        TAG                 VM SIZE                DATE       VM CLOCK
                 mock.call('5G', 'expanded', expected_fs_type,
                           '/some/path/root.hds')])
 
-    def test_pick_disk_driver_name(self):
-        type_map = {'kvm': ([True, 'qemu'], [False, 'qemu'], [None, 'qemu']),
-                    'qemu': ([True, 'qemu'], [False, 'qemu'], [None, 'qemu']),
-                    'uml': ([True, None], [False, None], [None, None]),
-                    'lxc': ([True, None], [False, None], [None, None])}
-        # NOTE(aloga): Xen is tested in test_pick_disk_driver_name_xen
-
-        version = 1005001
-        for (virt_type, checks) in type_map.items():
-            self.flags(virt_type=virt_type, group='libvirt')
-            for (is_block_dev, expected_result) in checks:
-                result = libvirt_utils.pick_disk_driver_name(version,
-                                                             is_block_dev)
-                self.assertEqual(result, expected_result)
-
-    @mock.patch('nova.privsep.libvirt.xend_probe')
-    @mock.patch('oslo_concurrency.processutils.execute')
-    def test_pick_disk_driver_name_xen(self, mock_execute, mock_xend_probe):
-
-        def execute_side_effect(*args, **kwargs):
-            if args == ('tap-ctl', 'check'):
-                if mock_execute.blktap is True:
-                    return ('ok\n', '')
-                elif mock_execute.blktap is False:
-                    return ('some error\n', '')
-                else:
-                    raise OSError(2, "No such file or directory")
-            raise Exception('Unexpected call')
-        mock_execute.side_effect = execute_side_effect
-
-        def xend_probe_side_effect():
-            if mock_execute.xend is True:
-                return ('', '')
-            elif mock_execute.xend is False:
-                raise processutils.ProcessExecutionError("error")
-            else:
-                raise OSError(2, "No such file or directory")
-        mock_xend_probe.side_effect = xend_probe_side_effect
-
-        self.flags(virt_type="xen", group='libvirt')
-        versions = [4000000, 4001000, 4002000, 4003000, 4005000]
-        for version in versions:
-            # block dev
-            result = libvirt_utils.pick_disk_driver_name(version, True)
-            self.assertEqual(result, "phy")
-            self.assertFalse(mock_execute.called)
-            mock_execute.reset_mock()
-            # file dev
-            for blktap in True, False, None:
-                mock_execute.blktap = blktap
-                for xend in True, False, None:
-                    mock_execute.xend = xend
-                    result = libvirt_utils.pick_disk_driver_name(version,
-                                                                 False)
-                    # qemu backend supported only by libxl which is
-                    # production since xen 4.2. libvirt use libxl if
-                    # xend service not started.
-                    if version >= 4002000 and xend is not True:
-                        self.assertEqual(result, 'qemu')
-                    elif blktap:
-                        if version == 4000000:
-                            self.assertEqual(result, 'tap')
-                        else:
-                            self.assertEqual(result, 'tap2')
-                    else:
-                        self.assertEqual(result, 'file')
-                    # default is_block_dev False
-                    self.assertEqual(result,
-                        libvirt_utils.pick_disk_driver_name(version))
-                    mock_execute.reset_mock()
-
-    @mock.patch('os.path.exists', return_value=True)
-    @mock.patch('oslo_concurrency.processutils.execute')
-    def test_get_disk_size(self, mock_execute, mock_exists):
-        path = '/some/path'
-        example_output = """image: 00000001
-file format: raw
-virtual size: 4.4M (4592640 bytes)
-disk size: 4.4M
-"""
-        mock_execute.return_value = (example_output, '')
-        self.assertEqual(4592640, disk.get_disk_size('/some/path'))
-        mock_execute.assert_called_once_with('env', 'LC_ALL=C', 'LANG=C',
-                                             'qemu-img', 'info', path,
-                                             prlimit=images.QEMU_IMG_LIMITS)
-        mock_exists.assert_called_once_with(path)
-
     def test_copy_image(self):
         dst_fd, dst_path = tempfile.mkstemp()
         try:
@@ -497,17 +171,6 @@ disk size: 4.4M
                     self.assertEqual(fp.read(), 'canary')
             finally:
                 os.unlink(src_path)
-        finally:
-            os.unlink(dst_path)
-
-    def test_write_to_file(self):
-        dst_fd, dst_path = tempfile.mkstemp()
-        try:
-            os.close(dst_fd)
-
-            libvirt_utils.write_to_file(dst_path, 'hello')
-            with open(dst_path, 'r') as fp:
-                self.assertEqual(fp.read(), 'hello')
         finally:
             os.unlink(dst_path)
 
@@ -582,8 +245,8 @@ disk size: 4.4M
         try:
             os.close(dst_fd)
 
-            # We have a test for write_to_file. If that is sound, this suffices
-            libvirt_utils.write_to_file(dst_path, 'hello')
+            with open(dst_path, 'w') as f:
+                f.write('hello')
             self.assertEqual(libvirt_utils.load_file(dst_path), 'hello')
         finally:
             os.unlink(dst_path)
@@ -593,8 +256,8 @@ disk size: 4.4M
         try:
             os.close(dst_fd)
 
-            # We have a test for write_to_file. If that is sound, this suffices
-            libvirt_utils.write_to_file(dst_path, 'hello')
+            with open(dst_path, 'w') as f:
+                f.write('hello')
             with libvirt_utils.file_open(dst_path, 'r') as fp:
                 self.assertEqual(fp.read(), 'hello')
         finally:
@@ -740,31 +403,6 @@ disk size: 4.4M
 
         del self.executes
 
-    def test_get_disk_backing_file(self):
-        with_actual_path = False
-
-        def fake_execute(*args, **kwargs):
-            if with_actual_path:
-                return ("some: output\n"
-                        "backing file: /foo/bar/baz (actual path: /a/b/c)\n"
-                        "...: ...\n"), ''
-            else:
-                return ("some: output\n"
-                        "backing file: /foo/bar/baz\n"
-                        "...: ...\n"), ''
-
-        def return_true(*args, **kwargs):
-            return True
-
-        self.stub_out('oslo_concurrency.processutils.execute', fake_execute)
-        self.stub_out('os.path.exists', return_true)
-
-        out = libvirt_utils.get_disk_backing_file('')
-        self.assertEqual(out, 'baz')
-        with_actual_path = True
-        out = libvirt_utils.get_disk_backing_file('')
-        self.assertEqual(out, 'c')
-
     def test_get_instance_path_at_destination(self):
         instance = fake_instance.fake_instance_obj(None, name='fake_inst',
                                                    uuid=uuids.instance)
@@ -837,23 +475,23 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
 
             # Source is given, and matches source in /proc/mounts
             proc_mnt = mock.mock_open(read_data=proc_with_mnt)
-            with mock.patch.object(six.moves.builtins, "open", proc_mnt):
+            with mock.patch('builtins.open', proc_mnt):
                 self.assertTrue(libvirt_utils.is_mounted(mount_path, source))
 
             # Source is given, and doesn't match source in /proc/mounts
             proc_mnt = mock.mock_open(read_data=proc_wrong_mnt)
-            with mock.patch.object(six.moves.builtins, "open", proc_mnt):
+            with mock.patch('builtins.open', proc_mnt):
                 self.assertFalse(libvirt_utils.is_mounted(mount_path, source))
 
             # Source is given, and mountpoint isn't present in /proc/mounts
             # Note that this shouldn't occur, as os.path.ismount should have
             # previously returned False in this case.
             proc_umnt = mock.mock_open(read_data=proc_without_mnt)
-            with mock.patch.object(six.moves.builtins, "open", proc_umnt):
+            with mock.patch('builtins.open', proc_umnt):
                 self.assertFalse(libvirt_utils.is_mounted(mount_path, source))
 
     def test_find_disk_file_device(self):
-        self.useFixture(fakelibvirt.FakeLibvirtFixture())
+        self.useFixture(nova_fixtures.LibvirtFixture())
         xml = """
           <domain type='kvm'>
             <os>
@@ -875,7 +513,7 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
         self.assertEqual('qcow2', format)
 
     def test_find_disk_block_device(self):
-        self.useFixture(fakelibvirt.FakeLibvirtFixture())
+        self.useFixture(nova_fixtures.LibvirtFixture())
         xml = """
           <domain type='kvm'>
             <os>
@@ -897,7 +535,7 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
         self.assertEqual('raw', format)
 
     def test_find_disk_rbd(self):
-        self.useFixture(fakelibvirt.FakeLibvirtFixture())
+        self.useFixture(nova_fixtures.LibvirtFixture())
         xml = """
           <domain type='kvm'>
             <os>
@@ -921,7 +559,7 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
         self.assertEqual('raw', format)
 
     def test_find_disk_lxc(self):
-        self.useFixture(fakelibvirt.FakeLibvirtFixture())
+        self.useFixture(nova_fixtures.LibvirtFixture())
         xml = """
           <domain type='lxc'>
             <os>
@@ -942,7 +580,7 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
         self.assertIsNone(format)
 
     def test_find_disk_parallels(self):
-        self.useFixture(fakelibvirt.FakeLibvirtFixture())
+        self.useFixture(nova_fixtures.LibvirtFixture())
         xml = """
           <domain type='parallels'>
             <os>
@@ -1020,3 +658,96 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
         # we shouldn't see the hyperthreading trait since that's a valid trait
         # but not a CPU flag
         self.assertEqual(set(['3dnow', 'sse2']), traits)
+
+    @mock.patch('nova.virt.libvirt.utils.copy_image')
+    @mock.patch('nova.privsep.path.chown')
+    @mock.patch('nova.privsep.path.move_tree')
+    @mock.patch('oslo_utils.fileutils.ensure_tree')
+    @mock.patch('os.path.exists', return_value=True)
+    def test_save_migrate_vtpm(
+        self, mock_exists, mock_ensure, mock_move, mock_chown, mock_copy,
+    ):
+        def _on_execute():
+            pass
+
+        def _on_completion():
+            pass
+
+        libvirt_utils.save_and_migrate_vtpm_dir(
+            uuids.instance, 'base_resize', 'base', 'host', _on_execute,
+            _on_completion,
+        )
+
+        vtpm_dir = f'/var/lib/libvirt/swtpm/{uuids.instance}'
+        swtpm_dir = 'base_resize/swtpm'
+        mock_exists.assert_called_once_with(vtpm_dir)
+        mock_ensure.assert_called_once_with(swtpm_dir)
+        mock_move.assert_called_once_with(vtpm_dir, swtpm_dir)
+        mock_chown.assert_called_once_with(
+            swtpm_dir, os.geteuid(), os.getegid(), recursive=True,
+        )
+        mock_copy.assert_called_once_with(
+            swtpm_dir, 'base', host='host', on_completion=_on_completion,
+            on_execute=_on_execute,
+        )
+
+    @mock.patch('nova.privsep.path.move_tree')
+    @mock.patch('nova.privsep.path.chown')
+    @mock.patch('nova.virt.libvirt.utils.copy_image')
+    @mock.patch('os.path.exists', return_value=False)
+    def test_save_migrate_vtpm_not_enabled(
+        self, mock_exists, mock_copy_image, mock_chown, mock_move,
+    ):
+        def _dummy():
+            pass
+
+        libvirt_utils.save_and_migrate_vtpm_dir(
+            uuids.instance, 'base_resize', 'base', 'host', _dummy, _dummy,
+        )
+
+        mock_exists.assert_called_once_with(
+            f'/var/lib/libvirt/swtpm/{uuids.instance}')
+        mock_copy_image.assert_not_called()
+        mock_chown.assert_not_called()
+        mock_move.assert_not_called()
+
+    @mock.patch('grp.getgrnam')
+    @mock.patch('pwd.getpwnam')
+    @mock.patch('nova.privsep.path.chmod')
+    @mock.patch('nova.privsep.path.makedirs')
+    @mock.patch('nova.privsep.path.move_tree')
+    @mock.patch('nova.privsep.path.chown')
+    @mock.patch('os.path.exists')
+    @mock.patch('os.path.isdir')
+    def _test_restore_vtpm(
+        self, exists, mock_isdir, mock_exists, mock_chown, mock_move,
+        mock_makedirs, mock_chmod, mock_getpwnam, mock_getgrnam,
+    ):
+        mock_exists.return_value = exists
+        mock_isdir.return_value = True
+        mock_getpwnam.return_value = pwd.struct_passwd(
+            ('swtpm', '*', 1234, 1234, None, '/home/test', '/bin/bash'))
+        mock_getgrnam.return_value = grp.struct_group(('swtpm', '*', 4321, []))
+
+        libvirt_utils.restore_vtpm_dir('dummy')
+
+        if not exists:
+            mock_makedirs.assert_called_once_with(libvirt_utils.VTPM_DIR)
+            mock_chmod.assert_called_once_with(libvirt_utils.VTPM_DIR, 0o711)
+
+        mock_getpwnam.assert_called_once_with(CONF.libvirt.swtpm_user)
+        mock_getgrnam.assert_called_once_with(CONF.libvirt.swtpm_group)
+        mock_chown.assert_called_with('dummy', 1234, 4321, recursive=True)
+        mock_move.assert_called_with('dummy', libvirt_utils.VTPM_DIR)
+
+    def test_restore_vtpm(self):
+        self._test_restore_vtpm(True)
+
+    def test_restore_vtpm_not_exist(self):
+        self._test_restore_vtpm(False)
+
+    @mock.patch('os.path.exists', return_value=True)
+    @mock.patch('os.path.isdir', return_value=False)
+    def test_restore_vtpm_notdir(self, mock_isdir, mock_exists):
+        self.assertRaises(exception.Invalid,
+                          libvirt_utils.restore_vtpm_dir, 'dummy')

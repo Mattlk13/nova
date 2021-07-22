@@ -14,13 +14,11 @@ from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional import fixtures as func_fixtures
 from nova.tests.functional import integrated_helpers
-from nova.tests.unit import cast_as_call
-from nova.tests.unit.image import fake as image_fake
-from nova.tests.unit import policy_fixture
 
 
-class SchedulerOnlyChecksTargetTest(test.TestCase,
-                                    integrated_helpers.InstanceHelperMixin):
+class SchedulerOnlyChecksTargetTest(
+    test.TestCase, integrated_helpers.InstanceHelperMixin,
+):
     """Regression test for bug 1702454 introduced in Newton.
 
     That test is for verifying that if we evacuate by providing a target, the
@@ -42,7 +40,7 @@ class SchedulerOnlyChecksTargetTest(test.TestCase,
 
     def setUp(self):
         super(SchedulerOnlyChecksTargetTest, self).setUp()
-        self.useFixture(policy_fixture.RealPolicyFixture())
+        self.useFixture(nova_fixtures.RealPolicyFixture())
 
         # The NeutronFixture is needed to stub out validate_networks in API.
         self.useFixture(nova_fixtures.NeutronFixture(self))
@@ -59,8 +57,7 @@ class SchedulerOnlyChecksTargetTest(test.TestCase,
         self.api = api_fixture.api
 
         # the image fake backend needed for image discovery
-        image_fake.stub_out_image_service(self)
-        self.addCleanup(image_fake.FakeImageService_reset)
+        self.useFixture(nova_fixtures.GlanceFixture(self))
 
         self.start_service('conductor')
 
@@ -85,7 +82,7 @@ class SchedulerOnlyChecksTargetTest(test.TestCase,
         self.start_service('compute', host='host1')
         self.start_service('compute', host='host2')
         self.start_service('compute', host='host3')
-        self.useFixture(cast_as_call.CastAsCall(self))
+        self.useFixture(nova_fixtures.CastAsCallFixture(self))
 
     def test_evacuate_server(self):
         # We first create the instance
@@ -112,15 +109,14 @@ class SchedulerOnlyChecksTargetTest(test.TestCase,
         # only possibility the instance can end up on it is because the
         # scheduler should only verify the requested destination as host2
         # is weighed lower than host3.
-        evacuate = {
-            'evacuate': {
-                'host': 'host2'
-            }
-        }
-        self.admin_api.post_server_action(server['id'], evacuate)
+        target_host = 'host2'
 
-        self._wait_for_state_change(server, 'ACTIVE')
-        server = self.admin_api.get_server(server_id)
+        post_args = {
+            'host': target_host
+        }
+
+        server = self._evacuate_server(
+            server, extra_post_args=post_args, expected_host=target_host)
 
         # Yeepee, that works!
-        self.assertEqual('host2', server['OS-EXT-SRV-ATTR:host'])
+        self.assertEqual(target_host, server['OS-EXT-SRV-ATTR:host'])

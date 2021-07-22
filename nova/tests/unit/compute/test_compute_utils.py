@@ -19,14 +19,13 @@
 import copy
 import datetime
 import string
-import traceback
 
 import mock
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import uuidutils
-import six
 
+from nova.accelerator.cyborg import _CyborgClient as cyborgclient
 from nova.compute import manager
 from nova.compute import power_state
 from nova.compute import task_states
@@ -42,12 +41,13 @@ from nova.objects import base
 from nova.objects import block_device as block_device_obj
 from nova.objects import fields
 from nova import rpc
+from nova.scheduler.client import report
 from nova import test
+from nova.tests import fixtures
 from nova.tests.unit import fake_block_device
 from nova.tests.unit import fake_crypto
 from nova.tests.unit import fake_instance
 from nova.tests.unit import fake_network
-from nova.tests.unit import fake_notifier
 from nova.tests.unit import fake_server_actions
 from nova.tests.unit.objects import test_flavor
 
@@ -86,17 +86,10 @@ class ComputeValidateDeviceTestCase(test.NoDBTestCase):
     def setUp(self):
         super(ComputeValidateDeviceTestCase, self).setUp()
         self.context = context.RequestContext('fake', 'fake')
-        # check if test name includes "xen"
-        if 'xen' in self.id():
-            self.flags(compute_driver='xenapi.XenAPIDriver')
-            self.instance = objects.Instance(
-                uuid=uuidutils.generate_uuid(dashed=False),
-                root_device_name=None, default_ephemeral_device=None)
-        else:
-            self.instance = objects.Instance(
-                uuid=uuidutils.generate_uuid(dashed=False),
-                root_device_name='/dev/vda',
-                default_ephemeral_device='/dev/vdb')
+        self.instance = objects.Instance(
+            uuid=uuidutils.generate_uuid(dashed=False),
+            root_device_name='/dev/vda',
+            default_ephemeral_device='/dev/vdb')
 
         flavor = objects.Flavor(**test_flavor.fake_flavor)
         self.instance.system_metadata = {}
@@ -184,7 +177,7 @@ class ComputeValidateDeviceTestCase(test.NoDBTestCase):
     def test_device_in_use(self):
         exc = self.assertRaises(exception.DevicePathInUse,
                           self._validate_device, '/dev/vda')
-        self.assertIn('/dev/vda', six.text_type(exc))
+        self.assertIn('/dev/vda', str(exc))
 
     def test_swap(self):
         self.instance['default_swap_device'] = "/dev/vdc"
@@ -196,33 +189,6 @@ class ComputeValidateDeviceTestCase(test.NoDBTestCase):
         self.instance.default_swap_device = "/dev/vdb"
         device = self._validate_device()
         self.assertEqual(device, '/dev/vdc')
-
-    def test_ephemeral_xenapi(self):
-        self.instance.flavor.ephemeral_gb = 10
-        self.instance.flavor.swap = 0
-        device = self._validate_device()
-        self.assertEqual(device, '/dev/xvdc')
-
-    def test_swap_xenapi(self):
-        self.instance.flavor.ephemeral_gb = 0
-        self.instance.flavor.swap = 10
-        device = self._validate_device()
-        self.assertEqual(device, '/dev/xvdb')
-
-    def test_swap_and_ephemeral_xenapi(self):
-        self.instance.flavor.ephemeral_gb = 10
-        self.instance.flavor.swap = 10
-        device = self._validate_device()
-        self.assertEqual(device, '/dev/xvdd')
-
-    def test_swap_and_one_attachment_xenapi(self):
-        self.instance.flavor.ephemeral_gb = 0
-        self.instance.flavor.swap = 10
-        device = self._validate_device()
-        self.assertEqual(device, '/dev/xvdb')
-        self.data.append(self._fake_bdm(device))
-        device = self._validate_device()
-        self.assertEqual(device, '/dev/xvdd')
 
     def test_no_dev_root_device_name_get_next_name(self):
         self.instance['root_device_name'] = 'vda'
@@ -394,8 +360,7 @@ class UsageInfoTestCase(test.TestCase):
 
         super(UsageInfoTestCase, self).setUp()
 
-        fake_notifier.stub_notifier(self)
-        self.addCleanup(fake_notifier.reset)
+        self.notifier = self.useFixture(fixtures.NotificationFixture(self))
 
         self.flags(compute_driver='fake.FakeDriver')
         self.compute = manager.ComputeManager()
@@ -404,12 +369,7 @@ class UsageInfoTestCase(test.TestCase):
         self.context = context.RequestContext(self.user_id, self.project_id)
         self.flavor = objects.Flavor.get_by_name(self.context, 'm1.tiny')
 
-        def fake_show(meh, context, id, **kwargs):
-            return {'id': 1, 'properties': {'kernel_id': 1, 'ramdisk_id': 1}}
-
         self.flags(group='glance', api_servers=['http://localhost:9292'])
-        self.stub_out('nova.tests.unit.image.fake._FakeImageService.show',
-                      fake_show)
         fake_network.set_stub_network_methods(self)
         fake_server_actions.stub_out_action_events(self)
 
@@ -424,8 +384,8 @@ class UsageInfoTestCase(test.TestCase):
         instance.save()
         compute_utils.notify_usage_exists(
             rpc.get_notifier('compute'), self.context, instance, 'fake-host')
-        self.assertEqual(len(fake_notifier.NOTIFICATIONS), 1)
-        msg = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual(len(self.notifier.notifications), 1)
+        msg = self.notifier.notifications[0]
         self.assertEqual(msg.priority, 'INFO')
         self.assertEqual(msg.event_type, 'compute.instance.exists')
         payload = msg.payload
@@ -456,8 +416,8 @@ class UsageInfoTestCase(test.TestCase):
 
         compute_utils.notify_usage_exists(
             rpc.get_notifier('compute'), self.context, instance, 'fake-host')
-        self.assertEqual(len(fake_notifier.VERSIONED_NOTIFICATIONS), 1)
-        msg = fake_notifier.VERSIONED_NOTIFICATIONS[0]
+        self.assertEqual(len(self.notifier.versioned_notifications), 1)
+        msg = self.notifier.versioned_notifications[0]
         self.assertEqual(msg['priority'], 'INFO')
         self.assertEqual(msg['event_type'], 'instance.exists')
         payload = msg['payload']['nova_object.data']
@@ -489,7 +449,7 @@ class UsageInfoTestCase(test.TestCase):
         self.compute.terminate_instance(self.context, instance, [])
         compute_utils.notify_usage_exists(
             rpc.get_notifier('compute'), self.context, instance, 'fake-host')
-        msg = fake_notifier.NOTIFICATIONS[-1]
+        msg = self.notifier.notifications[-1]
         self.assertEqual(msg.priority, 'INFO')
         self.assertEqual(msg.event_type, 'compute.instance.exists')
         payload = msg.payload
@@ -532,8 +492,8 @@ class UsageInfoTestCase(test.TestCase):
             phase='start',
             bdms=bdms)
 
-        self.assertEqual(len(fake_notifier.VERSIONED_NOTIFICATIONS), 1)
-        notification = fake_notifier.VERSIONED_NOTIFICATIONS[0]
+        self.assertEqual(len(self.notifier.versioned_notifications), 1)
+        notification = self.notifier.versioned_notifications[0]
 
         self.assertEqual(notification['priority'], 'INFO')
         self.assertEqual(notification['event_type'], 'instance.delete.start')
@@ -578,8 +538,8 @@ class UsageInfoTestCase(test.TestCase):
             host='fake-compute',
             phase='start')
 
-        self.assertEqual(1, len(fake_notifier.VERSIONED_NOTIFICATIONS))
-        notification = fake_notifier.VERSIONED_NOTIFICATIONS[0]
+        self.assertEqual(1, len(self.notifier.versioned_notifications))
+        notification = self.notifier.versioned_notifications[0]
 
         self.assertEqual('INFO', notification['priority'])
         self.assertEqual('instance.create.start', notification['event_type'])
@@ -621,8 +581,8 @@ class UsageInfoTestCase(test.TestCase):
             host='fake-compute',
             phase='start')
 
-        self.assertEqual(1, len(fake_notifier.VERSIONED_NOTIFICATIONS))
-        notification = fake_notifier.VERSIONED_NOTIFICATIONS[0]
+        self.assertEqual(1, len(self.notifier.versioned_notifications))
+        notification = self.notifier.versioned_notifications[0]
 
         self.assertEqual('INFO', notification['priority'])
         self.assertEqual('instance.create.start', notification['event_type'])
@@ -660,8 +620,8 @@ class UsageInfoTestCase(test.TestCase):
             host='fake-compute',
             phase='start')
 
-        self.assertEqual(1, len(fake_notifier.VERSIONED_NOTIFICATIONS))
-        notification = fake_notifier.VERSIONED_NOTIFICATIONS[0]
+        self.assertEqual(1, len(self.notifier.versioned_notifications))
+        notification = self.notifier.versioned_notifications[0]
 
         self.assertEqual('INFO', notification['priority'])
         self.assertEqual('instance.create.start', notification['event_type'])
@@ -695,8 +655,8 @@ class UsageInfoTestCase(test.TestCase):
             fields.NotificationPhase.START,
             uuids.old_volume_id, uuids.new_volume_id)
 
-        self.assertEqual(len(fake_notifier.VERSIONED_NOTIFICATIONS), 1)
-        notification = fake_notifier.VERSIONED_NOTIFICATIONS[0]
+        self.assertEqual(len(self.notifier.versioned_notifications), 1)
+        notification = self.notifier.versioned_notifications[0]
 
         self.assertEqual('INFO', notification['priority'])
         self.assertEqual('instance.%s.%s' %
@@ -731,14 +691,13 @@ class UsageInfoTestCase(test.TestCase):
             # To get exception trace, raise and catch an exception
             raise test.TestingException('Volume swap error.')
         except Exception as ex:
-            tb = traceback.format_exc()
             compute_utils.notify_about_volume_swap(
                 self.context, instance, 'fake-compute',
                 fields.NotificationPhase.ERROR,
-                uuids.old_volume_id, uuids.new_volume_id, ex, tb)
+                uuids.old_volume_id, uuids.new_volume_id, ex)
 
-        self.assertEqual(len(fake_notifier.VERSIONED_NOTIFICATIONS), 1)
-        notification = fake_notifier.VERSIONED_NOTIFICATIONS[0]
+        self.assertEqual(len(self.notifier.versioned_notifications), 1)
+        notification = self.notifier.versioned_notifications[0]
 
         self.assertEqual('ERROR', notification['priority'])
         self.assertEqual('instance.%s.%s' %
@@ -788,8 +747,8 @@ class UsageInfoTestCase(test.TestCase):
             uuids.rescue_image_ref,
             phase='start')
 
-        self.assertEqual(len(fake_notifier.VERSIONED_NOTIFICATIONS), 1)
-        notification = fake_notifier.VERSIONED_NOTIFICATIONS[0]
+        self.assertEqual(len(self.notifier.versioned_notifications), 1)
+        notification = self.notifier.versioned_notifications[0]
 
         self.assertEqual(notification['priority'], 'INFO')
         self.assertEqual(notification['event_type'], 'instance.rescue.start')
@@ -821,8 +780,8 @@ class UsageInfoTestCase(test.TestCase):
         compute_utils.notify_about_resize_prep_instance(
             self.context, instance, 'fake-compute', 'start', new_flavor)
 
-        self.assertEqual(len(fake_notifier.VERSIONED_NOTIFICATIONS), 1)
-        notification = fake_notifier.VERSIONED_NOTIFICATIONS[0]
+        self.assertEqual(len(self.notifier.versioned_notifications), 1)
+        notification = self.notifier.versioned_notifications[0]
 
         self.assertEqual(notification['priority'], 'INFO')
         self.assertEqual(notification['event_type'],
@@ -854,7 +813,7 @@ class UsageInfoTestCase(test.TestCase):
         self.compute.terminate_instance(self.context, instance, [])
         compute_utils.notify_usage_exists(
             rpc.get_notifier('compute'), self.context, instance, 'fake-host')
-        msg = fake_notifier.NOTIFICATIONS[-1]
+        msg = self.notifier.notifications[-1]
         self.assertEqual(msg.priority, 'INFO')
         self.assertEqual(msg.event_type, 'compute.instance.exists')
         payload = msg.payload
@@ -894,8 +853,8 @@ class UsageInfoTestCase(test.TestCase):
         compute_utils.notify_about_volume_usage(self.context, vol_usage,
                                                 'fake-compute')
 
-        self.assertEqual(1, len(fake_notifier.VERSIONED_NOTIFICATIONS))
-        notification = fake_notifier.VERSIONED_NOTIFICATIONS[0]
+        self.assertEqual(1, len(self.notifier.versioned_notifications))
+        notification = self.notifier.versioned_notifications[0]
 
         self.assertEqual('INFO', notification['priority'])
         self.assertEqual('volume.usage', notification['event_type'])
@@ -927,8 +886,8 @@ class UsageInfoTestCase(test.TestCase):
             rpc.get_notifier('compute'),
             self.context, instance, 'create.start',
             extra_usage_info=extra_usage_info)
-        self.assertEqual(len(fake_notifier.NOTIFICATIONS), 1)
-        msg = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual(len(self.notifier.notifications), 1)
+        msg = self.notifier.notifications[0]
         self.assertEqual(msg.priority, 'INFO')
         self.assertEqual(msg.event_type, 'compute.instance.create.start')
         payload = msg.payload
@@ -956,8 +915,8 @@ class UsageInfoTestCase(test.TestCase):
         compute_utils.notify_about_aggregate_update(self.context,
                                                     "create.end",
                                                     aggregate_payload)
-        self.assertEqual(len(fake_notifier.NOTIFICATIONS), 1)
-        msg = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual(len(self.notifier.notifications), 1)
+        msg = self.notifier.notifications[0]
         self.assertEqual(msg.priority, 'INFO')
         self.assertEqual(msg.event_type, 'aggregate.create.end')
         payload = msg.payload
@@ -969,8 +928,8 @@ class UsageInfoTestCase(test.TestCase):
         compute_utils.notify_about_aggregate_update(self.context,
                                                     "create.start",
                                                     aggregate_payload)
-        self.assertEqual(len(fake_notifier.NOTIFICATIONS), 1)
-        msg = fake_notifier.NOTIFICATIONS[0]
+        self.assertEqual(len(self.notifier.notifications), 1)
+        msg = self.notifier.notifications[0]
         self.assertEqual(msg.priority, 'INFO')
         self.assertEqual(msg.event_type, 'aggregate.create.start')
         payload = msg.payload
@@ -982,7 +941,7 @@ class UsageInfoTestCase(test.TestCase):
         compute_utils.notify_about_aggregate_update(self.context,
                                                     "create.start",
                                                     aggregate_payload)
-        self.assertEqual(len(fake_notifier.NOTIFICATIONS), 0)
+        self.assertEqual(len(self.notifier.notifications), 0)
 
 
 class ComputeUtilsGetValFromSysMetadata(test.NoDBTestCase):
@@ -1275,8 +1234,7 @@ class ComputeUtilsTestCase(test.NoDBTestCase):
 class ServerGroupTestCase(test.TestCase):
     def setUp(self):
         super(ServerGroupTestCase, self).setUp()
-        fake_notifier.stub_notifier(self)
-        self.addCleanup(fake_notifier.reset)
+        self.notifier = self.useFixture(fixtures.NotificationFixture(self))
         self.user_id = 'fake'
         self.project_id = 'fake'
         self.context = context.RequestContext(self.user_id, self.project_id)
@@ -1293,8 +1251,8 @@ class ServerGroupTestCase(test.TestCase):
     def test_notify_about_server_group_action(self):
         compute_utils.notify_about_server_group_action(self.context,
                                                        self.group, 'create')
-        self.assertEqual(len(fake_notifier.VERSIONED_NOTIFICATIONS), 1)
-        notification = fake_notifier.VERSIONED_NOTIFICATIONS[0]
+        self.assertEqual(len(self.notifier.versioned_notifications), 1)
+        notification = self.notifier.versioned_notifications[0]
         expected = {'priority': 'INFO',
                     'event_type': u'server_group.create',
                     'publisher_id': u'nova-api:fake-mini',
@@ -1325,8 +1283,8 @@ class ServerGroupTestCase(test.TestCase):
             self.context, uuids.server_group)
         mock_get_by_uuid.assert_called_once_with(self.context,
                                                  uuids.server_group)
-        self.assertEqual(len(fake_notifier.VERSIONED_NOTIFICATIONS), 1)
-        notification = fake_notifier.VERSIONED_NOTIFICATIONS[0]
+        self.assertEqual(len(self.notifier.versioned_notifications), 1)
+        notification = self.notifier.versioned_notifications[0]
         expected = {'priority': 'INFO',
                     'event_type': u'server_group.add_member',
                     'publisher_id': u'nova-api:fake-mini',
@@ -1395,6 +1353,46 @@ class ComputeUtilsQuotaTestCase(test.TestCase):
                 self.assertEqual('1, 1, 512', e.kwargs['allowed'])
             else:
                 self.fail("Exception not raised")
+
+    @mock.patch('nova.objects.Quotas.get_all_by_project_and_user')
+    @mock.patch('nova.objects.Quotas.check_deltas')
+    def test_check_num_instances_omits_user_if_no_user_quota(self, mock_check,
+                                                             mock_get):
+        # Return no per-user quota.
+        mock_get.return_value = {'project_id': self.context.project_id,
+                                 'user_id': self.context.user_id}
+        fake_flavor = objects.Flavor(vcpus=1, memory_mb=512)
+        compute_utils.check_num_instances_quota(
+            self.context, fake_flavor, 1, 1)
+        deltas = {'instances': 1, 'cores': 1, 'ram': 512}
+        # Verify that user_id has not been passed along to scope the resource
+        # counting.
+        mock_check.assert_called_once_with(
+            self.context, deltas, self.context.project_id, user_id=None,
+            check_project_id=self.context.project_id, check_user_id=None)
+
+    @mock.patch('nova.objects.Quotas.get_all_by_project_and_user')
+    @mock.patch('nova.objects.Quotas.check_deltas')
+    def test_check_num_instances_passes_user_if_user_quota(self, mock_check,
+                                                           mock_get):
+        for resource in ['instances', 'cores', 'ram']:
+            # Return some per-user quota for each of the instance-related
+            # resources.
+            mock_get.return_value = {'project_id': self.context.project_id,
+                                     'user_id': self.context.user_id,
+                                     resource: 5}
+            fake_flavor = objects.Flavor(vcpus=1, memory_mb=512)
+            compute_utils.check_num_instances_quota(
+                self.context, fake_flavor, 1, 1)
+            deltas = {'instances': 1, 'cores': 1, 'ram': 512}
+            # Verify that user_id is passed along to scope the resource
+            # counting and limit checking.
+            mock_check.assert_called_once_with(
+                self.context, deltas, self.context.project_id,
+                user_id=self.context.user_id,
+                check_project_id=self.context.project_id,
+                check_user_id=self.context.user_id)
+            mock_check.reset_mock()
 
 
 class IsVolumeBackedInstanceTestCase(test.TestCase):
@@ -1536,6 +1534,7 @@ class ComputeUtilsImageFunctionsTestCase(test.TestCase):
             'deeeeeac-d75e-11e2-8271-1234567897d6',
             'image_some_key': 'some_value',
             'image_fred': 'barney',
+            'image_os_glance_importing_to_stores': '',
             'image_cache_in_nova': 'true'
         }
         image_meta = compute_utils.initialize_instance_snapshot_metadata(
@@ -1548,3 +1547,114 @@ class ComputeUtilsImageFunctionsTestCase(test.TestCase):
             self.assertNotIn(p, properties)
         for p in CONF.non_inheritable_image_properties:
             self.assertNotIn(p, properties)
+        self.assertNotIn('os_glance_importing_to_stores', properties)
+
+
+class PciRequestUpdateTestCase(test.NoDBTestCase):
+    def setUp(self):
+        super().setUp()
+        self.context = context.RequestContext('fake', 'fake')
+
+    def test_no_pci_request(self):
+        provider_mapping = {}
+
+        compute_utils.update_pci_request_spec_with_allocated_interface_name(
+            self.context, mock.sentinel.report_client, [], provider_mapping)
+
+    def test_pci_request_from_flavor(self):
+        pci_requests = [objects.InstancePCIRequest(requester_id=None)]
+        provider_mapping = {}
+
+        compute_utils.update_pci_request_spec_with_allocated_interface_name(
+            self.context, mock.sentinel.report_client, pci_requests,
+            provider_mapping)
+
+    def test_pci_request_has_no_mapping(self):
+        pci_requests = [objects.InstancePCIRequest(requester_id=uuids.port_1)]
+        provider_mapping = {}
+
+        compute_utils.update_pci_request_spec_with_allocated_interface_name(
+            self.context, mock.sentinel.report_client, pci_requests,
+            provider_mapping)
+
+    def test_pci_request_ambiguous_mapping(self):
+        pci_requests = [objects.InstancePCIRequest(requester_id=uuids.port_1)]
+        provider_mapping = {uuids.port_1: [uuids.rp1, uuids.rp2]}
+
+        self.assertRaises(
+            exception.AmbiguousResourceProviderForPCIRequest,
+            (compute_utils.
+             update_pci_request_spec_with_allocated_interface_name),
+            self.context, mock.sentinel.report_client, pci_requests,
+            provider_mapping)
+
+    def test_unexpected_provider_name(self):
+        report_client = mock.Mock(spec=report.SchedulerReportClient)
+        report_client.get_resource_provider_name.return_value = 'unexpected'
+        pci_requests = [objects.InstancePCIRequest(
+            requester_id=uuids.port_1, spec=[{}])]
+        provider_mapping = {uuids.port_1: [uuids.rp1]}
+
+        self.assertRaises(
+            exception.UnexpectedResourceProviderNameForPCIRequest,
+            (compute_utils.
+             update_pci_request_spec_with_allocated_interface_name),
+            self.context, report_client, pci_requests,
+            provider_mapping)
+
+        report_client.get_resource_provider_name.assert_called_once_with(
+            self.context, uuids.rp1)
+        self.assertNotIn('parent_ifname', pci_requests[0].spec[0])
+
+    def test_pci_request_updated(self):
+        report_client = mock.Mock(spec=report.SchedulerReportClient)
+        report_client.get_resource_provider_name.return_value = (
+            'host:agent:enp0s31f6')
+        pci_requests = [objects.InstancePCIRequest(
+            requester_id=uuids.port_1, spec=[{}],)]
+        provider_mapping = {uuids.port_1: [uuids.rp1]}
+
+        compute_utils.update_pci_request_spec_with_allocated_interface_name(
+            self.context, report_client, pci_requests, provider_mapping)
+
+        report_client.get_resource_provider_name.assert_called_once_with(
+            self.context, uuids.rp1)
+        self.assertEqual('enp0s31f6', pci_requests[0].spec[0]['parent_ifname'])
+
+
+class AcceleratorRequestTestCase(test.NoDBTestCase):
+    def setUp(self):
+        super(AcceleratorRequestTestCase, self).setUp()
+        self.context = context.get_admin_context()
+
+    @mock.patch.object(cyborgclient, 'delete_arqs_for_instance')
+    def test_delete_with_device_profile(self, mock_del_arq):
+        flavor = objects.Flavor(**test_flavor.fake_flavor)
+        flavor['extra_specs'] = {'accel:device_profile': 'mydp'}
+        instance = fake_instance.fake_instance_obj(self.context, flavor=flavor)
+        compute_utils.delete_arqs_if_needed(self.context, instance)
+        mock_del_arq.assert_called_once_with(instance.uuid)
+
+    @mock.patch.object(cyborgclient, 'delete_arqs_for_instance')
+    def test_delete_with_no_device_profile(self, mock_del_arq):
+        flavor = objects.Flavor(**test_flavor.fake_flavor)
+        flavor['extra_specs'] = {}
+        instance = fake_instance.fake_instance_obj(self.context, flavor=flavor)
+        compute_utils.delete_arqs_if_needed(self.context, instance)
+        mock_del_arq.assert_not_called()
+
+    @mock.patch('nova.compute.utils.LOG.exception')
+    @mock.patch.object(cyborgclient, 'delete_arqs_for_instance')
+    def test_delete_with_device_profile_exception(self, mock_del_arq,
+                                                  mock_log_exc):
+        flavor = objects.Flavor(**test_flavor.fake_flavor)
+        flavor['extra_specs'] = {'accel:device_profile': 'mydp'}
+        instance = fake_instance.fake_instance_obj(self.context, flavor=flavor)
+        mock_del_arq.side_effect = exception.AcceleratorRequestOpFailed(
+                op='', msg='')
+
+        compute_utils.delete_arqs_if_needed(self.context, instance)
+        mock_del_arq.assert_called_once_with(instance.uuid)
+        mock_log_exc.assert_called_once()
+        self.assertIn('Failed to delete accelerator requests for instance',
+                      mock_log_exc.call_args[0][0])
